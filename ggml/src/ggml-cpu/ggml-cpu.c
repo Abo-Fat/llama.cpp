@@ -15,6 +15,7 @@
 #include "ggml.h"
 #include "common.h"
 #include "tiled/tiled.h"
+#include "s11-cpu.h"
 
 #if defined(_MSC_VER) || defined(__MINGW32__)
 #include <malloc.h> // using malloc.h with MSC/MINGW
@@ -212,7 +213,33 @@ typedef pthread_t ggml_thread_t;
 #include <TargetConditionals.h>
 #endif
 
+static void ggml_s11_vec_dot(int type, int n, float * s, size_t bs, const void * vx, size_t bx, const void * vy, size_t by, int nrc) {
+    GGML_UNUSED(bs);
+    GGML_UNUSED(bx);
+    GGML_UNUSED(by);
+    GGML_ASSERT(nrc == 1);
+    char error[256];
+    const int status = s11_cpu_vec_dot(type, vx, (const float *) vy, n, s, error, sizeof(error));
+    if (status != S11_CPU_OK) {
+        GGML_ABORT("S11 CPU projection failed: %s", error);
+    }
+}
+
+#define S11_VEC_DOT(NAME, TYPE) \
+    static void NAME(int n, float * s, size_t bs, const void * vx, size_t bx, const void * vy, size_t by, int nrc) { \
+        ggml_s11_vec_dot(TYPE, n, s, bs, vx, bx, vy, by, nrc); \
+    }
+S11_VEC_DOT(ggml_s11_dot_w2, GGML_TYPE_S11_W2)
+S11_VEC_DOT(ggml_s11_dot_w2_bf16, GGML_TYPE_S11_W2_BF16)
+S11_VEC_DOT(ggml_s11_dot_w4, GGML_TYPE_S11_W4)
+S11_VEC_DOT(ggml_s11_dot_i8, GGML_TYPE_S11_I8)
+#undef S11_VEC_DOT
+
 static const struct ggml_type_traits_cpu type_traits_cpu[GGML_TYPE_COUNT] = {
+    [GGML_TYPE_S11_W2] = { .vec_dot = ggml_s11_dot_w2, .vec_dot_type = GGML_TYPE_F32, .nrows = 1 },
+    [GGML_TYPE_S11_W2_BF16] = { .vec_dot = ggml_s11_dot_w2_bf16, .vec_dot_type = GGML_TYPE_F32, .nrows = 1 },
+    [GGML_TYPE_S11_W4] = { .vec_dot = ggml_s11_dot_w4, .vec_dot_type = GGML_TYPE_F32, .nrows = 1 },
+    [GGML_TYPE_S11_I8] = { .vec_dot = ggml_s11_dot_i8, .vec_dot_type = GGML_TYPE_F32, .nrows = 1 },
     [GGML_TYPE_F32] = {
         .from_float               = (ggml_from_float_t) ggml_cpu_fp32_to_fp32,
         .vec_dot                  = (ggml_vec_dot_t) ggml_vec_dot_f32,
@@ -1252,12 +1279,48 @@ static void ggml_compute_forward_mul_mat_one_chunk(
     }
 }
 
+static bool ggml_s11_prepared_matmul(const struct ggml_tensor * dst) {
+    const char * mode = getenv("S11_CPU_MATMUL");
+    if (!mode || strcmp(mode, "scalar") == 0) { return false; }
+    if (strcmp(mode, "prepared") != 0) { GGML_ABORT("Invalid S11_CPU_MATMUL: %s", mode); }
+    const struct ggml_tensor * w = dst->src[0], * x = dst->src[1];
+    return w->type >= GGML_TYPE_S11_W2_BF16 && w->type <= GGML_TYPE_S11_I8 &&
+        x->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32 &&
+        w->ne[2] == 1 && w->ne[3] == 1 && x->ne[2] == 1 && x->ne[3] == 1 &&
+        ggml_is_contiguous(w) && ggml_is_contiguous(x) && ggml_is_contiguous(dst) &&
+        w->buffer && ggml_backend_buffer_get_usage(w->buffer) == GGML_BACKEND_BUFFER_USAGE_WEIGHTS;
+}
+
 void ggml_compute_forward_mul_mat(
         const struct ggml_compute_params * params,
               struct ggml_tensor * dst) {
 
     const struct ggml_tensor * src0 = dst->src[0];
     const struct ggml_tensor * src1 = dst->src[1];
+    if (ggml_s11_prepared_matmul(dst)) {
+        const int k = src0->ne[0], n = src0->ne[1], m = src1->ne[1];
+        GGML_ASSERT(k % 128 == 0 && params->wsize >= (size_t) k * m * sizeof(float));
+        float * prepared = (float *) params->wdata;
+        char error[256];
+        for (int token = params->ith; token < m; token += params->nth) {
+            if (s11_cpu_prepare_row(src0->type, (const float *) src1->data + (size_t) token * k,
+                                     k, prepared + (size_t) token * k, error, sizeof(error))) {
+                GGML_ABORT("S11 CPU prepare: %s", error);
+            }
+        }
+        ggml_barrier(params->threadpool);
+        for (int token = 0; token < m; ++token) {
+            for (int row = (int64_t) n * params->ith / params->nth;
+                 row < (int64_t) n * (params->ith + 1) / params->nth; ++row) {
+                if (s11_cpu_prepared_dot(src0->type, (const char *) src0->data + row * src0->nb[1],
+                                         prepared + (size_t) token * k, k,
+                                         (float *) dst->data + (size_t) token * n + row, error, sizeof(error))) {
+                    GGML_ABORT("S11 CPU dot: %s", error);
+                }
+            }
+        }
+        return;
+    }
 
     const int32_t hint = ggml_get_op_params_i32(dst, 1);
     if (hint == GGML_HINT_SRC0_IS_HADAMARD && !params->use_ref) {
@@ -2883,6 +2946,10 @@ struct ggml_cplan ggml_graph_plan(
                 case GGML_OP_MUL_MAT:
                     {
                         const enum ggml_type vec_dot_type = type_traits_cpu[node->src[0]->type].vec_dot_type;
+                        if (ggml_s11_prepared_matmul(node)) {
+                            cur = ggml_nelements(node->src[1]) * sizeof(float);
+                            break;
+                        }
                         if (node->src[1]->type != vec_dot_type) {
                             cur = ggml_row_size(vec_dot_type, ggml_nelements(node->src[1]));
                         }

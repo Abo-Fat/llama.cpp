@@ -5375,6 +5375,10 @@ void ggml_compute_forward_get_rows(
     const ggml_tensor * src0 = dst->src[0];
 
     switch (src0->type) {
+        case GGML_TYPE_S11_W2:
+        case GGML_TYPE_S11_W2_BF16:
+        case GGML_TYPE_S11_W4:
+        case GGML_TYPE_S11_I8:
         case GGML_TYPE_Q1_0:
         case GGML_TYPE_Q2_0:
         case GGML_TYPE_Q4_0:

@@ -6,6 +6,9 @@
 #include "ggml-cpp.h"
 
 #include <algorithm>
+#include <cstdlib>
+#include <cstring>
+#include <fstream>
 #include <stdexcept>
 #include <unordered_map>
 #include <vector>
@@ -71,7 +74,7 @@ struct moe_cache_lru {
 
     // give a slot to each expert selected by ids in layer il, the misses evict the least recently used experts
     // returns false if the ids select more distinct experts than there are slots
-    bool plan(int32_t il, const int32_t * ids, size_t n_ids, std::vector<fill> & fills, size_t & n_hit) {
+    bool plan(int32_t il, const int32_t * ids, size_t n_ids, std::vector<fill> & fills, size_t & n_hit, bool admit = true) {
         fills.clear();
         n_hit = 0;
 
@@ -101,6 +104,9 @@ struct moe_cache_lru {
             }
         }
         // sorted misses usually get consecutive slots, so the uploads can be merged
+        if (!admit) {
+            return true;
+        }
         std::sort(uniq.begin(), uniq.end());
         for (int32_t e : uniq) {
             if (slots[e] >= 0) {
@@ -162,6 +168,7 @@ struct llama_moe_cache::impl {
         ggml_context_ptr ctx;
         ggml_backend_buffer_ptr buf;
         size_t buf_size = 0;
+        ggml_backend_event_ptr route_ready;
     };
 
     // layers of the same device with the same expert tensor layout share the banks and the LRU of a group
@@ -200,6 +207,11 @@ struct llama_moe_cache::impl {
     stats stats_small; // up to 8 tokens per ubatch
     stats stats_large;
     stats stats_copy;  // experts copied from the cache for large batches
+    uint64_t route_readbacks = 0;
+    uint64_t route_syncs = 0;
+    std::ofstream s11_route_trace;
+    size_t s11_traced_ids = 0;
+    bool s11_event_sync = false;
 
     std::vector<device> devices;
     std::vector<group> groups;
@@ -220,12 +232,37 @@ struct llama_moe_cache::impl {
 
     impl(const llama_model & model, const std::vector<ggml_backend_t> & backends, const std::vector<ggml_backend_buffer_type_t> & bufts, size_t size) :
             n_expert_used(model.hparams.n_expert_used_max()), layers(model.layers.size()) {
+        if (const char * mode = std::getenv("S11_ROUTE_SYNC")) {
+            if (std::strcmp(mode, "event") == 0) {
+                if (!model.output || model.output->type != GGML_TYPE_S11_I8) {
+                    throw std::runtime_error("S11 event route synchronization requires S11");
+                }
+                s11_event_sync = true;
+            } else if (std::strcmp(mode, "backend") != 0) {
+                throw std::runtime_error("Invalid S11_ROUTE_SYNC");
+            }
+        }
+        if (const char * path = std::getenv("S11_ROUTE_TRACE")) {
+            if (std::ifstream(path).good()) {
+                throw std::runtime_error("S11 route trace already exists");
+            }
+            s11_route_trace.open(path);
+            if (!s11_route_trace) {
+                throw std::runtime_error("Cannot open S11 route trace");
+            }
+        }
         for (size_t i = 0; i < backends.size(); ++i) {
             const auto dev_type = ggml_backend_dev_type(ggml_backend_get_device(backends[i]));
             if (dev_type == GGML_BACKEND_DEVICE_TYPE_GPU || dev_type == GGML_BACKEND_DEVICE_TYPE_IGPU) {
                 auto & d = devices.emplace_back();
                 d.backend = backends[i];
                 d.buft    = bufts[i];
+                if (s11_event_sync) {
+                    d.route_ready.reset(ggml_backend_event_new(ggml_backend_get_device(d.backend)));
+                    if (!d.route_ready) {
+                        throw std::runtime_error("S11 route event is unsupported by this device");
+                    }
+                }
             }
         }
         if (devices.empty()) {
@@ -466,7 +503,8 @@ struct llama_moe_cache::impl {
         const layer & l = layers[il];
 
         // large batches use most experts of a layer, so they gain little from the cache and would evict the experts used in generation
-        if (n_tokens == 0 || n_tokens > max_batch || std::min(n_tokens*n_expert_used, l.slot_map->ne[1]) > groups[l.ig].n_slots) {
+        const int64_t batch_limit = !l.experts.empty() && l.experts[0]->type == GGML_TYPE_S11_W2 ? 128 : max_batch;
+        if (n_tokens == 0 || n_tokens > batch_limit || std::min(n_tokens*n_expert_used, l.slot_map->ne[1]) > groups[l.ig].n_slots) {
             return nullptr;
         }
         return l.slot_map;
@@ -547,10 +585,37 @@ struct llama_moe_cache::impl {
 
         ids.resize(ggml_nelements(sel));
         ggml_backend_tensor_get_async(backend, sel, ids.data(), 0, ggml_nbytes(sel));
-        ggml_backend_synchronize(backend);
+        ++route_readbacks;
+        if (s11_event_sync) {
+            // S11 bank readers and the ID copy use this backend's same stream.
+            // Wait through the copy before mutating any bank slot or host map.
+            auto * event = devices[g.id].route_ready.get();
+            ggml_backend_event_record(event, backend);
+            ggml_backend_event_synchronize(event);
+        } else {
+            ggml_backend_synchronize(backend);
+        }
+        ++route_syncs;
+        if (s11_route_trace.is_open()) {
+            if (s11_traced_ids + ids.size() > 2000000) {
+                throw std::runtime_error("S11 route trace exceeds bounded diagnostic workload");
+            }
+            s11_traced_ids += ids.size();
+            s11_route_trace << il << ',' << ids.size();
+            for (int32_t id : ids) {
+                s11_route_trace << ',' << id;
+            }
+            s11_route_trace << '\n';
+            if (!s11_route_trace) {
+                throw std::runtime_error("S11 route trace write failed");
+            }
+        }
 
         size_t n_hit = 0;
-        if (!g.lru.plan(il, ids.data(), ids.size(), fills, n_hit)) {
+        const char * s11_mode = std::getenv("S11_EXPERT_MODE");
+        const bool cpu_miss = !l.experts.empty() && l.experts[0]->type == GGML_TYPE_S11_W2 &&
+            s11_mode && std::strcmp(s11_mode, "hybrid") == 0 && ids.size() <= 8;
+        if (!g.lru.plan(il, ids.data(), ids.size(), fills, n_hit, !cpu_miss)) {
             GGML_ABORT("the MoE cache is too small for the experts selected in layer %d", il);
         }
 
@@ -631,9 +696,14 @@ std::map<ggml_backend_buffer_type_t, size_t> llama_moe_cache::memory_breakdown()
         if (d.buf) {
             res[ggml_backend_buffer_get_type(d.buf.get())] += d.buf_size;
         }
+
     }
     if (pimpl->buf_host) {
         res[ggml_backend_buffer_get_type(pimpl->buf_host.get())] += pimpl->buf_host_size;
     }
     return res;
+}
+
+std::array<uint64_t, 3> llama_moe_cache::s11_statistics() const {
+    return {pimpl->stats_small.bytes + pimpl->stats_large.bytes, pimpl->route_readbacks, pimpl->route_syncs};
 }

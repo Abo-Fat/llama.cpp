@@ -97,6 +97,7 @@ struct llama_cross {
 };
 
 struct llm_graph_params;
+struct llama_model;
 
 //
 // llm_graph_input
@@ -997,6 +998,8 @@ struct llm_graph_qkv {
 
 struct llm_graph_context {
     const llm_arch arch;
+    bool s11_model = false;
+    const llama_model * s11_owner = nullptr;
 
     const llama_hparams & hparams;
     const llama_cparams & cparams;

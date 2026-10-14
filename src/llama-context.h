@@ -62,6 +62,7 @@ struct llama_context {
 
     const llama_model   & get_model()   const;
     const llama_cparams & get_cparams() const;
+    const llama_moe_cache * get_moe_cache() const { return moe_cache.get(); }
 
     ggml_backend_sched_t get_sched() const;
 

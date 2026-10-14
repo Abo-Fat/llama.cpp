@@ -242,8 +242,17 @@ struct server_batch {
     }
 };
 
+#ifdef S11_SERVER_CUDA
+#include "ggml-cuda.h"
+#endif
+
 struct server_slot {
     int id;
+    bool s11_workload = false;
+    uint64_t s11_cpu_before = 0;
+    uint64_t s11_gpu_before = 0;
+    uint64_t s11_graphs_before = 0;
+    llama_s11_cache_stats s11_cache_before{};
 
     llama_context * ctx_tgt = nullptr;
     llama_context * ctx_dft = nullptr;
@@ -1950,6 +1959,22 @@ private:
         // the per-request limit takes priority over the global one
         slot.n_predict_max = task.params.n_predict != -1 ? task.params.n_predict : params_base.n_predict;
 
+        char s11_schema[16] = {};
+        slot.s11_workload = llama_model_meta_val_str(model_tgt, "s11.schema_version", s11_schema, sizeof(s11_schema)) > 0;
+        if (slot.s11_workload) {
+            if (params_base.n_parallel != 1) {
+                send_error(task, "S11 workload accounting supports one slot only", ERROR_TYPE_INVALID_REQUEST);
+                return false;
+            }
+            slot.s11_cpu_before = llama_model_s11_cpu_assignments(model_tgt);
+            slot.s11_cache_before = llama_s11_cache_statistics(ctx_tgt);
+#ifdef S11_SERVER_CUDA
+            if (params_base.n_gpu_layers > 0) {
+                slot.s11_gpu_before = ggml_cuda_s11_assignments();
+                slot.s11_graphs_before = ggml_cuda_s11_graph_replays();
+            }
+#endif
+        }
         slot.task = std::make_unique<const server_task>(std::move(task));
 
         slot.state = slot.task->is_child()
@@ -2239,6 +2264,23 @@ private:
             res->tokens      = std::move(slot.generated_tokens);
         }
         res->stats           = slot.stats;
+        if (slot.s11_workload) {
+            const auto cache = llama_s11_cache_statistics(ctx_tgt);
+            res->s11_work = json{
+                {"cpu_assignments", llama_model_s11_cpu_assignments(model_tgt) - slot.s11_cpu_before},
+                {"gpu_assignments", 0},
+                {"graph_replays", 0},
+                {"routed_h2d_bytes", cache.routed_upload_bytes - slot.s11_cache_before.routed_upload_bytes},
+                {"route_readbacks", cache.route_readbacks - slot.s11_cache_before.route_readbacks},
+                {"route_syncs", cache.route_syncs - slot.s11_cache_before.route_syncs},
+            };
+#ifdef S11_SERVER_CUDA
+            if (params_base.n_gpu_layers > 0) {
+                res->s11_work["gpu_assignments"] = ggml_cuda_s11_assignments() - slot.s11_gpu_before;
+                res->s11_work["graph_replays"] = ggml_cuda_s11_graph_replays() - slot.s11_graphs_before;
+            }
+#endif
+        }
         res->prompt          = slot.task->tokens.detokenize(ctx_tgt, true);
         res->response_fields = std::move(slot.task->params.response_fields);
 

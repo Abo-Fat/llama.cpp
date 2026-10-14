@@ -1,6 +1,15 @@
 #include "ggml-cuda.h"
 #include "ggml-impl.h"
 #include "ggml-backend-impl.h"
+#include <atomic>
+#include <cstring>
+#include <map>
+
+static std::atomic<uint64_t> s11_graph_replays{0};
+
+uint64_t ggml_cuda_s11_graph_replays(void) {
+    return s11_graph_replays.load(std::memory_order_relaxed);
+}
 
 #include "ggml-cuda/allreduce.cuh"
 #include "ggml-cuda/common.cuh"
@@ -28,6 +37,7 @@
 #include "ggml-cuda/fattn.cuh"
 #include "ggml-cuda/fwht.cuh"
 #include "ggml-cuda/getrows.cuh"
+#include "ggml-cuda/s11.cuh"
 #include "ggml-cuda/im2col.cuh"
 #include "ggml-cuda/mmf.cuh"
 #include "ggml-cuda/mmq.cuh"
@@ -719,9 +729,14 @@ ggml_backend_cuda_context::~ggml_backend_cuda_context() {
 // cuda buffer
 
 struct ggml_backend_cuda_buffer_context {
+    struct s11_head_source {
+        std::vector<unsigned char> canonical;
+        size_t loaded = 0;
+    };
     int device;
     void * dev_ptr = nullptr;
     std::string name;
+    std::map<const void *, s11_head_source> s11_heads;
 
     ggml_backend_cuda_buffer_context(int device, void * dev_ptr) :
         device(device), dev_ptr(dev_ptr),
@@ -752,6 +767,11 @@ static enum ggml_status ggml_backend_cuda_buffer_init_tensor(ggml_backend_buffer
 
     if (tensor->view_src != NULL) {
         assert(tensor->view_src->buffer->buft == buffer->buft);
+        GGML_ASSERT(!ggml_cuda_s11_bf16_head(tensor->view_src) && "S11 derived head views are unsupported");
+        return GGML_STATUS_SUCCESS;
+    }
+    if (ggml_cuda_s11_bf16_head(tensor)) {
+        ctx->s11_heads[tensor->data].canonical.resize(ggml_nbytes(tensor));
         return GGML_STATUS_SUCCESS;
     }
 
@@ -770,6 +790,7 @@ static enum ggml_status ggml_backend_cuda_buffer_init_tensor(ggml_backend_buffer
 }
 
 static void ggml_backend_cuda_buffer_memset_tensor(ggml_backend_buffer_t buffer, ggml_tensor * tensor, uint8_t value, size_t offset, size_t size) {
+    GGML_ASSERT(!ggml_cuda_s11_bf16_head(tensor) && "S11 derived head is immutable");
     ggml_backend_cuda_buffer_context * ctx = (ggml_backend_cuda_buffer_context *) buffer->context;
 
     ggml_cuda_set_device(ctx->device);
@@ -781,6 +802,16 @@ static void ggml_backend_cuda_buffer_set_tensor(ggml_backend_buffer_t buffer, gg
     ggml_backend_cuda_buffer_context * ctx = (ggml_backend_cuda_buffer_context *) buffer->context;
 
     ggml_cuda_set_device(ctx->device);
+    if (ggml_cuda_s11_bf16_head(tensor)) {
+        auto & source = ctx->s11_heads.at(tensor->data);
+        GGML_ASSERT(offset == source.loaded && offset + size <= source.canonical.size());
+        std::memcpy(source.canonical.data() + offset, data, size);
+        source.loaded += size;
+        if (source.loaded == source.canonical.size()) {
+            ggml_cuda_s11_upload_head(tensor, source.canonical.data(), cudaStreamPerThread);
+        }
+        return;
+    }
     CUDA_CHECK(cudaMemcpyAsync((char *) tensor->data + offset, data, size, cudaMemcpyHostToDevice, cudaStreamPerThread));
     CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
 }
@@ -789,12 +820,25 @@ static void ggml_backend_cuda_buffer_get_tensor(ggml_backend_buffer_t buffer, co
     ggml_backend_cuda_buffer_context * ctx = (ggml_backend_cuda_buffer_context *) buffer->context;
 
     ggml_cuda_set_device(ctx->device);
+    if (ggml_cuda_s11_bf16_head(tensor)) {
+        const auto & source = ctx->s11_heads.at(tensor->data);
+        GGML_ASSERT(offset + size <= source.loaded);
+        std::memcpy(data, source.canonical.data() + offset, size);
+        return;
+    }
     CUDA_CHECK(cudaMemcpyAsync(data, (const char *) tensor->data + offset, size, cudaMemcpyDeviceToHost, cudaStreamPerThread));
     CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
 }
 
 static void ggml_backend_cuda_buffer_set_tensor_2d(ggml_backend_buffer_t buffer, struct ggml_tensor * tensor, const void * data,
         size_t offset, size_t size, size_t n_copies, size_t stride_tensor, size_t stride_data) {
+    if (ggml_cuda_s11_bf16_head(tensor)) {
+        for (size_t i = 0; i < n_copies; ++i) {
+            ggml_backend_cuda_buffer_set_tensor(buffer, tensor, static_cast<const char *>(data) + i * stride_data,
+                                                offset + i * stride_tensor, size);
+        }
+        return;
+    }
     ggml_backend_cuda_buffer_context * ctx = (ggml_backend_cuda_buffer_context *) buffer->context;
 
     ggml_cuda_set_device(ctx->device);
@@ -805,6 +849,13 @@ static void ggml_backend_cuda_buffer_set_tensor_2d(ggml_backend_buffer_t buffer,
 
 static void ggml_backend_cuda_buffer_get_tensor_2d(ggml_backend_buffer_t buffer, const struct ggml_tensor * tensor, void * data,
         size_t offset, size_t size, size_t n_copies, size_t stride_tensor, size_t stride_data) {
+    if (ggml_cuda_s11_bf16_head(tensor)) {
+        for (size_t i = 0; i < n_copies; ++i) {
+            ggml_backend_cuda_buffer_get_tensor(buffer, tensor, static_cast<char *>(data) + i * stride_data,
+                                                offset + i * stride_tensor, size);
+        }
+        return;
+    }
     ggml_backend_cuda_buffer_context * ctx = (ggml_backend_cuda_buffer_context *)buffer->context;
 
     ggml_cuda_set_device(ctx->device);
@@ -814,6 +865,9 @@ static void ggml_backend_cuda_buffer_get_tensor_2d(ggml_backend_buffer_t buffer,
 }
 
 static bool ggml_backend_cuda_buffer_cpy_tensor(ggml_backend_buffer_t buffer, const ggml_tensor * src, ggml_tensor * dst) {
+    if (ggml_cuda_s11_bf16_head(src) || ggml_cuda_s11_bf16_head(dst)) {
+        return false;
+    }
     if (ggml_backend_buffer_is_cuda(src->buffer)) {
         ggml_backend_cuda_buffer_context * src_ctx = (ggml_backend_cuda_buffer_context *)src->buffer->context;
         ggml_backend_cuda_buffer_context * dst_ctx = (ggml_backend_cuda_buffer_context *)dst->buffer->context;
@@ -842,6 +896,10 @@ static void ggml_backend_cuda_buffer_clear(ggml_backend_buffer_t buffer, uint8_t
     ggml_backend_cuda_buffer_context * ctx = (ggml_backend_cuda_buffer_context *)buffer->context;
 
     ggml_cuda_set_device(ctx->device);
+    for (auto & item : ctx->s11_heads) {
+        GGML_ASSERT(item.second.loaded == 0 && "S11 derived head is immutable after load");
+        std::fill(item.second.canonical.begin(), item.second.canonical.end(), value);
+    }
     CUDA_CHECK(cudaMemsetAsync(ctx->dev_ptr, value, buffer->size, cudaStreamPerThread));
     CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
 }
@@ -902,6 +960,9 @@ static size_t ggml_backend_cuda_buffer_type_get_alignment(ggml_backend_buffer_ty
 }
 
 static size_t ggml_backend_cuda_buffer_type_get_alloc_size(ggml_backend_buffer_type_t buft, const ggml_tensor * tensor) {
+    if (ggml_cuda_s11_bf16_head(tensor)) {
+        return ggml_nelements(tensor) * sizeof(nv_bfloat16);
+    }
     ggml_backend_cuda_buffer_type_context * buft_ctx = (ggml_backend_cuda_buffer_type_context *) buft->context;
 
     size_t size = tensor->op == GGML_OP_FLASH_ATTN_EXT
@@ -1904,6 +1965,14 @@ static bool ggml_cuda_match_shared_expert(const ggml_cgraph * graph, int routed_
 }
 
 static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
+    if (ggml_cuda_is_s11(src0->type)) {
+        ggml_cuda_s11_mul_mat(ctx, dst);
+        return;
+    }
+    if (ggml_get_op_params_i32(dst, 15) == 0x533131) {
+        ggml_cuda_s11_dense(ctx, dst);
+        return;
+    }
     GGML_TENSOR_BINARY_OP_LOCALS
 
     if (ggml_cuda_op_mul_mat_use_fwht(dst) && ggml_cuda_op_fwht(ctx, src1, dst)) {
@@ -1963,6 +2032,9 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
 static bool ggml_cuda_mul_mat_id_needs_sync(const ggml_tensor * dst, const int cc) {
     const ggml_tensor * src0 = dst->src[0];
     const ggml_tensor * src1 = dst->src[1];
+    if (ggml_cuda_is_s11(src0->type)) {
+        return false;
+    }
 
     if (src1->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32) {
         return true;
@@ -1991,6 +2063,10 @@ static bool ggml_cuda_mul_mat_id_needs_sync(const ggml_tensor * dst, const int c
 
 static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const ggml_tensor * src0 = dst->src[0];
+    if (ggml_cuda_is_s11(src0->type)) {
+        ggml_cuda_s11_mul_mat(ctx, dst);
+        return;
+    }
     const ggml_tensor * src1 = dst->src[1];
     const ggml_tensor * ids  = dst->src[2];
 
@@ -2529,6 +2605,10 @@ static void ggml_backend_cuda_free(ggml_backend_t backend) {
 }
 
 static void ggml_backend_cuda_set_tensor_async(ggml_backend_t backend, ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
+    if (ggml_cuda_s11_bf16_head(tensor)) {
+        ggml_backend_cuda_buffer_set_tensor(tensor->buffer, tensor, data, offset, size);
+        return;
+    }
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
     ggml_backend_buffer_t buf = tensor->view_src ? tensor->view_src->buffer : tensor->buffer;
 
@@ -2538,6 +2618,10 @@ static void ggml_backend_cuda_set_tensor_async(ggml_backend_t backend, ggml_tens
 }
 
 static void ggml_backend_cuda_get_tensor_async(ggml_backend_t backend, const ggml_tensor * tensor, void * data, size_t offset, size_t size) {
+    if (ggml_cuda_s11_bf16_head(tensor)) {
+        ggml_backend_cuda_buffer_get_tensor(tensor->buffer, tensor, data, offset, size);
+        return;
+    }
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
     ggml_backend_buffer_t buf = tensor->view_src ? tensor->view_src->buffer : tensor->buffer;
 
@@ -2548,6 +2632,10 @@ static void ggml_backend_cuda_get_tensor_async(ggml_backend_t backend, const ggm
 
 static void ggml_backend_cuda_set_tensor_2d_async(ggml_backend_t backend, struct ggml_tensor * tensor, const void * data,
         size_t offset, size_t size, size_t n_copies, size_t stride_tensor, size_t stride_data) {
+    if (ggml_cuda_s11_bf16_head(tensor)) {
+        ggml_backend_cuda_buffer_set_tensor_2d(tensor->buffer, tensor, data, offset, size, n_copies, stride_tensor, stride_data);
+        return;
+    }
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
     ggml_backend_buffer_t buf = tensor->view_src ? tensor->view_src->buffer : tensor->buffer;
 
@@ -2559,6 +2647,10 @@ static void ggml_backend_cuda_set_tensor_2d_async(ggml_backend_t backend, struct
 
 static void ggml_backend_cuda_get_tensor_2d_async(ggml_backend_t backend, const struct ggml_tensor * tensor, void * data,
         size_t offset, size_t size, size_t n_copies, size_t stride_tensor, size_t stride_data) {
+    if (ggml_cuda_s11_bf16_head(tensor)) {
+        ggml_backend_cuda_buffer_get_tensor_2d(tensor->buffer, tensor, data, offset, size, n_copies, stride_tensor, stride_data);
+        return;
+    }
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
     ggml_backend_buffer_t buf = tensor->view_src ? tensor->view_src->buffer : tensor->buffer;
 
@@ -2569,6 +2661,9 @@ static void ggml_backend_cuda_get_tensor_2d_async(ggml_backend_t backend, const 
 }
 
 static bool ggml_backend_cuda_cpy_tensor_async(ggml_backend_t backend_src, ggml_backend_t backend_dst, const ggml_tensor * src, ggml_tensor * dst) {
+    if (ggml_cuda_s11_bf16_head(src) || ggml_cuda_s11_bf16_head(dst)) {
+        return false;
+    }
     ggml_backend_buffer_t buf_src = src->view_src ? src->view_src->buffer : src->buffer;
     ggml_backend_buffer_t buf_dst = dst->view_src ? dst->view_src->buffer : dst->buffer;
 
@@ -3531,6 +3626,11 @@ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
 
 // try and fuse nodes and return the number of nodes to skip
 static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
+    const ggml_tensor * first = cgraph->nodes[i];
+    if ((first->op == GGML_OP_MUL_MAT || first->op == GGML_OP_MUL_MAT_ID) &&
+        (ggml_cuda_is_s11(first->src[0]->type) || ggml_get_op_params_i32(first, 15) == 0x533131)) {
+        return 0;
+    }
 
     static bool disable_fusion = getenv("GGML_CUDA_DISABLE_FUSION") != nullptr && std::atoi(getenv("GGML_CUDA_DISABLE_FUSION"));
     if (disable_fusion) {
@@ -4520,6 +4620,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
         }
         // Launch graph
         CUDA_CHECK(cudaGraphLaunch(graph->instance, cuda_ctx->stream()));
+        s11_graph_replays.fetch_add(1, std::memory_order_relaxed);
 #else
         GGML_UNUSED(graph_key);
         graph_evaluated_or_captured = true;
@@ -5345,6 +5446,10 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
             {
                 struct ggml_tensor * a = op->src[0];
                 struct ggml_tensor * b = op->src[1];
+                if (op->op == GGML_OP_MUL_MAT && ggml_get_op_params_i32(op, 15) == 0x533131) {
+                    return op->type == GGML_TYPE_F32 && b->type == GGML_TYPE_F32 &&
+                        (a->type == GGML_TYPE_F32 || a->type == GGML_TYPE_BF16 || a->type == GGML_TYPE_F16);
+                }
                 if (a->nb[0] != ggml_element_size(a) || b->nb[0] != ggml_element_size(b)) {
                     return false; // TODO this could in principle be implemented though currently there is no use case.
                 }
@@ -5368,6 +5473,11 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                 }
 #endif // GGML_USE_MUSA
                 switch (a->type) {
+                    case GGML_TYPE_S11_W2:
+                    case GGML_TYPE_S11_W2_BF16:
+                    case GGML_TYPE_S11_W4:
+                    case GGML_TYPE_S11_I8:
+                        return b->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32;
                     case GGML_TYPE_F32:
                     case GGML_TYPE_F16:
                     case GGML_TYPE_Q1_0:
@@ -5405,6 +5515,8 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
         case GGML_OP_GET_ROWS:
             {
                 switch (op->src[0]->type) {
+                    case GGML_TYPE_S11_I8:
+                        return op->type == GGML_TYPE_F32 && ggml_is_contiguous(op->src[1]);
                     case GGML_TYPE_F16:
                     case GGML_TYPE_F32:
                     case GGML_TYPE_BF16:

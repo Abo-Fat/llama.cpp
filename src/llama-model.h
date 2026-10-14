@@ -18,6 +18,8 @@ struct llama_cparams;
 struct llama_ubatch;
 struct llama_model_loader;
 struct llama_model;
+class llama_s11_cpu;
+struct s11_callback;
 
 // available models
 enum llm_type {
@@ -638,6 +640,8 @@ struct llama_prec_policy {
 };
 
 struct llama_model {
+    mutable std::shared_ptr<llama_s11_cpu> s11_cpu;
+    mutable std::array<std::shared_ptr<s11_callback>, 40> s11_callbacks;
     llm_type type = LLM_TYPE_UNKNOWN;
     llm_arch arch = LLM_ARCH_UNKNOWN;
 

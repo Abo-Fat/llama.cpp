@@ -25,6 +25,50 @@
 
 #define UNUSED GGML_UNUSED
 
+static void dequantize_row_s11(const void * vx, float * y, int64_t k, enum ggml_type type) {
+    GGML_ASSERT(k % 128 == 0);
+    const uint8_t * x = (const uint8_t *) vx;
+    const size_t size = ggml_type_size(type);
+    for (int64_t block = 0; block < k / 128; ++block, x += size) {
+        float scale;
+        memcpy(&scale, x + size - sizeof(scale), sizeof(scale));
+        GGML_ASSERT(isfinite(scale) && scale > 0.0f);
+        for (int lane = 0; lane < 128; ++lane) {
+            int code;
+            if (type == GGML_TYPE_S11_I8) {
+                code = (int8_t) x[lane];
+            } else if (type == GGML_TYPE_S11_W4) {
+                code = (x[lane / 2] >> (4 * (lane % 2))) & 15;
+                GGML_ASSERT(code != 8);
+                code = code < 8 ? code : code - 16;
+            } else {
+                code = (x[lane / 4] >> (2 * (lane % 4))) & 3;
+                GGML_ASSERT(code != 3);
+                code -= 1;
+            }
+            const float value = type == GGML_TYPE_S11_I8 ? (float) code / scale : (float) code * scale;
+            y[block * 128 + lane] = type == GGML_TYPE_S11_W2 ? value :
+                GGML_BF16_TO_FP32(GGML_FP32_TO_BF16(value));
+        }
+    }
+}
+
+void dequantize_row_s11_w2(const void * x, float * y, int64_t k) {
+    dequantize_row_s11(x, y, k, GGML_TYPE_S11_W2);
+}
+
+void dequantize_row_s11_w2_bf16(const void * x, float * y, int64_t k) {
+    dequantize_row_s11(x, y, k, GGML_TYPE_S11_W2_BF16);
+}
+
+void dequantize_row_s11_w4(const void * x, float * y, int64_t k) {
+    dequantize_row_s11(x, y, k, GGML_TYPE_S11_W4);
+}
+
+void dequantize_row_s11_i8(const void * x, float * y, int64_t k) {
+    dequantize_row_s11(x, y, k, GGML_TYPE_S11_I8);
+}
+
 static inline int best_index_int8(int n, const int8_t * val, float x) {
     if (x <= val[0]) return 0;
     if (x >= val[n-1]) return n-1;
@@ -5392,6 +5436,37 @@ bool ggml_validate_row_data(enum ggml_type type, const void * data, size_t nbyte
     const size_t nb = nbytes/ggml_type_size(type);
 
     switch (type) {
+        case GGML_TYPE_S11_W2:
+        case GGML_TYPE_S11_W2_BF16:
+        case GGML_TYPE_S11_W4:
+        case GGML_TYPE_S11_I8:
+            {
+                const uint8_t * block = (const uint8_t *) data;
+                const size_t size = ggml_type_size(type);
+                for (size_t i = 0; i < nb; ++i, block += size) {
+                    float scale;
+                    memcpy(&scale, block + size - sizeof(scale), sizeof(scale));
+                    if (!isfinite(scale) || scale <= 0.0f) {
+                        fprintf(stderr, "%s: invalid S11 scale at block %zu\n", __func__, i);
+                        return false;
+                    }
+                    if (type == GGML_TYPE_S11_W2 || type == GGML_TYPE_S11_W2_BF16) {
+                        for (size_t j = 0; j < 32; ++j) {
+                            if ((block[j] & (block[j] >> 1) & 0x55) != 0) {
+                                fprintf(stderr, "%s: reserved S11 W2 code at block %zu\n", __func__, i);
+                                return false;
+                            }
+                        }
+                    } else if (type == GGML_TYPE_S11_W4) {
+                        for (size_t j = 0; j < 64; ++j) {
+                            if ((block[j] & 15) == 8 || (block[j] >> 4) == 8) {
+                                fprintf(stderr, "%s: reserved S11 W4 code at block %zu\n", __func__, i);
+                                return false;
+                            }
+                        }
+                    }
+                }
+            } break;
         case GGML_TYPE_BF16:
             {
                 int nans = 0;

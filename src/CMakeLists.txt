@@ -29,6 +29,8 @@ set(LLAMA_CORE_SOURCES
     llama-kv-cache-dsv4.cpp
     llama-memory.cpp
     llama-moe-cache.cpp
+    llama-s11.cpp
+    llama-s11.h
     llama-memory-hybrid.cpp
     llama-memory-hybrid-iswa.cpp
     llama-memory-hybrid-idx.cpp

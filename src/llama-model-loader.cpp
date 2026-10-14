@@ -719,6 +719,122 @@ llama_model_loader::llama_model_loader(
 
     fver = (enum llama_fver) gguf_get_version(metadata);
 
+    bool has_s11 = false;
+    for (const auto & weight : weights_map) {
+        const auto type = weight.second.tensor->type;
+        has_s11 |= type >= GGML_TYPE_S11_W2 && type <= GGML_TYPE_S11_I8;
+    }
+    const int s11_version_key = gguf_find_key(metadata, "s11.schema_version");
+    if (has_s11 || s11_version_key >= 0) {
+        auto require_s11 = [](bool valid, const char * message) {
+            if (!valid) {
+                throw std::runtime_error(std::string("invalid S11 model: ") + message);
+            }
+        };
+        auto require_u32 = [&](const char * name, uint32_t expected) {
+            const int key = gguf_find_key(metadata, name);
+            require_s11(key >= 0 && gguf_get_kv_type(metadata, key) == GGUF_TYPE_UINT32,
+                        name);
+            require_s11(gguf_get_val_u32(metadata, key) == expected, name);
+        };
+        auto require_string = [&](const char * name, const char * expected) {
+            const int key = gguf_find_key(metadata, name);
+            require_s11(key >= 0 && gguf_get_kv_type(metadata, key) == GGUF_TYPE_STRING,
+                        name);
+            require_s11(strcmp(gguf_get_val_str(metadata, key), expected) == 0, name);
+        };
+        require_s11(has_s11 && arch_name == "qwen35moe", "missing S11 tensors or wrong architecture");
+        require_u32("s11.schema_version", 1);
+        require_u32("s11.layout_version", 1);
+        require_u32("s11.weight_group_size", 128);
+        require_u32("s11.activation_group_size", 128);
+        require_u32("s11.tensor_count", (uint32_t) weights_map.size());
+        require_string("s11.layout", "s11_k128_contiguous_codes_fp32_scale_v1");
+        require_string("s11.scale_dtype", "float32");
+        require_string("s11.numeric_backend", "s11_source_math_v1");
+        require_string("s11.protected_dtypes", "bfloat16,float32");
+        require_string("s11.head_order", "gdn_v_grouped_to_tiled_v1");
+        require_string("s11.router_normalization", "topk_then_softmax");
+        require_string("s11.probability_placement", "before_fc2_activation_quant");
+        require_string("s11.activation_rounding", "fp32_swiglu_probability_then_bf16");
+        require_string("s11.projection_activation", "dynamic_a128_bf16_fake_quant");
+        require_string("s11.restored_weight_dtype", "bfloat16");
+        require_string("s11.embedding_head_math", "triton_fp32_division_v1");
+        const int norm_key = gguf_find_key(metadata, "s11.norm_offset");
+        require_s11(norm_key >= 0 && gguf_get_kv_type(metadata, norm_key) == GGUF_TYPE_FLOAT32 &&
+                    gguf_get_val_f32(metadata, norm_key) == 1.0f, "norm offset");
+        const int a_key = gguf_find_key(metadata, "s11.ssm_a_is_log");
+        require_s11(a_key >= 0 && gguf_get_kv_type(metadata, a_key) == GGUF_TYPE_BOOL &&
+                    gguf_get_val_bool(metadata, a_key), "raw A_log flag");
+        for (const char * name : {"s11.source_manifest_sha256", "s11.source_config_sha256",
+                                  "s11.source_index_sha256"}) {
+            const int key = gguf_find_key(metadata, name);
+            require_s11(key >= 0 && gguf_get_kv_type(metadata, key) == GGUF_TYPE_STRING, name);
+            const std::string digest = gguf_get_val_str(metadata, key);
+            require_s11(digest.size() == 64 &&
+                        digest.find_first_not_of("0123456789abcdef") == std::string::npos, name);
+        }
+        const int names_key = gguf_find_key(metadata, "s11.tensor_names");
+        const int types_key = gguf_find_key(metadata, "s11.tensor_types");
+        const int shapes_key = gguf_find_key(metadata, "s11.tensor_shapes");
+        for (int key : {names_key, types_key, shapes_key}) {
+            require_s11(key >= 0 && gguf_get_kv_type(metadata, key) == GGUF_TYPE_ARRAY,
+                        "missing tensor schema arrays");
+        }
+        require_s11(gguf_get_arr_type(metadata, names_key) == GGUF_TYPE_STRING &&
+                    gguf_get_arr_type(metadata, types_key) == GGUF_TYPE_INT32 &&
+                    gguf_get_arr_type(metadata, shapes_key) == GGUF_TYPE_INT32,
+                    "tensor schema array dtype");
+        const size_t count = weights_map.size();
+        require_s11(gguf_get_arr_n(metadata, names_key) == count &&
+                    gguf_get_arr_n(metadata, types_key) == count &&
+                    gguf_get_arr_n(metadata, shapes_key) == count * GGML_MAX_DIMS,
+                    "tensor schema array length");
+        const auto * types = (const int32_t *) gguf_get_arr_data(metadata, types_key);
+        const auto * shapes = (const int32_t *) gguf_get_arr_data(metadata, shapes_key);
+        const std::map<std::string, ggml_type> quantized_roles = {
+            {"ffn_gate_exps.weight", GGML_TYPE_S11_W2},
+            {"ffn_up_exps.weight", GGML_TYPE_S11_W2},
+            {"ffn_down_exps.weight", GGML_TYPE_S11_W2},
+            {"ffn_gate_shexp.weight", GGML_TYPE_S11_W2_BF16},
+            {"ffn_up_shexp.weight", GGML_TYPE_S11_W2_BF16},
+            {"ffn_down_shexp.weight", GGML_TYPE_S11_W2_BF16},
+            {"attn_q.weight", GGML_TYPE_S11_W4}, {"attn_k.weight", GGML_TYPE_S11_W4},
+            {"attn_v.weight", GGML_TYPE_S11_W4}, {"attn_output.weight", GGML_TYPE_S11_W4},
+            {"attn_qkv.weight", GGML_TYPE_S11_W4}, {"attn_gate.weight", GGML_TYPE_S11_W4},
+            {"ssm_alpha.weight", GGML_TYPE_S11_W4}, {"ssm_beta.weight", GGML_TYPE_S11_W4},
+            {"ssm_out.weight", GGML_TYPE_S11_W4},
+            {"output.weight", GGML_TYPE_S11_I8}, {"token_embd.weight", GGML_TYPE_S11_I8},
+        };
+        std::set<std::string> seen;
+        for (size_t i = 0; i < count; ++i) {
+            const std::string name = gguf_get_arr_str(metadata, names_key, i);
+            require_s11(seen.insert(name).second, "duplicate tensor in schema");
+            const auto weight = weights_map.find(name);
+            require_s11(weight != weights_map.end(), "missing tensor from schema");
+            const ggml_tensor * tensor = weight->second.tensor;
+            require_s11((int32_t) tensor->type == types[i], "tensor dtype mismatch");
+            require_s11(tensor->type == GGML_TYPE_BF16 || tensor->type == GGML_TYPE_F32 ||
+                        (tensor->type >= GGML_TYPE_S11_W2 && tensor->type <= GGML_TYPE_S11_I8),
+                        "unsupported tensor dtype");
+            const std::string role = name.compare(0, 4, "blk.") == 0 ?
+                name.substr(name.find('.', 4) + 1) : name;
+            const auto expected_type = quantized_roles.find(role);
+            require_s11(expected_type == quantized_roles.end() ?
+                        (tensor->type == GGML_TYPE_BF16 || tensor->type == GGML_TYPE_F32) :
+                        tensor->type == expected_type->second, "module tensor dtype mismatch");
+            for (size_t dim = 0; dim < GGML_MAX_DIMS; ++dim) {
+                require_s11(tensor->ne[dim] == shapes[i * GGML_MAX_DIMS + dim],
+                            "tensor shape mismatch");
+            }
+            if (tensor->type >= GGML_TYPE_S11_W2) {
+                require_s11(tensor->ne[0] % 128 == 0, "non-K128 quantized tensor");
+            }
+        }
+        // Source-native data is always validated, even without --check-tensors.
+        check_tensors = true;
+    }
+
     LLAMA_LOG_INFO("%s: loaded meta data with %d key-value pairs and %d tensors from %s (version %s)\n",
             __func__, n_kv, n_tensors, fname.empty() ? "(file*)" : fname.c_str(), llama_file_version_name(fver));
 

@@ -943,6 +943,36 @@ static const struct ggml_type_traits type_traits[GGML_TYPE_COUNT] = {
         .type_size                = 0,
         .is_quantized             = false,
     },
+    // S11 blocks keep the source FP32 scale after contiguous K128 codes.
+    // No from_float hook: these types must not requantize source weights.
+    [GGML_TYPE_S11_W2] = {
+        .type_name                = "s11_w2",
+        .blck_size                = 128,
+        .type_size                = 36,
+        .is_quantized             = true,
+        .to_float                 = dequantize_row_s11_w2,
+    },
+    [GGML_TYPE_S11_W2_BF16] = {
+        .type_name                = "s11_w2_bf16",
+        .blck_size                = 128,
+        .type_size                = 36,
+        .is_quantized             = true,
+        .to_float                 = dequantize_row_s11_w2_bf16,
+    },
+    [GGML_TYPE_S11_W4] = {
+        .type_name                = "s11_w4",
+        .blck_size                = 128,
+        .type_size                = 68,
+        .is_quantized             = true,
+        .to_float                 = dequantize_row_s11_w4,
+    },
+    [GGML_TYPE_S11_I8] = {
+        .type_name                = "s11_i8",
+        .blck_size                = 128,
+        .type_size                = 132,
+        .is_quantized             = true,
+        .to_float                 = dequantize_row_s11_i8,
+    },
 };
 
 const struct ggml_type_traits * ggml_get_type_traits(enum ggml_type type) {

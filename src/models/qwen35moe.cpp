@@ -1,5 +1,8 @@
 #include "models.h"
 #include "llama-memory-recurrent.h"
+#include "llama-s11.h"
+#include <cstdlib>
+#include <cstring>
 
 void llama_model_qwen35moe::load_arch_hparams(llama_model_loader & ml) {
     ml.get_key_or_arr(LLM_KV_EXPERT_FEED_FORWARD_LENGTH, hparams.n_ff_exp_arr, hparams.n_layer_all, false);
@@ -155,6 +158,8 @@ std::unique_ptr<llm_graph_context> llama_model_qwen35moe::build_arch_graph(const
 
 llama_model_qwen35moe::graph::graph(const llama_model & model, const llm_graph_params & params) :
     llm_build_delta_net_base(params), model(model) {
+    s11_model = model.output && model.output->type == GGML_TYPE_S11_I8;
+    s11_owner = s11_model ? &model : nullptr;
     const int64_t n_embd_head = hparams.n_embd_head_v();
 
     GGML_ASSERT(n_embd_head == hparams.n_embd_head_k());
@@ -194,13 +199,16 @@ llama_model_qwen35moe::graph::graph(const llama_model & model, const llm_graph_p
             cur = build_layer_attn(inp->get_attn(), cur, inp_pos, sections, il);
         }
 
-        if (il == n_layer - 1 && crop_before_nextn(inp_out_ids)) {
+        if (!s11_model && il == n_layer - 1 && crop_before_nextn(inp_out_ids)) {
             cur   = ggml_get_rows(ctx0, cur, inp_out_ids);
             inpSA = ggml_get_rows(ctx0, inpSA, inp_out_ids);
         }
 
         // Residual connection
         cur = ggml_add(ctx0, cur, inpSA);
+        if (model.output->type == GGML_TYPE_S11_I8) {
+            cur = ggml_cast(ctx0, ggml_cast(ctx0, cur, GGML_TYPE_BF16), GGML_TYPE_F32);
+        }
         cb(cur, "attn_residual", il);
 
         // Save the tensor before post-attention norm for residual connection
@@ -216,6 +224,9 @@ llama_model_qwen35moe::graph::graph(const llama_model & model, const llm_graph_p
 
         // Residual connection for FFN - add to the tensor from before post_attention_layernorm
         cur = ggml_add(ctx0, cur, ffn_residual);
+        if (model.output->type == GGML_TYPE_S11_I8) {
+            cur = ggml_cast(ctx0, ggml_cast(ctx0, cur, GGML_TYPE_BF16), GGML_TYPE_F32);
+        }
         cb(cur, "post_moe", il);
 
         cur = build_cvec(cur, il);
@@ -232,7 +243,7 @@ llama_model_qwen35moe::graph::graph(const llama_model & model, const llm_graph_p
     cb(cur, "h_nextn", -1);
     res->t_h_nextn = cur;
 
-    if (crop_after_nextn(inp_out_ids)) {
+    if ((s11_model && inp_out_ids != nullptr) || crop_after_nextn(inp_out_ids)) {
         cur = ggml_get_rows(ctx0, cur, inp_out_ids);
     }
 
@@ -269,6 +280,13 @@ ggml_tensor * llama_model_qwen35moe::graph::build_norm_gated(
         ggml_tensor * weights,
         ggml_tensor * gate,
         int           layer) {
+    if (model.output->type == GGML_TYPE_S11_I8) {
+        input = ggml_cast(ctx0, ggml_cast(ctx0, input, GGML_TYPE_BF16), GGML_TYPE_F32);
+        ggml_tensor * normalized = ggml_rms_norm(ctx0, input, hparams.f_norm_rms_eps);
+        normalized = ggml_mul(ctx0, normalized, ggml_cast(ctx0, weights, GGML_TYPE_F32));
+        ggml_tensor * output = ggml_mul(ctx0, normalized, ggml_silu(ctx0, gate));
+        return ggml_cast(ctx0, ggml_cast(ctx0, output, GGML_TYPE_BF16), GGML_TYPE_F32);
+    }
     ggml_tensor * normalized = build_norm(input, weights, nullptr, LLM_NORM_RMS, layer);
     ggml_tensor * gated_silu = ggml_silu(ctx0, gate);
 
@@ -331,6 +349,10 @@ ggml_tensor * llama_model_qwen35moe::graph::build_layer_attn(
             n_rot, sections, rope_type, n_ctx_orig, freq_base, freq_scale,
             ext_factor, attn_factor, beta_fast, beta_slow
             );
+    if (s11_model) {
+        Qcur = ggml_cast(ctx0, ggml_cast(ctx0, Qcur, GGML_TYPE_BF16), GGML_TYPE_F32);
+        Kcur = ggml_cast(ctx0, ggml_cast(ctx0, Kcur, GGML_TYPE_BF16), GGML_TYPE_F32);
+    }
 
     cb(Qcur, "Qcur", il);
     cb(Kcur, "Kcur", il);
@@ -345,6 +367,10 @@ ggml_tensor * llama_model_qwen35moe::graph::build_layer_attn(
     cb(cur, "attn_pregate", il);
 
     ggml_tensor * gate_sigmoid = ggml_sigmoid(ctx0, gate);
+    if (s11_model) {
+        gate_sigmoid = ggml_cast(ctx0, ggml_cast(ctx0, gate_sigmoid, GGML_TYPE_BF16), GGML_TYPE_F32);
+        cur = ggml_cast(ctx0, ggml_cast(ctx0, cur, GGML_TYPE_BF16), GGML_TYPE_F32);
+    }
     cb(gate_sigmoid, "gate_sigmoid", il);
 
     cur = ggml_mul(ctx0, cur, gate_sigmoid);
@@ -384,17 +410,26 @@ ggml_tensor * llama_model_qwen35moe::graph::build_layer_attn_linear(
     cb(beta, "beta", il);
 
     beta = ggml_sigmoid(ctx0, beta);
+    if (s11_model) {
+        beta = ggml_cast(ctx0, ggml_cast(ctx0, beta, GGML_TYPE_BF16), GGML_TYPE_F32);
+    }
     cb(beta, "beta_sigmoid", il);
 
     ggml_tensor * alpha = build_lora_mm(model.layers[il].ssm_alpha, cur, model.layers[il].ssm_alpha_s);
     alpha = ggml_reshape_3d(ctx0, alpha, num_v_heads, n_seq_tokens, n_seqs);
     cb(alpha, "alpha", il);
 
-    ggml_tensor * alpha_biased   = ggml_add(ctx0, alpha, model.layers[il].ssm_dt);
+    ggml_tensor * dt_bias = model.layers[il].ssm_dt;
+    ggml_tensor * decay = model.layers[il].ssm_a;
+    if (s11_model) {
+        dt_bias = ggml_cast(ctx0, dt_bias, GGML_TYPE_F32);
+        decay = ggml_scale(ctx0, ggml_exp(ctx0, ggml_cast(ctx0, decay, GGML_TYPE_F32)), -1.0f);
+    }
+    ggml_tensor * alpha_biased   = ggml_add(ctx0, alpha, dt_bias);
     ggml_tensor * alpha_softplus = ggml_softplus(ctx0, alpha_biased);
     cb(alpha_softplus, "a_softplus", il);
 
-    ggml_tensor * gate = ggml_mul(ctx0, alpha_softplus, model.layers[il].ssm_a);  // -A_log.exp() * softplus
+    ggml_tensor * gate = ggml_mul(ctx0, alpha_softplus, decay);
     cb(gate, "gate", il);
 
     gate = ggml_reshape_4d(ctx0, gate, 1, num_v_heads, n_seq_tokens, n_seqs);
@@ -403,6 +438,9 @@ ggml_tensor * llama_model_qwen35moe::graph::build_layer_attn_linear(
     ggml_tensor * ssm_states_all  = mctx_cur->get_s_l(il);
 
     ggml_tensor * conv_kernel      = model.layers[il].ssm_conv1d;
+    if (s11_model) {
+        conv_kernel = ggml_cast(ctx0, conv_kernel, GGML_TYPE_F32);
+    }
     const int64_t conv_kernel_size = conv_kernel->ne[0];
     const int64_t conv_channels    = d_inner + 2 * hparams.ssm_n_group * hparams.ssm_d_state;
 
@@ -416,6 +454,9 @@ ggml_tensor * llama_model_qwen35moe::graph::build_layer_attn_linear(
     cb(conv_output_proper, "conv_output_raw", il);
 
     ggml_tensor * conv_output_silu = ggml_silu(ctx0, conv_output_proper);
+    if (s11_model) {
+        conv_output_silu = ggml_cast(ctx0, ggml_cast(ctx0, conv_output_silu, GGML_TYPE_BF16), GGML_TYPE_F32);
+    }
     cb(conv_output_silu, "conv_output_silu", il);
 
     ggml_tensor * conv_qkv_mix = conv_output_silu;
@@ -452,6 +493,10 @@ ggml_tensor * llama_model_qwen35moe::graph::build_layer_attn_linear(
 
     q_conv = build_gdn_l2_norm(ctx0, q_conv, eps_norm);
     k_conv = build_gdn_l2_norm(ctx0, k_conv, eps_norm);
+    if (s11_model) {
+        q_conv = ggml_cast(ctx0, ggml_cast(ctx0, q_conv, GGML_TYPE_BF16), GGML_TYPE_F32);
+        k_conv = ggml_cast(ctx0, ggml_cast(ctx0, k_conv, GGML_TYPE_BF16), GGML_TYPE_F32);
+    }
 
     //q_conv = ggml_cont_4d(ctx0, q_conv, head_k_dim, num_k_heads, n_seq_tokens, n_seqs);
     //k_conv = ggml_cont_4d(ctx0, k_conv, head_k_dim, num_k_heads, n_seq_tokens, n_seqs);
@@ -495,17 +540,46 @@ ggml_tensor * llama_model_qwen35moe::graph::build_layer_ffn(ggml_tensor * cur, c
     // Check if this is an MoE layer
     GGML_ASSERT(model.layers[il].ffn_gate_inp != nullptr);
 
+    const char * mode = std::getenv("S11_EXPERT_MODE");
+    const bool native_cpu = s11_model && mode && std::strcmp(mode, "cpu") == 0;
+    const bool native_resident = s11_model && mode && std::strcmp(mode, "gpu-resident") == 0;
+    if (s11_model && mode && !native_cpu && !native_resident &&
+        std::strcmp(mode, "gpu-cache") != 0 && std::strcmp(mode, "hybrid") != 0) {
+        throw std::invalid_argument("S11_EXPERT_MODE must be cpu, gpu-cache, hybrid or gpu-resident");
+    }
+    if (native_resident) {
+        for (const ggml_tensor * weight : {model.layers[il].ffn_gate_exps,
+                                           model.layers[il].ffn_up_exps, model.layers[il].ffn_down_exps}) {
+            if (!weight || !weight->buffer || ggml_backend_buffer_is_host(weight->buffer)) {
+                throw std::invalid_argument("S11 gpu-resident requires all routed banks on device, without --cpu-moe");
+            }
+        }
+        if (moe_cache) {
+            throw std::invalid_argument("S11 gpu-resident does not use a host expert cache");
+        }
+    }
+    if (s11_model && !native_cpu && !native_resident && !moe_cache) {
+        throw std::invalid_argument("S11 GPU expert mode requires an explicit bounded --moe-cache-mib");
+    }
+    ggml_tensor * s11_cpu_output = nullptr;
+    if (native_cpu) {
+        ggml_tensor * logits = build_lora_mm(model.layers[il].ffn_gate_inp, cur);
+        ggml_tensor * ids = ggml_argsort_top_k(ctx0, logits, 8);
+        ggml_tensor * selected = ggml_get_rows(ctx0, ggml_reshape_3d(ctx0, logits, 1, 256, cur->ne[1]), ids);
+        ggml_tensor * probabilities = ggml_soft_max(ctx0, ggml_reshape_2d(ctx0, selected, 8, cur->ne[1]));
+        s11_cpu_output = llama_s11_cpu_experts(ctx0, model, il, cur, ids, probabilities);
+    }
     ggml_tensor * moe_out =
-        build_moe_ffn(cur,
+        native_cpu ? s11_cpu_output : build_moe_ffn(cur,
             model.layers[il].ffn_gate_inp,
             model.layers[il].ffn_up_exps,
             model.layers[il].ffn_gate_exps,
             model.layers[il].ffn_down_exps,
             nullptr,
             n_expert, n_expert_used,
-            LLM_FFN_SILU, true,
+            LLM_FFN_SILU, model.output->type != GGML_TYPE_S11_I8,
             hparams.expert_weights_scale,
-            LLAMA_EXPERT_GATING_FUNC_TYPE_SOFTMAX, il,
+            model.output->type == GGML_TYPE_S11_I8 ? LLAMA_EXPERT_GATING_FUNC_TYPE_SOFTMAX_WEIGHT : LLAMA_EXPERT_GATING_FUNC_TYPE_SOFTMAX, il,
             nullptr, model.layers[il].ffn_gate_up_exps,
             model.layers[il].ffn_up_exps_s,
             model.layers[il].ffn_gate_exps_s,
@@ -531,14 +605,23 @@ ggml_tensor * llama_model_qwen35moe::graph::build_layer_ffn(ggml_tensor * cur, c
 
         // Apply sigmoid to the gate
         shared_gate = ggml_sigmoid(ctx0, shared_gate);
+        if (model.output->type == GGML_TYPE_S11_I8) {
+            shared_gate = ggml_cast(ctx0, ggml_cast(ctx0, shared_gate, GGML_TYPE_BF16), GGML_TYPE_F32);
+        }
         cb(shared_gate, "shared_expert_gate_sigmoid", il);
 
 
         // Apply the gate to the shared expert output
         ffn_shexp = ggml_mul(ctx0, ffn_shexp, shared_gate);
+        if (model.output->type == GGML_TYPE_S11_I8) {
+            ffn_shexp = ggml_cast(ctx0, ggml_cast(ctx0, ffn_shexp, GGML_TYPE_BF16), GGML_TYPE_F32);
+        }
         cb(ffn_shexp, "ffn_shexp_gated", il);
 
         cur = ggml_add(ctx0, moe_out, ffn_shexp);
+        if (model.output->type == GGML_TYPE_S11_I8) {
+            cur = ggml_cast(ctx0, ggml_cast(ctx0, cur, GGML_TYPE_BF16), GGML_TYPE_F32);
+        }
         cb(cur, "ffn_out", il);
     } else {
         cur = moe_out;
@@ -549,7 +632,7 @@ ggml_tensor * llama_model_qwen35moe::graph::build_layer_ffn(ggml_tensor * cur, c
 
 // LLM_GRAPH_TYPE_DECODER_MTP draft head for Qwen3.5/3.6 MoE
 llama_model_qwen35moe::graph_mtp::graph_mtp(const llama_model & model, const llm_graph_params & params)
-    : llm_graph_context(params) {
+    :     llm_graph_context(params) {
     GGML_ASSERT(hparams.n_layer_nextn > 0 && "QWEN35MOE MTP requires n_layer_nextn > 0");
     GGML_ASSERT(hparams.n_layer_nextn == 1 && "QWEN35MOE MTP currently only supports a single MTP block");
 

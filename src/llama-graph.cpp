@@ -1,4 +1,5 @@
 #include "llama-graph.h"
+#include "llama-s11.h"
 
 #include "llama-impl.h"
 #include "llama-model.h"
@@ -1553,6 +1554,12 @@ ggml_tensor * llm_graph_context::build_lora_mm(
           ggml_tensor * cur,
           ggml_tensor * w_s) const {
     ggml_tensor * res = ggml_mul_mat(ctx0, w, cur);
+    if (s11_model && (w->type == GGML_TYPE_F32 || w->type == GGML_TYPE_BF16)) {
+        // Private op slot 15 selects phase-stable FP32 products for S11.
+        ggml_prec_set_src(res, GGML_PREC_F32, 1);
+        ggml_prec_set_acc(res, GGML_PREC_F32);
+        res->op_params[15] = 0x533131;
+    }
 
     if (prec_policy) {
         prec_policy->apply(res);
@@ -1659,6 +1666,10 @@ ggml_tensor * llm_graph_context::build_norm(
     }
 
     if (mw) {
+        if (s11_model) {
+            mw = ggml_cast(ctx0, mw, GGML_TYPE_F32);
+            mw = ggml_scale_bias(ctx0, mw, 1.0f, 1.0f);
+        }
         cur = ggml_mul(ctx0, cur, mw);
         if (mb) {
             cb(cur, "norm_w", il);
@@ -1669,6 +1680,9 @@ ggml_tensor * llm_graph_context::build_norm(
         cur = ggml_add(ctx0, cur, mb);
     }
 
+    if (s11_model) {
+        cur = ggml_cast(ctx0, ggml_cast(ctx0, cur, GGML_TYPE_BF16), GGML_TYPE_F32);
+    }
     return cur;
 }
 
@@ -2079,6 +2093,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
          ggml_tensor * selected_experts_in) const {
     const int64_t n_embd   = cur->ne[0];
     const int64_t n_tokens = cur->ne[1];
+    ggml_tensor * s11_input = cur;
     const bool weight_before_ffn = arch == LLM_ARCH_LLAMA4; // for llama4, we apply the sigmoid-ed weights before the FFN
 
     ggml_tensor * logits = nullptr;
@@ -2366,6 +2381,11 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
             GGML_ABORT("fatal error");
     }
 
+    const bool s11_experts = down_exps->type == GGML_TYPE_S11_W2;
+    if (s11_experts) {
+        cur = ggml_mul(ctx0, cur, weights);
+        cur = ggml_cast(ctx0, ggml_cast(ctx0, cur, GGML_TYPE_BF16), GGML_TYPE_F32);
+    }
     experts = build_lora_mm_id(down_exps, cur, selected_experts, down_exps_s, slots); // [n_embd, n_expert_used, n_tokens]
     if (arch == LLM_ARCH_MISTRAL4) {
         // src1 can exceed F16 range
@@ -2382,9 +2402,18 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         cb(experts, "ffn_moe_down_biased", il);
     }
 
-    if (!weight_before_ffn) {
+    if (!weight_before_ffn && !s11_experts) {
         experts = ggml_mul(ctx0, experts, weights);
         cb(experts, "ffn_moe_weighted", il);
+    }
+    const char * s11_mode = std::getenv("S11_EXPERT_MODE");
+    if (s11_experts && s11_owner && s11_mode && std::strcmp(s11_mode, "hybrid") == 0) {
+        if (!moe_cache || !moe_cache->get_slot_map(il, n_tokens, n_expert_used)) {
+            throw std::invalid_argument("S11 hybrid requires a cache and at most 128 tokens per microbatch");
+        }
+        ggml_tensor * cpu_slots = llama_s11_cpu_misses(ctx0, *s11_owner, moe_cache, il,
+                                                     s11_input, selected_experts, weights);
+        experts = ggml_add(ctx0, experts, cpu_slots);
     }
 
     ggml_build_forward_expand(gf, experts);
@@ -2418,6 +2447,9 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         moe_out = ggml_cont(ctx0, moe_out);
     }
 
+    if (s11_experts) {
+        moe_out = ggml_cast(ctx0, ggml_cast(ctx0, moe_out, GGML_TYPE_BF16), GGML_TYPE_F32);
+    }
     cb(moe_out, "ffn_moe_out", il);
 
     return moe_out;
@@ -2483,6 +2515,15 @@ ggml_tensor * llm_graph_context::build_inp_embd(ggml_tensor * tok_embd, float to
     // token embeddings with lora and padding
     auto build_tok = [&](ggml_tensor * ids) {
         ggml_tensor * cur = ggml_get_rows(ctx0, tok_embd, ids);
+        if (s11_model) {
+            const char * placement = std::getenv("S11_EMBEDDING");
+            if (placement && std::strcmp(placement, "cpu") == 0) {
+                GGML_ASSERT(tok_embd->buffer && ggml_backend_buffer_is_host(tok_embd->buffer));
+                ggml_backend_sched_set_tensor_backend(sched, cur, backend_cpu);
+            } else if (placement && std::strcmp(placement, "gpu") != 0) {
+                GGML_ABORT("Invalid S11_EMBEDDING: %s", placement);
+            }
+        }
 
         // apply lora for embedding tokens if needed
         for (const auto & lora : *loras) {
@@ -2814,6 +2855,11 @@ ggml_tensor * llm_graph_context::build_attn_mha(
         cur = ggml_reshape_2d(ctx0, cur, cur->ne[0]*cur->ne[1], cur->ne[2]*cur->ne[3]);
     } else {
         ggml_tensor * kq = ggml_mul_mat(ctx0, k, q);
+        if (s11_model) {
+            ggml_prec_set_src(kq, GGML_PREC_F32, 1);
+            ggml_prec_set_acc(kq, GGML_PREC_F32);
+            kq->op_params[15] = 0x533131;
+        }
         cb(kq, "kq", il);
 
         // note: this op tends to require high floating point range
@@ -2858,6 +2904,11 @@ ggml_tensor * llm_graph_context::build_attn_mha(
         }
 
         ggml_tensor * kqv = ggml_mul_mat(ctx0, v, kq);
+        if (s11_model) {
+            ggml_prec_set_src(kqv, GGML_PREC_F32, 1);
+            ggml_prec_set_acc(kqv, GGML_PREC_F32);
+            kqv->op_params[15] = 0x533131;
+        }
         cb(kqv, "kqv", il);
 
         // for MLA with the absorption optimization, we need to "decompress" from MQA back to MHA

@@ -34,6 +34,10 @@ endif()
 target_include_directories(${TARGET} PRIVATE ../mtmd)
 target_include_directories(${TARGET} PRIVATE ${PROJECT_SOURCE_DIR})
 target_link_libraries(${TARGET} PUBLIC llama-common mtmd ${CMAKE_THREAD_LIBS_INIT})
+if (TARGET ggml-cuda)
+    target_link_libraries(${TARGET} PUBLIC ggml-cuda)
+    target_compile_definitions(${TARGET} PRIVATE S11_SERVER_CUDA)
+endif()
 
 # llama-server-impl: server logic, reusable by app
 

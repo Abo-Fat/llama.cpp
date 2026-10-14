@@ -598,6 +598,13 @@ extern "C" {
 
     LLAMA_API int32_t llama_model_n_ctx_train  (const struct llama_model * model);
     LLAMA_API int32_t llama_model_n_embd       (const struct llama_model * model);
+    LLAMA_API uint64_t llama_model_s11_cpu_assignments(const struct llama_model * model);
+    struct llama_s11_cache_stats {
+        uint64_t routed_upload_bytes;
+        uint64_t route_readbacks;
+        uint64_t route_syncs;
+    };
+    LLAMA_API struct llama_s11_cache_stats llama_s11_cache_statistics(const struct llama_context * ctx);
     LLAMA_API int32_t llama_model_n_embd_inp   (const struct llama_model * model);
     LLAMA_API int32_t llama_model_n_embd_out   (const struct llama_model * model);
     LLAMA_API int32_t llama_model_n_layer      (const struct llama_model * model);
