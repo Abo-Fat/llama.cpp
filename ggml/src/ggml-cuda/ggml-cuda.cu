@@ -3626,6 +3626,10 @@ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
 
 // try and fuse nodes and return the number of nodes to skip
 static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
+    const int s11_fused = ggml_cuda_s11_try_fuse(*cuda_ctx, cgraph, i);
+    if (s11_fused > 0) {
+        return s11_fused;
+    }
     const ggml_tensor * first = cgraph->nodes[i];
     if ((first->op == GGML_OP_MUL_MAT || first->op == GGML_OP_MUL_MAT_ID) &&
         (ggml_cuda_is_s11(first->src[0]->type) || ggml_get_op_params_i32(first, 15) == 0x533131)) {
@@ -4509,6 +4513,9 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
 
             for (int i = 0; i < cgraph->n_nodes; i++) {
                 ggml_tensor * node = cgraph->nodes[i];
+                if (!ggml_cuda_is_view_or_noop(node)) {
+                    ggml_cuda_s11_invalidate_if_written(node->data);
+                }
                 if (is_concurrent_event_active) {
                     GGML_ASSERT(concurrent_event);
 
@@ -4688,6 +4695,8 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
         }
     }
 #endif // USE_CUDA_GRAPH
+
+    ggml_cuda_s11_reset_graph_state();
 
     if (use_cuda_graph && cuda_graph_update_required) {
         // Start CUDA graph capture
@@ -5730,6 +5739,10 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
         case GGML_OP_SUB:
         case GGML_OP_MUL:
         case GGML_OP_DIV:
+            if (op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_BF16 &&
+                op->type == GGML_TYPE_F32 && op->src[0]->buffer == nullptr) {
+                return true;
+            }
             if (op->src[0]->type == GGML_TYPE_BF16 || op->src[1]->type == GGML_TYPE_BF16 || op->type == GGML_TYPE_BF16) {
                 return op->src[0]->type == GGML_TYPE_BF16 && op->type == GGML_TYPE_BF16 &&
                     (op->src[1]->type == GGML_TYPE_BF16 || op->src[1]->type == GGML_TYPE_F32);

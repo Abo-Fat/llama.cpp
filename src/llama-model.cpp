@@ -1,4 +1,5 @@
 #include "llama-model.h"
+#include "llama-s11.h"
 
 #include "llama-arch.h"
 #include "llama-ext.h"
@@ -1307,6 +1308,8 @@ llama_model::llama_model(const llama_model_params & params) : params(params), pi
 }
 
 llama_model::~llama_model() {
+    // Executors borrow immutable pimpl weights and must be destroyed first.
+    llama_s11_release_cpu(*this);
     for (auto * lora : loras) {
         delete lora;
     }

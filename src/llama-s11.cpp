@@ -1,6 +1,8 @@
 #include "llama-s11.h"
 #include "llama-model.h"
 #include "ggml-backend.h"
+#include "ggml-cpu.h"
+#include "ggml-cpp.h"
 #include "llama-moe-cache.h"
 #include "llama-context.h"
 #include "../ggml/src/ggml-cpu/s11-cpu.h"
@@ -9,9 +11,57 @@
 #include <atomic>
 #include <cstdlib>
 #include <sched.h>
+#include <cstring>
 #include <mutex>
 #include <stdexcept>
 #include <vector>
+
+class llama_s11_cpu_head {
+public:
+    std::vector<ggml_bf16_t> values;
+    ggml_context_ptr context;
+    ggml_backend_buffer_ptr buffer;
+    ggml_tensor * weight = nullptr;
+    explicit llama_s11_cpu_head(const ggml_tensor * source) {
+        if (source->type != GGML_TYPE_S11_I8 || !source->buffer ||
+            !ggml_backend_buffer_is_host(source->buffer) || !ggml_is_contiguous(source)) {
+            throw std::invalid_argument("S11 CPU BF16 head requires immutable host I8 weight");
+        }
+        values.resize(ggml_nelements(source) + 32);
+        auto * data = reinterpret_cast<ggml_bf16_t *>((reinterpret_cast<uintptr_t>(values.data()) + 63) & ~uintptr_t(63));
+        context.reset(ggml_init({ggml_tensor_overhead() * 2, nullptr, true}));
+        if (!context) { throw std::runtime_error("Cannot allocate CPU head metadata"); }
+        weight = ggml_new_tensor_2d(context.get(), GGML_TYPE_BF16, source->ne[0], source->ne[1]);
+        ggml_set_name(weight, "s11_cpu_head_bf16");
+        buffer.reset(ggml_backend_cpu_buffer_from_ptr(data, ggml_nelements(source) * sizeof(ggml_bf16_t)));
+        if (!buffer) { throw std::runtime_error("Cannot bind derived CPU head buffer"); }
+        ggml_backend_tensor_alloc(buffer.get(), weight, data);
+        ggml_backend_buffer_set_usage(buffer.get(), GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+        std::vector<float> row(source->ne[0]);
+        char error[256];
+        for (int64_t r = 0; r < source->ne[1]; ++r) {
+            if (s11_cpu_dequantize(S11_CPU_TYPE_I8, static_cast<const char *>(source->data) + r * source->nb[1],
+                                   source->ne[0], row.data(), error, sizeof(error))) {
+                throw std::runtime_error(error);
+            }
+            for (int64_t k = 0; k < source->ne[0]; ++k) {
+                data[r * source->ne[0] + k] = ggml_fp32_to_bf16(row[k]);
+            }
+        }
+    }
+};
+
+ggml_tensor * llama_s11_cpu_head_weight(const llama_model & model) {
+    const char * layout = std::getenv("S11_CPU_HEAD");
+    if (!layout || std::strcmp(layout, "packed") == 0) { return model.output; }
+    if (std::strcmp(layout, "bf16") != 0) { throw std::invalid_argument("Invalid S11_CPU_HEAD"); }
+    const char * matmul = std::getenv("S11_CPU_MATMUL");
+    if (!matmul || (std::strcmp(matmul, "prepared") != 0 && std::strcmp(matmul, "tiled") != 0)) {
+        throw std::invalid_argument("S11 CPU BF16 head requires prepared or tiled CPU matmul");
+    }
+    if (!model.s11_cpu_head) { model.s11_cpu_head = std::make_shared<llama_s11_cpu_head>(model.output); }
+    return model.s11_cpu_head->weight;
+}
 
 class llama_s11_cpu {
 public:
@@ -225,4 +275,10 @@ ggml_tensor * llama_s11_cpu_misses(ggml_context * ctx, const llama_model & model
     ggml_tensor * sources[3] = {ggml_cont(ctx, input), ggml_cont(ctx, ids), ggml_cont(ctx, probabilities)};
     return ggml_custom_4d(ctx, GGML_TYPE_F32, 2048, 8, input->ne[1], 1, sources, 3,
                           execute_s11_misses, 1, model.s11_callbacks[layer].get());
+}
+
+void llama_s11_release_cpu(llama_model & model) {
+    for (auto & callback : model.s11_callbacks) { callback.reset(); }
+    model.s11_cpu_head.reset();
+    model.s11_cpu.reset();
 }

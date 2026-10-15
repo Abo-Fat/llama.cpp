@@ -11,16 +11,19 @@
 #include <sched.h>
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <cfenv>
 #include <cmath>
 #include <condition_variable>
 #include <cstdio>
 #include <cstring>
+#include <cstdlib>
 #include <limits>
 #include <memory>
 #include <mutex>
 #include <stdexcept>
+#include <string>
 #include <thread>
 #include <vector>
 
@@ -74,9 +77,8 @@ int sum128(const int8_t * x) {
     return hsum(acc);
 }
 
-int dot128(const uint8_t * p, const int8_t * x, int correction) {
+void unpack128(const uint8_t * p, __m256i w[4]) {
     const __m256i mask = _mm256_set1_epi8(3);
-    const __m256i one = _mm256_set1_epi16(1);
     const __m256i packed = _mm256_loadu_si256(reinterpret_cast<const __m256i *>(p));
     const __m256i a = _mm256_and_si256(packed, mask);
     const __m256i b = _mm256_and_si256(_mm256_srli_epi16(packed, 2), mask);
@@ -86,10 +88,16 @@ int dot128(const uint8_t * p, const int8_t * x, int correction) {
     const __m256i cd0 = _mm256_unpacklo_epi8(c, d), cd1 = _mm256_unpackhi_epi8(c, d);
     const __m256i t0 = _mm256_unpacklo_epi16(ab0, cd0), t1 = _mm256_unpackhi_epi16(ab0, cd0);
     const __m256i t2 = _mm256_unpacklo_epi16(ab1, cd1), t3 = _mm256_unpackhi_epi16(ab1, cd1);
-    const __m256i w[4] = {
-        _mm256_permute2x128_si256(t0, t1, 0x20), _mm256_permute2x128_si256(t2, t3, 0x20),
-        _mm256_permute2x128_si256(t0, t1, 0x31), _mm256_permute2x128_si256(t2, t3, 0x31),
-    };
+    w[0] = _mm256_permute2x128_si256(t0, t1, 0x20);
+    w[1] = _mm256_permute2x128_si256(t2, t3, 0x20);
+    w[2] = _mm256_permute2x128_si256(t0, t1, 0x31);
+    w[3] = _mm256_permute2x128_si256(t2, t3, 0x31);
+}
+
+int dot128(const uint8_t * p, const int8_t * x, int correction) {
+    __m256i w[4];
+    unpack128(p, w);
+    const __m256i one = _mm256_set1_epi16(1);
     __m256i acc = _mm256_setzero_si256();
     for (int j = 0; j < 4; ++j) {
         const __m256i q = _mm256_loadu_si256(reinterpret_cast<const __m256i *>(x + j * 32));
@@ -166,6 +174,55 @@ struct Route {
     int token, slot, expert;
     float probability;
 };
+
+int option(const char * name, const char * enabled) {
+    const char * value = std::getenv(name);
+    if (!value || std::strcmp(value, "reference") == 0) { return 0; }
+    if (std::strcmp(value, enabled) == 0) { return 1; }
+    throw std::invalid_argument(std::string("Invalid ") + name);
+}
+
+std::vector<uint8_t> interleave4(const uint8_t * source, int experts, int rows, int k) {
+    const size_t bytes = size_t(experts) * rows * (k / G) * B;
+    std::vector<uint8_t> packed(bytes);
+    for (int e = 0; e < experts; ++e) {
+        for (int row = 0; row < rows; ++row) {
+            for (int g = 0; g < k / G; ++g) {
+                const size_t src = ((size_t(e) * rows + row) * (k / G) + g) * B;
+                const size_t dst = ((size_t(e) * (rows / 4) + row / 4) * (k / G) * 4 + g * 4 + row % 4) * B;
+                std::memcpy(packed.data() + dst, source + src, B);
+                if (std::memcmp(packed.data() + dst, source + src, B)) {
+                    throw std::runtime_error("S11 interleaved inverse block mismatch");
+                }
+            }
+        }
+    }
+    return packed;
+}
+
+void integer_tile(const uint8_t * packed, const int8_t * const * q, const float * const * scales,
+                  const int32_t * const * corrections, int k, int columns, float values[4][4]) {
+    for (int g = 0; g < k / G; ++g) {
+        for (int row = 0; row < 4; ++row) {
+            const uint8_t * block = packed + (g * 4 + row) * B;
+            __m256i w[4];
+            unpack128(block, w);
+            // Keep each K128 dot independent: row scale cannot be hoisted over K.
+            for (int col = 0; col < columns; ++col) {
+                __m256i acc = _mm256_setzero_si256();
+                for (int part = 0; part < 4; ++part) {
+                    const auto x = _mm256_loadu_si256(reinterpret_cast<const __m256i *>(q[col] + g * G + part * 32));
+                    acc = _mm256_add_epi32(acc, _mm256_madd_epi16(_mm256_maddubs_epi16(w[part], x), _mm256_set1_epi16(1)));
+                }
+                const int dot = hsum(acc) - corrections[col][g];
+                values[col][row] = values[col][row] + (float(dot) * scales[col][g]) * load_scale(block);
+            }
+        }
+    }
+    for (int col = 0; col < columns; ++col) {
+        for (int row = 0; row < 4; ++row) { values[col][row] = bf16(values[col][row]); }
+    }
+}
 } // namespace
 
 struct s11_cpu_pool {
@@ -280,6 +337,11 @@ struct s11_cpu_executor {
     std::vector<int8_t> qx, qm;
     std::vector<float> sx, sm, fc1, middle;
     std::vector<int32_t> sums_x, sums_m;
+    std::vector<uint8_t> packed_gate, packed_up, packed_down;
+    std::vector<int> order;
+    std::vector<std::array<int, 4>> batches;
+    int batch_count = 0;
+    bool tiled = false;
     const float * input = nullptr;
     uint16_t * output = nullptr;
     std::atomic<bool> numeric{false};
@@ -290,10 +352,19 @@ struct s11_cpu_executor {
         bytes = checked_mul(r, sizeof(Route));
         bytes += checked_mul(mt, h + (h / G) * (sizeof(float) + sizeof(int32_t)));
         bytes += checked_mul(r, f + (f / G) * (sizeof(float) + sizeof(int32_t)) + 3 * f * sizeof(float));
+        bytes += checked_mul(r, sizeof(int) + sizeof(std::array<int, 4>));
         if (bytes > limit || bytes > MAX_WORKSPACE) {
             throw std::invalid_argument("Workspace budget exceeded (maximum 512 MiB)");
         }
         source_bytes = w.gate_bytes + w.up_bytes + w.down_bytes;
+        tiled = option("S11_CPU_EXPERT_LAYOUT", "interleaved4") != 0;
+        if (tiled) {
+            packed_gate = interleave4(w.gate, w.experts, f, h);
+            packed_up = interleave4(w.up, w.experts, f, h);
+            packed_down = interleave4(w.down, w.experts, h, f);
+        }
+        order.resize(r);
+        batches.resize(r);
         routes.resize(r);
         qx.resize(mt * h); sx.resize(mt * h / G); sums_x.resize(mt * h / G);
         qm.resize(r * f); sm.resize(r * f / G); sums_m.resize(r * f / G);
@@ -361,6 +432,48 @@ struct s11_cpu_executor {
             out[j] = bf16_bits(v);
         }
     }
+
+    static void tiled_job(s11_cpu_executor & e, size_t job, bool down) {
+        const int n = down ? e.weights.hidden : e.weights.intermediate;
+        const int k = down ? e.weights.intermediate : e.weights.hidden;
+        const int begin = (job % (n / 4)) * 4;
+        const auto & batch = e.batches[job / (n / 4)];
+        const int expert = e.routes[batch[0]].expert;
+        const int8_t * q[4];
+        const float * scales[4];
+        const int32_t * corrections[4];
+        int columns = 0;
+        for (; columns < 4 && batch[columns] >= 0; ++columns) {
+            const int r = batch[columns];
+            const int source = down ? r : e.routes[r].token;
+            q[columns] = (down ? e.qm.data() : e.qx.data()) + size_t(source) * k;
+            scales[columns] = (down ? e.sm.data() : e.sx.data()) + size_t(source) * (k / G);
+            corrections[columns] = (down ? e.sums_m.data() : e.sums_x.data()) + size_t(source) * (k / G);
+        }
+        const size_t offset = (size_t(expert) * n + begin) * (k / G) * B;
+        float values[4][4] = {};
+        integer_tile((down ? e.packed_down.data() : e.packed_gate.data()) + offset,
+                     q, scales, corrections, k, columns, values);
+        float ups[4][4] = {};
+        if (!down) {
+            integer_tile(e.packed_up.data() + offset, q, scales, corrections, k, columns, ups);
+        }
+        for (int col = 0; col < columns; ++col) {
+            const int r = batch[col];
+            for (int row = 0; row < 4; ++row) {
+                if (down) {
+                    const auto & route = e.routes[r];
+                    e.output[(size_t(route.token) * e.slots + route.slot) * n + begin + row] = bf16_bits(values[col][row]);
+                    if (!std::isfinite(values[col][row])) { e.numeric.store(true, std::memory_order_relaxed); }
+                } else {
+                    e.fc1[size_t(r) * 2 * n + begin + row] = values[col][row];
+                    e.fc1[size_t(r) * 2 * n + n + begin + row] = ups[col][row];
+                }
+            }
+        }
+    }
+    static void tiled_fc1(void * ctx, size_t job) { tiled_job(*static_cast<s11_cpu_executor *>(ctx), job, false); }
+    static void tiled_down(void * ctx, size_t job) { tiled_job(*static_cast<s11_cpu_executor *>(ctx), job, true); }
 };
 
 extern "C" int s11_cpu_pool_create(int threads, const int * cpus, int n_cpus,
@@ -478,6 +591,20 @@ extern "C" int s11_cpu_execute(s11_cpu_executor * e, const float * x, const int3
         }
     }
     e->input = x; e->output = output; e->tokens = tokens; e->slots = slots; e->active = active;
+    if (e->tiled) {
+        for (int r = 0; r < active; ++r) { e->order[r] = r; }
+        std::sort(e->order.begin(), e->order.begin() + active,
+                  [e](int a, int b) { return e->routes[a].expert < e->routes[b].expert; });
+        e->batch_count = 0;
+        for (int r = 0; r < active;) {
+            auto & batch = e->batches[e->batch_count++];
+            batch.fill(-1);
+            const int expert = e->routes[e->order[r]].expert;
+            for (int col = 0; col < 4 && r < active && e->routes[e->order[r]].expert == expert; ++col) {
+                batch[col] = e->order[r++];
+            }
+        }
+    }
     e->numeric.store(false, std::memory_order_relaxed);
     std::memset(output, 0, size_t(tokens) * slots * e->weights.hidden * sizeof(uint16_t));
     if (active) {
@@ -485,7 +612,9 @@ extern "C" int s11_cpu_execute(s11_cpu_executor * e, const float * x, const int3
         if (e->numeric.load(std::memory_order_relaxed)) {
             return fail(S11_CPU_NUMERIC, error, size, "A128 input scale overflow");
         }
-        e->pool->run(size_t(active) * ((e->weights.intermediate + TILE - 1) / TILE), s11_cpu_executor::fc1_job, e);
+        e->pool->run(e->tiled ? size_t(e->batch_count) * (e->weights.intermediate / 4) :
+                    size_t(active) * ((e->weights.intermediate + TILE - 1) / TILE),
+                    e->tiled ? s11_cpu_executor::tiled_fc1 : s11_cpu_executor::fc1_job, e);
         if (!finite(e->fc1.data(), size_t(active) * 2 * e->weights.intermediate)) {
             return fail(S11_CPU_NUMERIC, error, size, "FC1 BF16 overflow");
         }
@@ -493,7 +622,9 @@ extern "C" int s11_cpu_execute(s11_cpu_executor * e, const float * x, const int3
         if (e->numeric.load(std::memory_order_relaxed)) {
             return fail(S11_CPU_NUMERIC, error, size, "SwiGLU BF16 or A128 intermediate overflow");
         }
-        e->pool->run(size_t(active) * ((e->weights.hidden + TILE - 1) / TILE), s11_cpu_executor::down_job, e);
+        e->pool->run(e->tiled ? size_t(e->batch_count) * (e->weights.hidden / 4) :
+                    size_t(active) * ((e->weights.hidden + TILE - 1) / TILE),
+                    e->tiled ? s11_cpu_executor::tiled_down : s11_cpu_executor::down_job, e);
         if (e->numeric.load(std::memory_order_relaxed)) {
             return fail(S11_CPU_NUMERIC, error, size, "FC2 BF16 overflow");
         }
@@ -543,6 +674,19 @@ int code(const uint8_t * p, int j, int type) {
         return (u ^ 8) - 8;
     }
     return int((p[j / 4] >> ((j % 4) * 2)) & 3) - 1;
+}
+
+__attribute__((always_inline)) inline __m256 restore8(const uint8_t * block, int j, int type) {
+    alignas(32) int32_t codes[8];
+    for (int i = 0; i < 8; ++i) { codes[i] = code(block, j + i, type); }
+    const __m256 c = _mm256_cvtepi32_ps(_mm256_load_si256(reinterpret_cast<const __m256i *>(codes)));
+    const __m256 scale = _mm256_set1_ps(load_scale(block, block_bytes(type) - 4));
+    const __m256 v = type == S11_CPU_TYPE_I8 ? _mm256_div_ps(c, scale) : _mm256_mul_ps(c, scale);
+    const __m256i bits = _mm256_castps_si256(v);
+    const __m256i tie = _mm256_and_si256(_mm256_srli_epi32(bits, 16), _mm256_set1_epi32(1));
+    return _mm256_castsi256_ps(_mm256_and_si256(
+        _mm256_add_epi32(bits, _mm256_add_epi32(_mm256_set1_epi32(0x7fff), tie)),
+        _mm256_set1_epi32(int(0xffff0000u))));
 }
 
 bool valid_block(const uint8_t * p, int type, int bytes) {
@@ -655,18 +799,9 @@ extern "C" int s11_cpu_prepared_dot(int type, const void * packed, const float *
     }
     const auto * p = static_cast<const uint8_t *>(packed);
     float value = 0;
-    const __m256i mask = _mm256_set1_epi32(int(0xffff0000u));
     for (int g = 0; g < k / G; ++g, p += bytes) {
-        const __m256 scale = _mm256_set1_ps(load_scale(p, bytes - 4));
         for (int j = 0; j < G; j += 8) {
-            alignas(32) int32_t codes[8];
-            for (int i = 0; i < 8; ++i) { codes[i] = code(p, j + i, type); }
-            const __m256 c = _mm256_cvtepi32_ps(_mm256_load_si256(reinterpret_cast<const __m256i *>(codes)));
-            const __m256 restored = type == S11_CPU_TYPE_I8 ? _mm256_div_ps(c, scale) : _mm256_mul_ps(c, scale);
-            const __m256i bits = _mm256_castps_si256(restored);
-            const __m256i tie = _mm256_and_si256(_mm256_srli_epi32(bits, 16), _mm256_set1_epi32(1));
-            const __m256 rounded = _mm256_castsi256_ps(_mm256_and_si256(
-                _mm256_add_epi32(bits, _mm256_add_epi32(_mm256_set1_epi32(0x7fff), tie)), mask));
+            const __m256 rounded = restore8(p, j, type);
             alignas(32) float products[8];
             _mm256_store_ps(products, _mm256_mul_ps(_mm256_loadu_ps(prepared + g * G + j), rounded));
             for (float product : products) { value = value + product; }
@@ -674,4 +809,74 @@ extern "C" int s11_cpu_prepared_dot(int type, const void * packed, const float *
     }
     *out = bf16(value);
     return std::isfinite(*out) ? S11_CPU_OK : fail(S11_CPU_NUMERIC, error, size, "Prepared dot overflow");
+}
+
+extern "C" int s11_cpu_prepared_tile(int type, const void * packed, size_t stride,
+                                    const float * prepared, int k, int rows, int columns,
+                                    float * out, size_t out_stride, char * error, size_t size) {
+    const int bytes = block_bytes(type);
+    if (type < S11_CPU_TYPE_W2_BF16 || type > S11_CPU_TYPE_I8 || !packed || !prepared || !out ||
+        k <= 0 || k % G || rows < 1 || rows > 4 || columns < 1 || columns > 4 ||
+        stride < size_t(k / G) * bytes || out_stride < size_t(rows)) {
+        return fail(S11_CPU_INVALID, error, size, "Invalid prepared tile");
+    }
+    float sums[4][4] = {};
+    for (int g = 0; g < k / G; ++g) {
+        for (int j = 0; j < G; j += 8) {
+            __m256 activations[4];
+            for (int col = 0; col < columns; ++col) {
+                activations[col] = _mm256_loadu_ps(prepared + size_t(col) * k + g * G + j);
+            }
+            for (int row = 0; row < rows; ++row) {
+                const auto * block = static_cast<const uint8_t *>(packed) + row * stride + g * bytes;
+                const __m256 w = restore8(block, j, type);
+                for (int col = 0; col < columns; ++col) {
+                    alignas(32) float products[8];
+                    _mm256_store_ps(products, _mm256_mul_ps(activations[col], w));
+                    for (float product : products) { sums[col][row] = sums[col][row] + product; }
+                }
+            }
+        }
+    }
+    for (int col = 0; col < columns; ++col) {
+        for (int row = 0; row < rows; ++row) {
+            out[col * out_stride + row] = bf16(sums[col][row]);
+            if (!std::isfinite(out[col * out_stride + row])) {
+                return fail(S11_CPU_NUMERIC, error, size, "Prepared tile overflow");
+            }
+        }
+    }
+    return S11_CPU_OK;
+}
+
+extern "C" int s11_cpu_bf16_head_dot(const uint16_t * weights, const float * prepared, int k,
+                                    float * out, char * error, size_t size) {
+    if (!weights || !prepared || !out || k <= 0 || k % G) {
+        return fail(S11_CPU_INVALID, error, size, "Invalid BF16 head dot");
+    }
+    float sum = 0;
+    for (int j = 0; j < k; j += 8) {
+        const auto codes = _mm256_cvtepu16_epi32(_mm_loadu_si128(reinterpret_cast<const __m128i *>(weights + j)));
+        const __m256 w = _mm256_castsi256_ps(_mm256_slli_epi32(codes, 16));
+        alignas(32) float products[8];
+        _mm256_store_ps(products, _mm256_mul_ps(w, _mm256_loadu_ps(prepared + j)));
+        for (float product : products) { sum = sum + product; }
+    }
+    *out = bf16(sum);
+    return std::isfinite(*out) ? S11_CPU_OK : fail(S11_CPU_NUMERIC, error, size, "BF16 head overflow");
+}
+
+namespace {
+std::atomic<uint64_t> cpu_dispatch[4]{};
+}
+
+extern "C" void s11_cpu_record_dispatch(int path) {
+    static const bool enabled = std::getenv("S11_CPU_COVERAGE") != nullptr;
+    if (enabled && path >= 0 && path < 4) { cpu_dispatch[path].fetch_add(1, std::memory_order_relaxed); }
+}
+
+extern "C" void s11_cpu_dispatch_counts(uint64_t counts[4]) {
+    if (counts) {
+        for (int i = 0; i < 4; ++i) { counts[i] = cpu_dispatch[i].load(std::memory_order_relaxed); }
+    }
 }

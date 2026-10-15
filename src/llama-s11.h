@@ -6,6 +6,8 @@
 struct llama_model;
 class llama_moe_cache;
 class llama_s11_cpu;
+ggml_tensor * llama_s11_cpu_head_weight(const llama_model & model);
+void llama_s11_release_cpu(llama_model & model);
 
 ggml_tensor * llama_s11_cpu_experts(ggml_context * ctx, const llama_model & model,
                                   int layer, ggml_tensor * input, ggml_tensor * ids,

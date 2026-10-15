@@ -122,6 +122,13 @@ int s11_cpu_prepare_row(int type, const float * x, int k, float * prepared,
                         char * error, size_t error_size);
 int s11_cpu_prepared_dot(int type, const void * packed, const float * prepared, int k,
                          float * output, char * error, size_t error_size);
+int s11_cpu_prepared_tile(int type, const void * packed, size_t row_stride,
+                          const float * prepared, int k, int rows, int columns,
+                          float * output, size_t output_stride, char * error, size_t error_size);
+int s11_cpu_bf16_head_dot(const uint16_t * weights, const float * prepared, int k,
+                          float * output, char * error, size_t error_size);
+void s11_cpu_record_dispatch(int path);
+void s11_cpu_dispatch_counts(uint64_t counts[4]);
 
 #ifdef __cplusplus
 }

@@ -1,7 +1,12 @@
 #include "llama.h"
 #include "ggml-backend.h"
 #include "ggml-cpu.h"
+#include "../../ggml/src/ggml-cpu/s11-cpu.h"
+#ifndef S11_CHECK_CPU_ONLY
 #include "ggml-cuda.h"
+#else
+static uint64_t ggml_cuda_s11_assignments() { return 0; }
+#endif
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
@@ -10,10 +15,35 @@
 #include <vector>
 #include <array>
 #include <string>
+#include <chrono>
+#include <map>
 
 struct layer_trace {
     std::array<std::vector<float>, 40> last;
+    bool profile = std::getenv("S11_CPU_PROFILE") != nullptr;
+    std::chrono::steady_clock::time_point started;
+    std::map<std::string, std::pair<uint64_t, uint64_t>> timings;
     static bool observe(ggml_tensor * tensor, bool ask, void * data) {
+        auto & trace = *static_cast<layer_trace *>(data);
+        if (trace.profile) {
+            if (ask) {
+                trace.started = std::chrono::steady_clock::now();
+            } else {
+                std::string key = ggml_op_name(tensor->op);
+                key += ":" + std::string(tensor->name).substr(0, std::string(tensor->name).find('-'));
+                if (tensor->op == GGML_OP_MUL_MAT) {
+                    const auto * w = tensor->src[0];
+                    key += ":" + std::string(ggml_type_name(w->type)) +
+                        ":K" + std::to_string(w->ne[0]) + ":N" + std::to_string(w->ne[1]) +
+                        ":M" + std::to_string(tensor->src[1]->ne[1]);
+                }
+                auto & timing = trace.timings[key];
+                ++timing.first;
+                timing.second += std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    std::chrono::steady_clock::now() - trace.started).count();
+            }
+            return true;
+        }
         const std::string name(tensor->name);
         if (name.rfind("l_out-", 0) != 0) {
             return false;
@@ -40,6 +70,9 @@ int main(int argc, char ** argv) {
     ggml_backend_load_all();
     llama_model_params mp = llama_model_default_params();
     const bool gpu = argc >= 3 && std::strcmp(argv[2], "gpu") == 0;
+#ifdef S11_CHECK_CPU_ONLY
+    if (gpu) { std::fprintf(stderr, "CPU-only check cannot run GPU qualification\n"); return 1; }
+#endif
     const char * resident_value = std::getenv("S11_RESIDENT");
     const bool resident = resident_value && std::strcmp(resident_value, "1") == 0;
     if (resident_value && (!resident || !gpu)) {
@@ -73,7 +106,7 @@ int main(int argc, char ** argv) {
     cp.type_v = GGML_TYPE_BF16;
     cp.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_DISABLED;
     layer_trace trace;
-    if (diagnostic) {
+    if (diagnostic || trace.profile) {
         cp.cb_eval = layer_trace::observe;
         cp.cb_eval_user_data = &trace;
     }
@@ -188,6 +221,20 @@ int main(int argc, char ** argv) {
         std::printf("{\"chunk\":%d,\"finite_logits\":%d,\"relative_l2\":%.9g,\"max_absolute\":%.9g,\"position\":32,\"assignments\":%llu}\n",
                     chunk, vocab, relative, maximum, static_cast<unsigned long long>(work));
         llama_batch_free(batch);
+    }
+    for (const auto & entry : trace.timings) {
+        std::printf("{\"cpu_profile\":\"%s\",\"calls\":%llu,\"elapsed_ns\":%llu}\n",
+                    entry.first.c_str(), static_cast<unsigned long long>(entry.second.first),
+                    static_cast<unsigned long long>(entry.second.second));
+    }
+    std::fflush(stdout);
+    if (std::getenv("S11_CPU_COVERAGE")) {
+        uint64_t counts[4];
+        s11_cpu_dispatch_counts(counts);
+        std::printf("{\"cpu_dispatch\":{\"fallback\":%llu,\"prepared\":%llu,\"tiled\":%llu,\"bf16_head\":%llu}}\n",
+                    static_cast<unsigned long long>(counts[0]), static_cast<unsigned long long>(counts[1]),
+                    static_cast<unsigned long long>(counts[2]), static_cast<unsigned long long>(counts[3]));
+        std::fflush(stdout);
     }
     llama_free(ctx);
     llama_model_free(model);

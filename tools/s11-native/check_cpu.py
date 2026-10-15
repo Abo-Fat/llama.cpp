@@ -287,6 +287,8 @@ class Native:
             "vec_dot": [i, v, v, i, v, v, z],
             "prepare_row": [i, v, i, v, v, z],
             "prepared_dot": [i, v, v, i, v, v, z],
+            "prepared_tile": [i, v, z, v, i, i, i, v, z, v, z],
+            "bf16_head_dot": [v, v, i, v, v, z],
         }
         for name, args in signatures.items():
             fn = getattr(self.lib, "s11_cpu_" + name)
@@ -421,6 +423,21 @@ def adapter_checks(native, rng):
             fast = C.c_float()
             native.call("prepared_dot", typ, ptr(packed), ptr(prepared), x.size, C.byref(fast))
             assert fast.value == dot.value, (typ, fast.value, dot.value)
+            rows = np.stack([np.roll(packed, r * (36 if typ == 44 else 68 if typ == 45 else 132))
+                             for r in range(3)])
+            inputs = np.stack([prepared, -prepared, prepared * np.float32(0.5)])
+            tiled = np.empty((3, 3), np.float32)
+            native.call("prepared_tile", typ, ptr(rows), packed.nbytes, ptr(inputs), x.size,
+                        3, 3, ptr(tiled), 3)
+            for col in range(3):
+                for row in range(3):
+                    scalar = C.c_float()
+                    native.call("prepared_dot", typ, ptr(rows[row]), ptr(inputs[col]), x.size, C.byref(scalar))
+                    assert tiled[col, row] == scalar.value, (typ, col, row, tiled[col, row], scalar.value)
+            if typ == 46:
+                head = (restored.view(np.uint32) >> 16).astype(np.uint16)
+                native.call("bf16_head_dot", ptr(head), ptr(prepared), x.size, C.byref(fast))
+                assert fast.value == dot.value
         results[str(typ)] = "dequant_and_dot_exact"
     return results
 
@@ -442,8 +459,8 @@ def invalid_checks(native, packed, x, ids, probabilities):
     mask.flat[0] = 2
     native.execute(x, ids, probabilities, mask, expected=1)
     cases["invalid_miss_byte"] = "rejected"
-    native.execute(np.repeat(x, 18, axis=0), np.repeat(ids, 18, axis=0),
-                   np.repeat(probabilities, 18, axis=0), expected=1)
+    native.execute(np.repeat(x, 129, axis=0), np.repeat(ids, 129, axis=0),
+                   np.repeat(probabilities, 129, axis=0), expected=1)
     cases["token_capacity_exceeded"] = "rejected"
     no_tasks = np.full_like(ids, -1)
     out, trace = native.execute(x, no_tasks, probabilities)
@@ -535,7 +552,7 @@ def main():
     result["math_checks"] = math_checks(native, rng)
     result["adapter_checks"] = adapter_checks(native, rng)
     cases = []
-    for tokens, slots, mode in [(1, 8, "all"), (5, 3, "tail"), (17, 8, "misses"),
+    for tokens, slots, mode in [(1, 8, "all"), (5, 3, "tail"), (17, 8, "misses"), (128, 8, "prefill"),
                                 (5, 8, "none"), (1, 8, "zero"), (3, 8, "probability_zero"),
                                 (2, 8, "extreme_groups")]:
         x = bf16(rng.normal(0, 0.75, (tokens, H)).astype(np.float32))
@@ -563,7 +580,7 @@ def main():
     for threads in sorted(set([1, min(8, len(os.sched_getaffinity(0)))])):
         before_threads = len(os.listdir("/proc/self/task"))
         started = time.perf_counter()
-        native.create(packed, threads)
+        native.create(packed, threads, max_tokens=128)
         prepare_ms = (time.perf_counter() - started) * 1000
         pool_tasks = sorted(int(t) for t in os.listdir("/proc/self/task"))
         assert len(pool_tasks) == before_threads + threads - 1

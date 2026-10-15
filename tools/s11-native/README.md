@@ -146,6 +146,74 @@ not deliver a stable all-load latency win or close the B1 gap.
 `report_hardware.py OUTPUT` verifies100 formal samples, assets, work counts,
 output identity and separate resource budgets.
 
+## CB CPU baseline (CB00-CB12 completed)
+
+The isolated build `baseline-envs/s11-native-cpu/build` uses `GGML_CUDA=OFF`,
+native AVX2, `GGML_OPENMP=OFF` and `GGML_LLAMAFILE=OFF`.
+`run_cpu.sh` pins0-7, disables visible GPU devices, selects native CPU experts,
+`S11_CPU_MATMUL=tiled`, direct expert layout and packed I8 head. The original
+GPU launcher/build and B1 denominator are not replaced. Expert layout
+`reference` means the existing direct packed AVX2 executor, not a Python or
+full-float model fallback. Run the CPU launcher
+under `guard_cpu.py`, not unmonitored:
+
+```bash
+root=/home/v-zning/workspace_qwen
+"$root/vllm-bitnet-cpu-gpu/.venv/bin/python" \
+  "$root/s11-native/tools/s11-native/guard_cpu.py" \
+  --output "$root/outputs/s11-native/cpu-new-run" --timeout 64800 -- \
+  bash "$root/s11-native/tools/s11-native/run_cpu.sh"
+```
+
+The floating4-row/4-column tile shares restored BF16 weights and prepared
+inputs while preserving scalar K accumulation. `tiled` uses the prepared GEMV
+for fewer than4 input columns and the tiled path for4 or more; this is a shape
+rule, not an assumption that M1 is always Decode. The shared restoration helper
+is explicitly inlined to avoid innerloop function-call spills.
+It supports loader-validated,
+immutable, contiguous2D S11 W2_BF16/W4/I8; GGML owns bounded preparation memory.
+Set `S11_CPU_MATMUL=prepared` for the prior CPU adapter. Unsupported production
+S11 matmul dispatch is observable with `S11_CPU_COVERAGE=1` in `check_model.cpp`;
+the initial candidate's complete-state check had0fallback/11474tiled; the final
+shape-specific GEMV/GEMM qualification records both counters separately.
+Counters are diagnostic only, disabled in formal timing.
+
+Two qualified experiments are not defaults:
+- `S11_CPU_EXPERT_LAYOUT=interleaved4` creates executor-owned
+  `[expert][row/4][K128][row%4][36B]` weight banks and batches up to4 current
+  assignments for the same expert. Canonical source stays immutable, routes and
+  output slots stay in their original order, and each group has its own exact
+  dot/scale accumulation. Inverse block checks and M1/5/17/128 chains passed.
+  It adds8.44GiB RSS and lost on developer long requests; `reference` is chosen.
+- `S11_CPU_HEAD=bf16` creates a model-owned aligned BF16 head from canonical I8
+  via bounded row restoration. A private marker selects ordered CPU accumulation
+  without changing `model.output`'s S11 identity. It requires prepared/tiled CPU
+  matmul and host I8 source, has explicit invalid-mode/source errors, and adds
+  about970MiB. Math/state passed after an alignment fix; complete developer
+  request cost did not improve, so `packed` remains selected.
+
+Model destruction explicitly releases CPU callback/executor/head owners before
+the canonical pimpl weight buffers, preserving borrowed-weight lifetime.
+
+This adapts public BitNet row/column/interleaving methods, not its row-scale
+quantization recipe. Group128 scales, probability position, A128 and BF16
+boundaries remain S11. The caller supplies validated immutable weights to the
+trusted prepared/tile/head helpers; checked standalone dequant/vec-dot APIs
+retain malformed-input validation. `report_cpu_baseline.py OUTPUT` verifies
+40 selected formal C0/candidate samples;20 initial compiler-regressed samples
+remain separate (60 retained). The observed four-load request reductions are
+27.8/40.0/15.0/34.3%, with unchanged output IDs and exact useful work.
+Decode only improves modestly to about2.80-2.84token/s; Prefill is the main gain.
+Selected CPU peak RSS11.693GiB, GPU0,8-CPU affinity. No stable or universally
+optimal CPU speed is claimed; developer1+1 is only screening.
+
+The [CB report](../../../outputs/s11-native/20261015-cpu-baseline/REPORT.md)
+records source/binary identities, negative results and stopping boundary.
+The live GPU build/worktree was observed to change concurrently outside this
+CPU task. It was not reverted; CPU C0 used a frozen binary snapshot and final
+CPU measurements used the isolated CPU-only build. Do not infer a new paired
+GPU comparison or an unchanged live GPU binary from these CPU results.
+
 Independent resident reproduction (never treat this as the8GiB launcher):
 
 ```bash

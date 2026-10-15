@@ -1282,9 +1282,10 @@ static void ggml_compute_forward_mul_mat_one_chunk(
 static bool ggml_s11_prepared_matmul(const struct ggml_tensor * dst) {
     const char * mode = getenv("S11_CPU_MATMUL");
     if (!mode || strcmp(mode, "scalar") == 0) { return false; }
-    if (strcmp(mode, "prepared") != 0) { GGML_ABORT("Invalid S11_CPU_MATMUL: %s", mode); }
+    if (strcmp(mode, "prepared") != 0 && strcmp(mode, "tiled") != 0) { GGML_ABORT("Invalid S11_CPU_MATMUL: %s", mode); }
     const struct ggml_tensor * w = dst->src[0], * x = dst->src[1];
-    return w->type >= GGML_TYPE_S11_W2_BF16 && w->type <= GGML_TYPE_S11_I8 &&
+    return ((w->type >= GGML_TYPE_S11_W2_BF16 && w->type <= GGML_TYPE_S11_I8) ||
+            (w->type == GGML_TYPE_BF16 && dst->op_params[13] == 0x533143)) &&
         x->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32 &&
         w->ne[2] == 1 && w->ne[3] == 1 && x->ne[2] == 1 && x->ne[3] == 1 &&
         ggml_is_contiguous(w) && ggml_is_contiguous(x) && ggml_is_contiguous(dst) &&
@@ -1299,16 +1300,47 @@ void ggml_compute_forward_mul_mat(
     const struct ggml_tensor * src1 = dst->src[1];
     if (ggml_s11_prepared_matmul(dst)) {
         const int k = src0->ne[0], n = src0->ne[1], m = src1->ne[1];
+        if (params->ith == 0) {
+            s11_cpu_record_dispatch(src0->type == GGML_TYPE_BF16 ? 3 :
+                                    strcmp(getenv("S11_CPU_MATMUL"), "tiled") == 0 && m >= 4 ? 2 : 1);
+        }
         GGML_ASSERT(k % 128 == 0 && params->wsize >= (size_t) k * m * sizeof(float));
         float * prepared = (float *) params->wdata;
         char error[256];
         for (int token = params->ith; token < m; token += params->nth) {
-            if (s11_cpu_prepare_row(src0->type, (const float *) src1->data + (size_t) token * k,
+            if (s11_cpu_prepare_row(src0->type == GGML_TYPE_BF16 ? S11_CPU_TYPE_I8 : src0->type,
+                                     (const float *) src1->data + (size_t) token * k,
                                      k, prepared + (size_t) token * k, error, sizeof(error))) {
                 GGML_ABORT("S11 CPU prepare: %s", error);
             }
         }
         ggml_barrier(params->threadpool);
+        if (src0->type == GGML_TYPE_BF16) {
+            for (int token = 0; token < m; ++token) {
+                for (int row = (int64_t) n * params->ith / params->nth;
+                     row < (int64_t) n * (params->ith + 1) / params->nth; ++row) {
+                    if (s11_cpu_bf16_head_dot((const uint16_t *) src0->data + (size_t) row * k,
+                                              prepared + (size_t) token * k, k,
+                                              (float *) dst->data + (size_t) token * n + row, error, sizeof(error))) {
+                        GGML_ABORT("S11 CPU BF16 head: %s", error);
+                    }
+                }
+            }
+            return;
+        }
+        if (strcmp(getenv("S11_CPU_MATMUL"), "tiled") == 0 && m >= 4) {
+            const int row_tiles = (n + 3) / 4, column_tiles = (m + 3) / 4;
+            const int tasks = row_tiles * column_tiles;
+            for (int task = params->ith; task < tasks; task += params->nth) {
+                const int row = (task % row_tiles) * 4, token = (task / row_tiles) * 4;
+                if (s11_cpu_prepared_tile(src0->type, (const char *) src0->data + row * src0->nb[1], src0->nb[1],
+                                          prepared + (size_t) token * k, k, MIN(4, n - row), MIN(4, m - token),
+                                          (float *) dst->data + (size_t) token * n + row, n, error, sizeof(error))) {
+                    GGML_ABORT("S11 CPU tile: %s", error);
+                }
+            }
+            return;
+        }
         for (int token = 0; token < m; ++token) {
             for (int row = (int64_t) n * params->ith / params->nth;
                  row < (int64_t) n * (params->ith + 1) / params->nth; ++row) {
@@ -1322,6 +1354,9 @@ void ggml_compute_forward_mul_mat(
         return;
     }
 
+    if (params->ith == 0 && src0->type >= GGML_TYPE_S11_W2_BF16 && src0->type <= GGML_TYPE_S11_I8) {
+        s11_cpu_record_dispatch(0);
+    }
     const int32_t hint = ggml_get_op_params_i32(dst, 1);
     if (hint == GGML_HINT_SRC0_IS_HADAMARD && !params->use_ref) {
         ggml_compute_forward_fwht(params, dst);
