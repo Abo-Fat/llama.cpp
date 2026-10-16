@@ -3906,8 +3906,8 @@ private:
 
                     bool do_checkpoint = params_base.n_ctx_checkpoints > 0;
 
-                    // make checkpoints only for completion tasks
-                    do_checkpoint = do_checkpoint && slot.task->type == SERVER_TASK_TYPE_COMPLETION;
+                    // make checkpoints only for completion tasks with prompt caching enabled
+                    do_checkpoint = do_checkpoint && slot.task->type == SERVER_TASK_TYPE_COMPLETION && slot.task->params.cache_prompt;
 
                     // make a checkpoint of the parts of the memory that cannot be rolled back.
                     // checkpoints are created only if:

@@ -9,6 +9,7 @@
 #include <vector>
 
 struct llama_model;
+struct llama_ubatch;
 
 // keeps the most recently used experts of host-resident MoE layers in a device buffer
 // each layer has a slot map in host memory: when the scheduler copies it to the device, the copy callback uploads the missing experts
@@ -17,6 +18,9 @@ public:
     // backends are all the backends of the context, each GPU gets its own cache of the given size for the layers assigned to it
     llama_moe_cache(const llama_model & model, const std::vector<ggml_backend_t> & backends, const std::vector<ggml_backend_buffer_type_t> & bufts, size_t size);
     ~llama_moe_cache();
+
+    // notify the cache of the current microbatch before graph execution
+    void begin_ubatch(const llama_ubatch & ubatch, bool graph_reused);
 
     // the device that caches layer il
     ggml_backend_t backend(int32_t il) const;

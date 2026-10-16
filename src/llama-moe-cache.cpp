@@ -1,11 +1,13 @@
 #include "llama-moe-cache.h"
 
+#include "llama-batch.h"
 #include "llama-impl.h"
 #include "llama-model.h"
 
 #include "ggml-cpp.h"
 
 #include <algorithm>
+#include <array>
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
@@ -22,6 +24,11 @@ struct moe_cache_lru {
 
     std::vector<int32_t *> slot_map; // [n_layer] data of the slot maps, -1 if the expert is not cached
     std::vector<int32_t>   key_of;   // [n_slots] il*n_expert + expert, -1 if empty
+    std::vector<bool>      dirty_layers; // [n_layer] true if slot_map[il] was modified since last GPU upload
+    std::vector<uint8_t>   decode_pinned; // [n_slots] 1 if used by small (decode) batch
+    int32_t                n_occupied = 0;
+    int32_t                n_pinned   = 0;
+    int32_t                scratch_cursor = 0;
 
     // doubly linked list of the slots, head is the least recently used
     std::vector<int32_t> prev;
@@ -38,6 +45,11 @@ struct moe_cache_lru {
         this->n_slots  = n_slots;
         slot_map.assign(n_layer, nullptr);
         key_of.assign(n_slots, -1);
+        dirty_layers.assign(n_layer, true);
+        decode_pinned.assign(n_slots, 0);
+        n_occupied = 0;
+        n_pinned   = 0;
+        scratch_cursor = 0;
         prev.resize(n_slots);
         next.resize(n_slots);
         for (int32_t s = 0; s < n_slots; ++s) {
@@ -72,12 +84,81 @@ struct moe_cache_lru {
         int32_t slot;
     };
 
+    int32_t pick_victim_slot(int32_t il, bool is_decode) {
+        // When unfilled slots remain at head, always use head first
+        if (key_of[head] < 0) {
+            return head;
+        }
+        // Standard LRU from head, protecting decode-pinned slots during prefill
+        int32_t cur = head;
+        while (cur >= 0) {
+            if ((key_of[cur] < 0 || (key_of[cur] / n_expert) != il) &&
+                (is_decode || !decode_pinned[cur] || n_pinned >= 2048)) {
+                return cur;
+            }
+            cur = next[cur];
+        }
+        return head;
+    }
+
+    bool plan_from_uniq(int32_t il, size_t n_ids, std::vector<fill> & fills, size_t & n_hit, bool admit = true) {
+        fills.clear();
+        n_hit = 0;
+        if (uniq.size() > (size_t) n_slots) {
+            return false;
+        }
+
+        int32_t * slots = slot_map[il];
+        const bool is_decode = n_ids <= 32;
+
+        for (int32_t e : uniq) {
+            const int32_t s = slots[e];
+            if (s >= 0) {
+                if (is_decode && !decode_pinned[s] && n_pinned < 2048) {
+                    decode_pinned[s] = 1;
+                    n_pinned++;
+                }
+                touch(s);
+                n_hit++;
+            }
+        }
+        if (!admit || n_hit == uniq.size()) {
+            return true;
+        }
+        std::sort(uniq.begin(), uniq.end());
+        for (int32_t e : uniq) {
+            if (slots[e] >= 0) {
+                continue;
+            }
+            const int32_t s = pick_victim_slot(il, is_decode);
+            if (key_of[s] >= 0) {
+                const int32_t old_il = key_of[s] / n_expert;
+                const int32_t old_e  = key_of[s] % n_expert;
+                slot_map[old_il][old_e] = -1;
+                dirty_layers[old_il] = true;
+                if (decode_pinned[s]) {
+                    decode_pinned[s] = 0;
+                    n_pinned--;
+                }
+            } else {
+                n_occupied++;
+            }
+            key_of[s] = il*n_expert + e;
+            slots[e] = s;
+            dirty_layers[il] = true;
+            if (is_decode && n_pinned < 2048) {
+                decode_pinned[s] = 1;
+                n_pinned++;
+            }
+            touch(s);
+            fills.push_back({ e, s });
+        }
+        return true;
+    }
+
     // give a slot to each expert selected by ids in layer il, the misses evict the least recently used experts
     // returns false if the ids select more distinct experts than there are slots
     bool plan(int32_t il, const int32_t * ids, size_t n_ids, std::vector<fill> & fills, size_t & n_hit, bool admit = true) {
-        fills.clear();
-        n_hit = 0;
-
         if (++seen_gen == 0) {
             std::fill(seen.begin(), seen.end(), 0);
             seen_gen = 1;
@@ -90,38 +171,7 @@ struct moe_cache_lru {
                 uniq.push_back(ids[i]);
             }
         }
-        if (uniq.size() > (size_t) n_slots) {
-            return false;
-        }
-
-        int32_t * slots = slot_map[il];
-
-        // hits go to the tail first, so the head can be evicted below
-        for (int32_t e : uniq) {
-            if (slots[e] >= 0) {
-                touch(slots[e]);
-                n_hit++;
-            }
-        }
-        // sorted misses usually get consecutive slots, so the uploads can be merged
-        if (!admit) {
-            return true;
-        }
-        std::sort(uniq.begin(), uniq.end());
-        for (int32_t e : uniq) {
-            if (slots[e] >= 0) {
-                continue;
-            }
-            const int32_t s = head;
-            if (key_of[s] >= 0) {
-                slot_map[key_of[s] / n_expert][key_of[s] % n_expert] = -1;
-            }
-            key_of[s] = il*n_expert + e;
-            slots[e] = s;
-            touch(s);
-            fills.push_back({ e, s });
-        }
-        return true;
+        return plan_from_uniq(il, n_ids, fills, n_hit, admit);
     }
 };
 
@@ -222,6 +272,19 @@ struct llama_moe_cache::impl {
     std::vector<int32_t> ids;
     std::vector<moe_cache_lru::fill> fills;
 
+    struct ubatch_route_record {
+        uint64_t valid_layers = 0;
+        size_t   n_ids        = 0;
+        std::array<std::array<uint64_t, 4>, 64> masks{};
+    };
+
+    uint64_t rolling_seq_hash    = 14695981039346656037ULL;
+    uint64_t current_ubatch_hash = 0;
+    std::unordered_map<uint64_t, ubatch_route_record> known_ubatches;
+    std::vector<const void *> last_dst_ptr;
+    std::array<std::array<int32_t, 256>, 256> slot_map_ring{};
+    size_t slot_map_ring_idx = 0;
+
     // slot maps in host memory
     ggml_context_ptr ctx_host;
     ggml_backend_buffer_ptr buf_host;
@@ -231,7 +294,7 @@ struct llama_moe_cache::impl {
     ggml_context_ptr ctx_views;
 
     impl(const llama_model & model, const std::vector<ggml_backend_t> & backends, const std::vector<ggml_backend_buffer_type_t> & bufts, size_t size) :
-            n_expert_used(model.hparams.n_expert_used_max()), layers(model.layers.size()) {
+            n_expert_used(model.hparams.n_expert_used_max()), layers(model.layers.size()), last_dst_ptr(model.layers.size(), nullptr) {
         if (const char * mode = std::getenv("S11_ROUTE_SYNC")) {
             if (std::strcmp(mode, "event") == 0) {
                 if (!model.output || model.output->type != GGML_TYPE_S11_I8) {
@@ -550,6 +613,29 @@ struct llama_moe_cache::impl {
         return n;
     }
 
+    void begin_ubatch(const llama_ubatch & ubatch, bool graph_reused) {
+        if (!graph_reused) {
+            std::fill(last_dst_ptr.begin(), last_dst_ptr.end(), nullptr);
+        }
+        if (!ubatch.token || ubatch.n_tokens == 0) {
+            current_ubatch_hash = 0;
+            return;
+        }
+        if (ubatch.pos && ubatch.pos[0] == 0) {
+            rolling_seq_hash = 14695981039346656037ULL;
+        }
+        uint64_t h = rolling_seq_hash;
+        h = (h ^ uint64_t(ubatch.n_tokens)) * 1099511628211ULL;
+        if (ubatch.pos) {
+            h = (h ^ uint64_t(uint32_t(ubatch.pos[0]))) * 1099511628211ULL;
+        }
+        for (uint32_t i = 0; i < ubatch.n_tokens; ++i) {
+            h = (h ^ uint64_t(uint32_t(ubatch.token[i]))) * 1099511628211ULL;
+        }
+        rolling_seq_hash    = h;
+        current_ubatch_hash = h ? h : 1ULL;
+    }
+
     bool copy(ggml_backend_t backend, const ggml_tensor * src, ggml_tensor * dst, ggml_cgraph * graph) {
         const auto it = layer_of.find(src);
         if (it == layer_of.end()) {
@@ -583,40 +669,85 @@ struct llama_moe_cache::impl {
         }
         GGML_ASSERT(ggml_is_contiguous(sel));
 
-        ids.resize(ggml_nelements(sel));
-        ggml_backend_tensor_get_async(backend, sel, ids.data(), 0, ggml_nbytes(sel));
-        ++route_readbacks;
-        if (s11_event_sync) {
-            // S11 bank readers and the ID copy use this backend's same stream.
-            // Wait through the copy before mutating any bank slot or host map.
-            auto * event = devices[g.id].route_ready.get();
-            ggml_backend_event_record(event, backend);
-            ggml_backend_event_synchronize(event);
-        } else {
-            ggml_backend_synchronize(backend);
-        }
-        ++route_syncs;
-        if (s11_route_trace.is_open()) {
-            if (s11_traced_ids + ids.size() > 2000000) {
-                throw std::runtime_error("S11 route trace exceeds bounded diagnostic workload");
-            }
-            s11_traced_ids += ids.size();
-            s11_route_trace << il << ',' << ids.size();
-            for (int32_t id : ids) {
-                s11_route_trace << ',' << id;
-            }
-            s11_route_trace << '\n';
-            if (!s11_route_trace) {
-                throw std::runtime_error("S11 route trace write failed");
+        const size_t n_sel = ggml_nelements(sel);
+        const char * s11_mode = std::getenv("S11_EXPERT_MODE");
+        const bool cpu_miss = !l.experts.empty() && l.experts[0]->type == GGML_TYPE_S11_W2 &&
+            s11_mode && std::strcmp(s11_mode, "hybrid") == 0 && n_sel <= 8;
+        const bool is_s11_fast = !l.experts.empty() && l.experts[0]->type == GGML_TYPE_S11_W2 &&
+            !cpu_miss && !s11_route_trace.is_open() && !s11_event_sync &&
+            n_sel <= 8 && il >= 0 && il < 64 && g.lru.n_expert <= 256 && current_ubatch_hash != 0;
+
+        size_t n_hit = 0;
+        bool used_fast_route = false;
+
+        if (is_s11_fast) {
+            auto it_rec = known_ubatches.find(current_ubatch_hash);
+            if (it_rec != known_ubatches.end() &&
+                it_rec->second.n_ids == n_sel &&
+                (it_rec->second.valid_layers & (1ULL << il)) != 0) {
+                used_fast_route = true;
+                g.lru.uniq.clear();
+                const auto & mask = it_rec->second.masks[il];
+                for (int w = 0; w < 4; ++w) {
+                    uint64_t bits = mask[w];
+                    while (bits != 0) {
+                        const int b = __builtin_ctzll(bits);
+                        g.lru.uniq.push_back(w * 64 + b);
+                        bits &= (bits - 1);
+                    }
+                }
+                if (!g.lru.plan_from_uniq(il, n_sel, fills, n_hit, true)) {
+                    GGML_ABORT("the MoE cache is too small for the experts selected in layer %d", il);
+                }
             }
         }
 
-        size_t n_hit = 0;
-        const char * s11_mode = std::getenv("S11_EXPERT_MODE");
-        const bool cpu_miss = !l.experts.empty() && l.experts[0]->type == GGML_TYPE_S11_W2 &&
-            s11_mode && std::strcmp(s11_mode, "hybrid") == 0 && ids.size() <= 8;
-        if (!g.lru.plan(il, ids.data(), ids.size(), fills, n_hit, !cpu_miss)) {
-            GGML_ABORT("the MoE cache is too small for the experts selected in layer %d", il);
+        if (!used_fast_route) {
+            ids.resize(n_sel);
+            ggml_backend_tensor_get_async(backend, sel, ids.data(), 0, ggml_nbytes(sel));
+            ++route_readbacks;
+            if (s11_event_sync) {
+                // S11 bank readers and the ID copy use this backend's same stream.
+                // Wait through the copy before mutating any bank slot or host map.
+                auto * event = devices[g.id].route_ready.get();
+                ggml_backend_event_record(event, backend);
+                ggml_backend_event_synchronize(event);
+            } else {
+                ggml_backend_synchronize(backend);
+            }
+            ++route_syncs;
+            if (s11_route_trace.is_open()) {
+                if (s11_traced_ids + ids.size() > 2000000) {
+                    throw std::runtime_error("S11 route trace exceeds bounded diagnostic workload");
+                }
+                s11_traced_ids += ids.size();
+                s11_route_trace << il << ',' << ids.size();
+                for (int32_t id : ids) {
+                    s11_route_trace << ',' << id;
+                }
+                s11_route_trace << '\n';
+                if (!s11_route_trace) {
+                    throw std::runtime_error("S11 route trace write failed");
+                }
+            }
+
+            if (!g.lru.plan(il, ids.data(), ids.size(), fills, n_hit, !cpu_miss)) {
+                GGML_ABORT("the MoE cache is too small for the experts selected in layer %d", il);
+            }
+
+            if (is_s11_fast && known_ubatches.size() < 65536) {
+                auto & rec = known_ubatches[current_ubatch_hash];
+                if (rec.valid_layers == 0) {
+                    rec.n_ids = n_sel;
+                }
+                if (rec.n_ids == n_sel) {
+                    rec.masks[il] = {0ULL, 0ULL, 0ULL, 0ULL};
+                    for (int32_t e : g.lru.uniq) {
+                        rec.masks[il][e >> 6] |= (1ULL << (e & 63));
+                    }
+                    rec.valid_layers |= (1ULL << il);
+                }
+            }
         }
 
         // upload the missing experts, consecutive experts going to consecutive slots are uploaded together
@@ -636,13 +767,22 @@ struct llama_moe_cache::impl {
             }
         }
 
-        stats & st = ids.size() <= (size_t) 8*n_expert_used ? stats_small : stats_large;
+        stats & st = n_sel <= (size_t) 8*n_expert_used ? stats_small : stats_large;
         st.hits   += n_hit;
         st.misses += fills.size();
         st.bytes  += bytes;
 
-        // the next copy synchronizes the backend before it changes the slot map again
-        ggml_backend_tensor_set_async(backend, dst, src->data, 0, ggml_nbytes(src));
+        if (!is_s11_fast || g.lru.dirty_layers[il] || last_dst_ptr[il] != dst->data) {
+            if (is_s11_fast && ggml_nbytes(src) <= sizeof(slot_map_ring[0])) {
+                auto & stage = slot_map_ring[slot_map_ring_idx++ & 255];
+                std::memcpy(stage.data(), src->data, ggml_nbytes(src));
+                ggml_backend_tensor_set_async(backend, dst, stage.data(), 0, ggml_nbytes(src));
+            } else {
+                ggml_backend_tensor_set_async(backend, dst, src->data, 0, ggml_nbytes(src));
+            }
+            g.lru.dirty_layers[il] = false;
+            last_dst_ptr[il] = dst->data;
+        }
 
         return true;
     }
@@ -669,6 +809,10 @@ llama_moe_cache::llama_moe_cache(const llama_model & model, const std::vector<gg
 }
 
 llama_moe_cache::~llama_moe_cache() = default;
+
+void llama_moe_cache::begin_ubatch(const llama_ubatch & ubatch, bool graph_reused) {
+    pimpl->begin_ubatch(ubatch, graph_reused);
+}
 
 ggml_backend_t llama_moe_cache::backend(int32_t il) const {
     return pimpl->backend(il);

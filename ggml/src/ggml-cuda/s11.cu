@@ -667,6 +667,8 @@ struct s11_persistent_state {
     const void * last_ids_data = nullptr;
     int last_ids_tokens = 0;
     int last_ids_slots = 0;
+    size_t last_ids_nb0 = 0;
+    size_t last_ids_nb1 = 0;
 };
 
 static s11_persistent_state g_s11_state;
@@ -857,7 +859,7 @@ void ggml_cuda_s11_mul_mat(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
             }
             q_ptr = g_s11_state.q_buf[buf_idx];
             scales_ptr = g_s11_state.s_buf[buf_idx];
-            const bool can_reuse = (x->view_src == nullptr) &&
+            const bool can_reuse = (x->view_src == nullptr || (x->view_offs == 0 && ggml_is_contiguous(x))) &&
                                    (g_s11_state.last_x_data[buf_idx] == x->data) &&
                                    (g_s11_state.last_k[buf_idx] == k) &&
                                    (g_s11_state.last_tokens[buf_idx] == tokens) &&
@@ -907,10 +909,11 @@ void ggml_cuda_s11_mul_mat(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
                     int32_t * tile_counts  = g_s11_state.plan_buf + 8192;
                     int32_t * sorted_assn  = g_s11_state.plan_buf + 12288;
                     int32_t * num_tiles    = g_s11_state.plan_buf + 16384;
-                    const bool reuse_plan = (ids->view_src == nullptr) &&
-                                            (g_s11_state.last_ids_data == ids->data) &&
+                    const bool reuse_plan = (g_s11_state.last_ids_data == ids->data) &&
                                             (g_s11_state.last_ids_tokens == tokens) &&
-                                            (g_s11_state.last_ids_slots == slots);
+                                            (g_s11_state.last_ids_slots == slots) &&
+                                            (g_s11_state.last_ids_nb0 == ids->nb[0]) &&
+                                            (g_s11_state.last_ids_nb1 == ids->nb[1]);
                     if (!reuse_plan) {
                         s11_build_routed_plan_kernel<<<1, 256, 0, ctx.stream()>>>(
                             static_cast<const char *>(ids->data), slots, tokens, ids->nb[0], ids->nb[1],
@@ -919,6 +922,8 @@ void ggml_cuda_s11_mul_mat(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
                         g_s11_state.last_ids_data = ids->data;
                         g_s11_state.last_ids_tokens = tokens;
                         g_s11_state.last_ids_slots = slots;
+                        g_s11_state.last_ids_nb0 = ids->nb[0];
+                        g_s11_state.last_ids_nb1 = ids->nb[1];
                     }
                     const int m = tokens * slots;
                     const int max_tiles = std::min(m, (m + 15) / 16 + std::min(m, 256));
@@ -967,6 +972,7 @@ void ggml_cuda_s11_mul_mat(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
 
 static __global__ void __launch_bounds__(256) s11_rms_norm_offset_bf16_kernel(
         const char * __restrict__ x, const nv_bfloat16 * __restrict__ mw, float * __restrict__ dst,
+        signed char * __restrict__ q_out, float * __restrict__ s_out,
         int k, int ne1, int ne2, size_t nb1, size_t nb2, size_t nb3,
         float eps, float scale, float bias) {
     const int row = blockIdx.x;
@@ -1000,16 +1006,50 @@ static __global__ void __launch_bounds__(256) s11_rms_norm_offset_bf16_kernel(
     }
     __syncthreads();
     const float inv_rms = warp_sums[0];
-    for (int col = threadIdx.x; col < k; col += 256) {
-        const float w = __fadd_rn(__fmul_rn(__bfloat162float(mw[col]), scale), bias);
-        const float val = __fmul_rn(__fmul_rn(x_row[col], inv_rms), w);
-        y_row[col] = s11_bf16(val);
+    if (q_out && s_out && k == 2048) {
+        const int warp = threadIdx.x / 32;
+        const int lane = threadIdx.x % 32;
+        #pragma unroll
+        for (int g_sub = 0; g_sub < 2; ++g_sub) {
+            const int group = warp * 2 + g_sub;
+            float values[4];
+            float maximum = 1e-5f;
+            #pragma unroll
+            for (int i = 0; i < 4; ++i) {
+                const int col = group * 128 + lane + 32 * i;
+                const float w = __fadd_rn(__fmul_rn(__bfloat162float(mw[col]), scale), bias);
+                const float val = s11_bf16(__fmul_rn(__fmul_rn(x_row[col], inv_rms), w));
+                y_row[col] = val;
+                values[i] = val;
+                maximum = fmaxf(maximum, fabsf(val));
+            }
+            for (int offset = 16; offset > 0; offset /= 2) {
+                maximum = fmaxf(maximum, __shfl_xor_sync(0xffffffff, maximum, offset));
+            }
+            const float inverse = __fmul_rn(__fdiv_rn(1.0f, maximum), 127.0f);
+            if (lane == 0) {
+                s_out[size_t(row) * 16 + group] = __fdiv_rn(1.0f, inverse);
+            }
+            #pragma unroll
+            for (int i = 0; i < 4; ++i) {
+                const int col = group * 128 + lane + 32 * i;
+                const int quant = max(-128, min(127, __float2int_rn(__fmul_rn(values[i], inverse))));
+                q_out[size_t(row) * 2048 + col] = static_cast<signed char>(quant);
+            }
+        }
+    } else {
+        for (int col = threadIdx.x; col < k; col += 256) {
+            const float w = __fadd_rn(__fmul_rn(__bfloat162float(mw[col]), scale), bias);
+            const float val = __fmul_rn(__fmul_rn(x_row[col], inv_rms), w);
+            y_row[col] = s11_bf16(val);
+        }
     }
 }
 
 static __global__ void __launch_bounds__(128) s11_norm_gated_fused_kernel(
         const float * __restrict__ input, const void * __restrict__ weights, int w_type,
-        const float * __restrict__ gate, float * __restrict__ dst, float eps) {
+        const float * __restrict__ gate, float * __restrict__ dst,
+        signed char * __restrict__ q_out, float * __restrict__ s_out, float eps) {
     const int row = blockIdx.x;
     const int t = threadIdx.x; // 0..127 (k = 128)
     const float x = s11_bf16(input[size_t(row) * 128 + t]);
@@ -1038,7 +1078,34 @@ static __global__ void __launch_bounds__(128) s11_norm_gated_fused_kernel(
     const float g = gate[size_t(row) * 128 + t];
     const float silu_g = g / (1.0f + expf(-g));
     const float norm_val = __fmul_rn(__fmul_rn(x, inv_rms), w);
-    dst[size_t(row) * 128 + t] = s11_bf16(__fmul_rn(norm_val, silu_g));
+    const float out_val = s11_bf16(__fmul_rn(norm_val, silu_g));
+    dst[size_t(row) * 128 + t] = out_val;
+    if (q_out && s_out) {
+        __shared__ float warp_max[4];
+        float maximum = fmaxf(1e-5f, fabsf(out_val));
+        for (int offset = 16; offset > 0; offset /= 2) {
+            maximum = fmaxf(maximum, __shfl_xor_sync(0xffffffff, maximum, offset));
+        }
+        if ((t & 31) == 0) {
+            warp_max[t / 32] = maximum;
+        }
+        __syncthreads();
+        if (t < 4) {
+            float m = warp_max[t];
+            m = fmaxf(m, __shfl_down_sync(0x0000000f, m, 2));
+            m = fmaxf(m, __shfl_down_sync(0x0000000f, m, 1));
+            if (t == 0) {
+                warp_max[0] = m;
+            }
+        }
+        __syncthreads();
+        const float inverse = __fmul_rn(__fdiv_rn(1.0f, warp_max[0]), 127.0f);
+        if (t == 0) {
+            s_out[row] = __fdiv_rn(1.0f, inverse);
+        }
+        const int quant = max(-128, min(127, __float2int_rn(__fmul_rn(out_val, inverse))));
+        q_out[size_t(row) * 128 + t] = static_cast<signed char>(quant);
+    }
 }
 
 static __global__ void __launch_bounds__(256) s11_gdn_gate_fused_kernel(
@@ -1068,6 +1135,240 @@ static __global__ void __launch_bounds__(256) s11_round_bf16_f32_kernel(
     if (idx < n) {
         dst[idx] = s11_bf16(src[idx]);
     }
+}
+
+static __global__ void __launch_bounds__(256) s11_add_round_bf16_f32_kernel(
+        const float * __restrict__ a, const float * __restrict__ b, float * __restrict__ dst, int64_t n) {
+    if (gridDim.x == 1 && n == 2048) {
+        const int t = threadIdx.x;
+        float out[8];
+        #pragma unroll
+        for (int m = 0; m < 8; ++m) {
+            const int idx = t + m * 256;
+            out[m] = s11_bf16(__fadd_rn(a[idx], b[idx]));
+        }
+        __syncthreads();
+        #pragma unroll
+        for (int m = 0; m < 8; ++m) {
+            dst[t + m * 256] = out[m];
+        }
+        return;
+    }
+    const int64_t idx = int64_t(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (idx < n) {
+        dst[idx] = s11_bf16(__fadd_rn(a[idx], b[idx]));
+    }
+}
+
+static __global__ void __launch_bounds__(256) s11_shexp_epilogue_fused_kernel(
+        const float * __restrict__ shared_gate,
+        const float * __restrict__ ffn_shexp,
+        const float * __restrict__ moe_out,
+        const float * __restrict__ ffn_residual,
+        float * __restrict__ dst,
+        int k, int64_t total) {
+    if (gridDim.x == 1 && k == 2048 && total == 2048) {
+        const int t = threadIdx.x;
+        const float raw_g = shared_gate[0];
+        const float sig_g = s11_bf16(1.0f / (1.0f + expf(-raw_g)));
+        float out[8];
+        #pragma unroll
+        for (int m = 0; m < 8; ++m) {
+            const int idx = t + m * 256;
+            const float gated = s11_bf16(__fmul_rn(ffn_shexp[idx], sig_g));
+            const float sum1  = s11_bf16(__fadd_rn(moe_out[idx], gated));
+            out[m]            = s11_bf16(__fadd_rn(sum1, ffn_residual[idx]));
+        }
+        __syncthreads();
+        #pragma unroll
+        for (int m = 0; m < 8; ++m) {
+            dst[t + m * 256] = out[m];
+        }
+        return;
+    }
+    const int64_t idx = int64_t(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (idx < total) {
+        const int token = int(idx / k);
+        const float raw_g = shared_gate[token];
+        const float sig_g = s11_bf16(1.0f / (1.0f + expf(-raw_g)));
+        const float gated = s11_bf16(__fmul_rn(ffn_shexp[idx], sig_g));
+        const float sum1  = s11_bf16(__fadd_rn(moe_out[idx], gated));
+        dst[idx]          = s11_bf16(__fadd_rn(sum1, ffn_residual[idx]));
+    }
+}
+
+static __global__ void __launch_bounds__(128) s11_routed_up_gate_swiglu_wmma_k128_kernel(
+        const char * __restrict__ up_weights, const char * __restrict__ gate_weights,
+        const signed char * __restrict__ q, const float * __restrict__ activation_scales,
+        const int32_t * __restrict__ tile_experts, const int32_t * __restrict__ tile_starts,
+        const int32_t * __restrict__ tile_counts, const int32_t * __restrict__ sorted_assignments,
+        const int32_t * __restrict__ num_tiles_in, const char * __restrict__ prob_weights,
+        char * __restrict__ output,
+        int k, int n, int slots, int input_slots,
+        size_t weight_row, size_t weight_expert,
+        size_t prob_slot, size_t prob_token,
+        size_t output_slot, size_t output_token) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+    const int tile = blockIdx.y;
+    if (tile >= num_tiles_in[0]) {
+        return;
+    }
+    const int expert = tile_experts[tile];
+    const int start = tile_starts[tile];
+    const int count = tile_counts[tile];
+    const int t = threadIdx.x;
+    const int warp = t / 32;
+    const int lane = t % 32;
+    const int first_row = blockIdx.x * 64;
+    if (first_row >= n || count <= 0) {
+        return;
+    }
+
+    __shared__ __align__(32) signed char a_sh[16 * 128];
+    __shared__ __align__(32) signed char b_sh[64 * 128];
+    __shared__ __align__(32) int dots_sh[4][16 * 16];
+    __shared__ int assign_sh[16];
+    __shared__ int source_sh[16];
+    __shared__ float a_scales_sh[16];
+    __shared__ float w_scales_sh[64];
+
+    if (t < 16) {
+        const int a = (t < count) ? sorted_assignments[start + t] : 0;
+        assign_sh[t] = a;
+        const int slot = a % slots;
+        const int token = a / slots;
+        source_sh[t] = token * input_slots + (input_slots == 1 ? 0 : slot);
+    }
+    __syncthreads();
+
+    const char * exp_up   = up_weights   + size_t(expert) * weight_expert;
+    const char * exp_gate = gate_weights + size_t(expert) * weight_expert;
+    float sums_up[8]   = {};
+    float sums_gate[8] = {};
+
+    for (int group = 0; group < k / 128; ++group) {
+        if (t < 16) {
+            a_scales_sh[t] = (t < count) ? activation_scales[size_t(source_sh[t]) * (k / 128) + group] : 0.0f;
+        }
+        #pragma unroll
+        for (int idx = t; idx < 16 * 32; idx += 128) {
+            const int tok_local = idx / 32;
+            const int col4 = idx % 32;
+            *reinterpret_cast<int *>(&a_sh[tok_local * 128 + col4 * 4]) = (tok_local < count)
+                ? *reinterpret_cast<const int *>(q + size_t(source_sh[tok_local]) * k + group * 128 + col4 * 4)
+                : 0;
+        }
+        if (t < 64) {
+            const int r = first_row + t;
+            w_scales_sh[t] = (r < n)
+                ? s11_scale(reinterpret_cast<const unsigned char *>(exp_up + size_t(r) * weight_row + group * 36), GGML_TYPE_S11_W2)
+                : 0.0f;
+        }
+        #pragma unroll
+        for (int idx = t; idx < 64 * 32; idx += 128) {
+            const int r_local = idx / 32;
+            const int col4 = idx % 32;
+            const int r = first_row + r_local;
+            int packed = 0;
+            if (r < n) {
+                const auto * block = reinterpret_cast<const unsigned char *>(exp_up + size_t(r) * weight_row + group * 36);
+                packed = s11_unpack4_w2(block, col4);
+            }
+            *reinterpret_cast<int *>(&b_sh[r_local * 128 + col4 * 4]) = packed;
+        }
+        __syncthreads();
+
+        namespace wmma = nvcuda::wmma;
+        wmma::fragment<wmma::accumulator, 16, 16, 16, int> acc_up;
+        wmma::fill_fragment(acc_up, 0);
+        #pragma unroll
+        for (int ks = 0; ks < 128; ks += 16) {
+            wmma::fragment<wmma::matrix_a, 16, 16, 16, signed char, wmma::row_major> af;
+            wmma::fragment<wmma::matrix_b, 16, 16, 16, signed char, wmma::col_major> bf;
+            wmma::load_matrix_sync(af, a_sh + ks, 128);
+            wmma::load_matrix_sync(bf, b_sh + (warp * 16) * 128 + ks, 128);
+            wmma::mma_sync(acc_up, af, bf, acc_up);
+        }
+        wmma::store_matrix_sync(dots_sh[warp], acc_up, 16, wmma::mem_row_major);
+        __syncwarp();
+
+        #pragma unroll
+        for (int p = 0; p < 8; ++p) {
+            const int idx = lane + p * 32;
+            const int tok_local = idx / 16;
+            const int row_in_warp = idx % 16;
+            const int dot = dots_sh[warp][idx];
+            const float scale_prod = __fmul_rn(a_scales_sh[tok_local], w_scales_sh[warp * 16 + row_in_warp]);
+            sums_up[p] = __fadd_rn(sums_up[p], __fmul_rn(float(dot), scale_prod));
+        }
+        __syncthreads();
+
+        if (t < 64) {
+            const int r = first_row + t;
+            w_scales_sh[t] = (r < n)
+                ? s11_scale(reinterpret_cast<const unsigned char *>(exp_gate + size_t(r) * weight_row + group * 36), GGML_TYPE_S11_W2)
+                : 0.0f;
+        }
+        #pragma unroll
+        for (int idx = t; idx < 64 * 32; idx += 128) {
+            const int r_local = idx / 32;
+            const int col4 = idx % 32;
+            const int r = first_row + r_local;
+            int packed = 0;
+            if (r < n) {
+                const auto * block = reinterpret_cast<const unsigned char *>(exp_gate + size_t(r) * weight_row + group * 36);
+                packed = s11_unpack4_w2(block, col4);
+            }
+            *reinterpret_cast<int *>(&b_sh[r_local * 128 + col4 * 4]) = packed;
+        }
+        __syncthreads();
+
+        wmma::fragment<wmma::accumulator, 16, 16, 16, int> acc_gate;
+        wmma::fill_fragment(acc_gate, 0);
+        #pragma unroll
+        for (int ks = 0; ks < 128; ks += 16) {
+            wmma::fragment<wmma::matrix_a, 16, 16, 16, signed char, wmma::row_major> af;
+            wmma::fragment<wmma::matrix_b, 16, 16, 16, signed char, wmma::col_major> bf;
+            wmma::load_matrix_sync(af, a_sh + ks, 128);
+            wmma::load_matrix_sync(bf, b_sh + (warp * 16) * 128 + ks, 128);
+            wmma::mma_sync(acc_gate, af, bf, acc_gate);
+        }
+        wmma::store_matrix_sync(dots_sh[warp], acc_gate, 16, wmma::mem_row_major);
+        __syncwarp();
+
+        #pragma unroll
+        for (int p = 0; p < 8; ++p) {
+            const int idx = lane + p * 32;
+            const int tok_local = idx / 16;
+            const int row_in_warp = idx % 16;
+            const int dot = dots_sh[warp][idx];
+            const float scale_prod = __fmul_rn(a_scales_sh[tok_local], w_scales_sh[warp * 16 + row_in_warp]);
+            sums_gate[p] = __fadd_rn(sums_gate[p], __fmul_rn(float(dot), scale_prod));
+        }
+        __syncthreads();
+    }
+
+    #pragma unroll
+    for (int p = 0; p < 8; ++p) {
+        const int idx = lane + p * 32;
+        const int tok_local = idx / 16;
+        const int row = first_row + warp * 16 + idx % 16;
+        if (tok_local < count && row < n) {
+            const int a = assign_sh[tok_local];
+            const int slot = a % slots;
+            const int token = a / slots;
+            const float u = s11_bf16(sums_up[p]);
+            const float g = s11_bf16(sums_gate[p]);
+            const float silu_g = g / (1.0f + expf(-g));
+            float val = silu_g * u;
+            if (prob_weights) {
+                const float prob = *reinterpret_cast<const float *>(prob_weights + size_t(slot) * prob_slot + size_t(token) * prob_token);
+                val = s11_bf16(val * prob);
+            }
+            *reinterpret_cast<float *>(output + size_t(row) * sizeof(float) + size_t(slot) * output_slot + size_t(token) * output_token) = val;
+        }
+    }
+#endif
 }
 
 template <int TYPE>
@@ -1260,13 +1561,24 @@ int ggml_cuda_s11_try_fuse(ggml_backend_cuda_context & ctx, ggml_cgraph * cgraph
                 const int k = int(n0->ne[0]);
                 const int nrows = int(ggml_nrows(n0));
                 ggml_cuda_s11_invalidate_if_written(n5->data);
+                const bool fuse_quant = (k == 2048) &&
+                                        (size_t(nrows) * 2048 <= g_s11_state.q_cap[0]) &&
+                                        (size_t(nrows) * 16   <= g_s11_state.s_cap[0]);
                 s11_rms_norm_offset_bf16_kernel<<<nrows, 256, 0, ctx.stream()>>>(
                     static_cast<const char *>(x->data),
                     static_cast<const nv_bfloat16 *>(n1->src[0]->data),
                     static_cast<float *>(n5->data),
+                    fuse_quant ? g_s11_state.q_buf[0] : nullptr,
+                    fuse_quant ? g_s11_state.s_buf[0] : nullptr,
                     k, int(x->ne[1]), int(x->ne[2]), x->nb[1], x->nb[2], x->nb[3],
                     eps, scale, bias);
                 CUDA_CHECK(cudaGetLastError());
+                if (fuse_quant) {
+                    g_s11_state.last_x_data[0]      = n5->data;
+                    g_s11_state.last_k[0]           = 2048;
+                    g_s11_state.last_tokens[0]      = nrows;
+                    g_s11_state.last_input_slots[0] = 1;
+                }
                 return 5;
             }
         }
@@ -1343,12 +1655,24 @@ int ggml_cuda_s11_try_fuse(ggml_backend_cuda_context & ctx, ggml_cgraph * cgraph
                 std::memcpy(&eps, n2->op_params, sizeof(float));
                 const int nrows = int(ggml_nrows(n8));
                 ggml_cuda_s11_invalidate_if_written(n8->data);
+                const bool fuse_quant = (nrows % 32 == 0) &&
+                                        (size_t(nrows) * 128 <= g_s11_state.q_cap[0]) &&
+                                        (size_t(nrows)       <= g_s11_state.s_cap[0]);
                 s11_norm_gated_fused_kernel<<<nrows, 128, 0, ctx.stream()>>>(
                     static_cast<const float *>(n0->src[0]->data),
                     n3->src[0]->data, n3->src[0]->type,
                     static_cast<const float *>(n5->src[0]->data),
-                    static_cast<float *>(n8->data), eps);
+                    static_cast<float *>(n8->data),
+                    fuse_quant ? g_s11_state.q_buf[0] : nullptr,
+                    fuse_quant ? g_s11_state.s_buf[0] : nullptr,
+                    eps);
                 CUDA_CHECK(cudaGetLastError());
+                if (fuse_quant) {
+                    g_s11_state.last_x_data[0]      = n8->data;
+                    g_s11_state.last_k[0]           = 4096;
+                    g_s11_state.last_tokens[0]      = nrows / 32;
+                    g_s11_state.last_input_slots[0] = 1;
+                }
                 return 8;
             }
         }
@@ -1397,6 +1721,98 @@ int ggml_cuda_s11_try_fuse(ggml_backend_cuda_context & ctx, ggml_cgraph * cgraph
                 CUDA_CHECK(cudaGetLastError());
                 return 10;
             }
+        }
+    }
+
+    // Pattern G: 12-node Shared-Expert + MoE + Residual Epilogue
+    if (n0->op == GGML_OP_UNARY && ggml_get_unary_op(n0) == GGML_UNARY_OP_SIGMOID &&
+        i + 11 < cgraph->n_nodes) {
+        ggml_tensor * n1  = cgraph->nodes[i + 1];
+        ggml_tensor * n2  = cgraph->nodes[i + 2];
+        ggml_tensor * n3  = cgraph->nodes[i + 3];
+        ggml_tensor * n4  = cgraph->nodes[i + 4];
+        ggml_tensor * n5  = cgraph->nodes[i + 5];
+        ggml_tensor * n6  = cgraph->nodes[i + 6];
+        ggml_tensor * n7  = cgraph->nodes[i + 7];
+        ggml_tensor * n8  = cgraph->nodes[i + 8];
+        ggml_tensor * n9  = cgraph->nodes[i + 9];
+        ggml_tensor * n10 = cgraph->nodes[i + 10];
+        ggml_tensor * n11 = cgraph->nodes[i + 11];
+        auto safe_alias = [](const ggml_tensor * dst, const ggml_tensor * src) {
+            return !s11_tensors_overlap(dst, src) || dst->data == src->data;
+        };
+        if (n0->src[0] && n0->src[0]->type == GGML_TYPE_F32 && n0->ne[0] == 1 &&
+            n1->op == GGML_OP_CPY && n1->src[0] == n0 && n1->type == GGML_TYPE_BF16 &&
+            n2->op == GGML_OP_CPY && n2->src[0] == n1 && n2->type == GGML_TYPE_F32 &&
+            n3->op == GGML_OP_MUL && n3->src[1] == n2 && n3->src[0] && n3->src[0]->type == GGML_TYPE_F32 &&
+            n4->op == GGML_OP_CPY && n4->src[0] == n3 && n4->type == GGML_TYPE_BF16 &&
+            n5->op == GGML_OP_CPY && n5->src[0] == n4 && n5->type == GGML_TYPE_F32 &&
+            n6->op == GGML_OP_ADD && n6->src[1] == n5 && n6->src[0] && n6->src[0]->type == GGML_TYPE_F32 &&
+            n7->op == GGML_OP_CPY && n7->src[0] == n6 && n7->type == GGML_TYPE_BF16 &&
+            n8->op == GGML_OP_CPY && n8->src[0] == n7 && n8->type == GGML_TYPE_F32 &&
+            n9->op == GGML_OP_ADD && n9->src[0] == n8 && n9->src[1] && n9->src[1]->type == GGML_TYPE_F32 &&
+            n10->op == GGML_OP_CPY && n10->src[0] == n9 && n10->type == GGML_TYPE_BF16 &&
+            n11->op == GGML_OP_CPY && n11->src[0] == n10 && n11->type == GGML_TYPE_F32 &&
+            ggml_is_contiguous(n0->src[0]) && ggml_is_contiguous(n3->src[0]) &&
+            ggml_is_contiguous(n6->src[0]) && ggml_is_contiguous(n9->src[1]) &&
+            ggml_is_contiguous(n11) &&
+            ggml_are_same_shape(n3->src[0], n6->src[0]) &&
+            ggml_are_same_shape(n6->src[0], n9->src[1]) &&
+            ggml_are_same_shape(n9->src[1], n11) &&
+            n0->src[0]->ne[1] == n11->ne[1] &&
+            !s11_tensors_overlap(n11, n0->src[0]) &&
+            ((n11->ne[0] == 2048 && n11->ne[1] == 1) ||
+             (safe_alias(n11, n3->src[0]) && safe_alias(n11, n6->src[0]) && safe_alias(n11, n9->src[1])))) {
+            bool external = false;
+            for (int m = 0; m < 11; ++m) {
+                if (s11_has_external_consumer(cgraph, i + 12, cgraph->nodes[i + m])) {
+                    external = true;
+                    break;
+                }
+            }
+            if (!external) {
+                const int k = int(n11->ne[0]);
+                const int64_t total = ggml_nelements(n11);
+                const int blocks = (k == 2048 && total == 2048) ? 1 : int((total + 255) / 256);
+                ggml_cuda_s11_invalidate_if_written(n11->data);
+                s11_shexp_epilogue_fused_kernel<<<blocks, 256, 0, ctx.stream()>>>(
+                    static_cast<const float *>(n0->src[0]->data),
+                    static_cast<const float *>(n3->src[0]->data),
+                    static_cast<const float *>(n6->src[0]->data),
+                    static_cast<const float *>(n9->src[1]->data),
+                    static_cast<float *>(n11->data), k, total);
+                CUDA_CHECK(cudaGetLastError());
+                return 11;
+            }
+        }
+    }
+
+    // Pattern F: 3-node ADD + CPY(F32 -> BF16) + CPY(BF16 -> F32)
+    if (n0->op == GGML_OP_ADD && i + 2 < cgraph->n_nodes) {
+        ggml_tensor * n1 = cgraph->nodes[i + 1];
+        ggml_tensor * n2 = cgraph->nodes[i + 2];
+        if (n0->src[0] && n0->src[1] &&
+            n0->src[0]->type == GGML_TYPE_F32 && n0->src[1]->type == GGML_TYPE_F32 &&
+            n1->op == GGML_OP_CPY && n1->src[0] == n0 && n1->type == GGML_TYPE_BF16 &&
+            n2->op == GGML_OP_CPY && n2->src[0] == n1 && n2->type == GGML_TYPE_F32 &&
+            ggml_are_same_shape(n0->src[0], n0->src[1]) &&
+            ggml_are_same_shape(n0->src[0], n2) &&
+            ggml_is_contiguous(n0->src[0]) && ggml_is_contiguous(n0->src[1]) &&
+            ggml_is_contiguous(n0) && ggml_is_contiguous(n1) && ggml_is_contiguous(n2) &&
+            (ggml_nelements(n2) == 2048 ||
+             ((!s11_tensors_overlap(n2, n0->src[0]) || n2->data == n0->src[0]->data) &&
+              (!s11_tensors_overlap(n2, n0->src[1]) || n2->data == n0->src[1]->data))) &&
+            !s11_has_external_consumer(cgraph, i + 3, n0) &&
+            !s11_has_external_consumer(cgraph, i + 3, n1)) {
+            const int64_t count = ggml_nelements(n2);
+            const int blocks = (count == 2048) ? 1 : int((count + 255) / 256);
+            ggml_cuda_s11_invalidate_if_written(n2->data);
+            s11_add_round_bf16_f32_kernel<<<blocks, 256, 0, ctx.stream()>>>(
+                static_cast<const float *>(n0->src[0]->data),
+                static_cast<const float *>(n0->src[1]->data),
+                static_cast<float *>(n2->data), count);
+            CUDA_CHECK(cudaGetLastError());
+            return 2;
         }
     }
 
@@ -1458,9 +1874,16 @@ int ggml_cuda_s11_try_fuse(ggml_backend_cuda_context & ctx, ggml_cgraph * cgraph
                 s11_quantize<<<dim3(k / 128, tokens * slots), 32, 0, ctx.stream()>>>(
                     static_cast<const char *>(x->data), q_ptr, scales_ptr, nullptr, k,
                     slots, tokens, x->nb[1], x->nb[2]);
-                s11_copy_ids_kernel<<<1, 32, 0, ctx.stream()>>>(
-                    static_cast<const char *>(ids->data), safe_ids,
-                    slots, tokens, ids->nb[0], ids->nb[1]);
+                const char * ids_ptr = static_cast<const char *>(ids->data);
+                size_t ids_nb0 = ids->nb[0];
+                size_t ids_nb1 = ids->nb[1];
+                if (s11_tensors_overlap(c2, ids)) {
+                    s11_copy_ids_kernel<<<1, 32, 0, ctx.stream()>>>(
+                        ids_ptr, safe_ids, slots, tokens, ids_nb0, ids_nb1);
+                    ids_ptr = reinterpret_cast<const char *>(safe_ids);
+                    ids_nb0 = sizeof(int32_t);
+                    ids_nb1 = size_t(slots) * sizeof(int32_t);
+                }
                 CUDA_CHECK(cudaGetLastError());
                 g_s11_state.last_x_data[1] = x->data;
                 g_s11_state.last_k[1] = k;
@@ -1470,8 +1893,8 @@ int ggml_cuda_s11_try_fuse(ggml_backend_cuda_context & ctx, ggml_cgraph * cgraph
                 ggml_cuda_s11_invalidate_if_written(c2->data);
                 s11_fused_down_exps_reduce_kernel<<<dim3((n + 3) / 4, tokens), 128, 0, ctx.stream()>>>(
                     static_cast<const char *>(w->data), q_ptr, scales_ptr,
-                    reinterpret_cast<const char *>(safe_ids), static_cast<char *>(c2->data),
-                    k, n, slots, tokens, w->nb[1], w->nb[2], sizeof(int32_t), size_t(slots) * sizeof(int32_t), c2->nb[1]);
+                    ids_ptr, static_cast<char *>(c2->data),
+                    k, n, slots, tokens, w->nb[1], w->nb[2], ids_nb0, ids_nb1, c2->nb[1]);
                 CUDA_CHECK(cudaGetLastError());
                 return 17;
             }
@@ -1522,7 +1945,8 @@ int ggml_cuda_s11_try_fuse(ggml_backend_cuda_context & ctx, ggml_cgraph * cgraph
         return 0;
     }
     const int tokens = ids ? glu_node->ne[2] : glu_node->ne[1];
-    if (tokens >= 8) {
+    const int slots = ids ? glu_node->ne[1] : 1;
+    if (tokens >= 8 && !(w_up->type == GGML_TYPE_S11_W2 && ids && tokens * slots <= 4096 && !s11_is_hybrid_mode())) {
         return 0;
     }
 
@@ -1559,12 +1983,11 @@ int ggml_cuda_s11_try_fuse(ggml_backend_cuda_context & ctx, ggml_cgraph * cgraph
 
     const int k = w_up->ne[0];
     const int n = w_up->ne[1];
-    const int slots = ids ? glu_node->ne[1] : 1;
     const int input_slots = ids ? x->ne[1] : 1;
     const int buf_idx = (input_slots == 1) ? 0 : 1;
     signed char * q_ptr = g_s11_state.q_buf[buf_idx];
     float * scales_ptr = g_s11_state.s_buf[buf_idx];
-    const bool can_reuse = (x->view_src == nullptr) &&
+    const bool can_reuse = (x->view_src == nullptr || (x->view_offs == 0 && ggml_is_contiguous(x))) &&
                            (g_s11_state.last_x_data[buf_idx] == x->data) &&
                            (g_s11_state.last_k[buf_idx] == k) &&
                            (g_s11_state.last_tokens[buf_idx] == tokens) &&
@@ -1583,19 +2006,62 @@ int ggml_cuda_s11_try_fuse(ggml_backend_cuda_context & ctx, ggml_cgraph * cgraph
     ggml_cuda_s11_invalidate_if_written(out_node->data);
 
     if (w_up->type == GGML_TYPE_S11_W2) {
-        if (prob_weights) {
-            g_s11_state.last_ids_data = ids->data;
-            g_s11_state.last_ids_tokens = tokens;
-            g_s11_state.last_ids_slots = slots;
+        if (tokens >= 8) {
+            constexpr size_t kPlanInts = 4096 * 4 + 16;
+            if (g_s11_state.plan_cap < kPlanInts) {
+                if (g_s11_state.plan_buf) CUDA_CHECK(cudaFree(g_s11_state.plan_buf));
+                CUDA_CHECK(cudaMalloc(reinterpret_cast<void **>(&g_s11_state.plan_buf), kPlanInts * sizeof(int32_t)));
+                g_s11_state.plan_cap = kPlanInts;
+                g_s11_state.last_ids_data = nullptr;
+            }
+            int32_t * tile_experts = g_s11_state.plan_buf;
+            int32_t * tile_starts  = g_s11_state.plan_buf + 4096;
+            int32_t * tile_counts  = g_s11_state.plan_buf + 8192;
+            int32_t * sorted_assn  = g_s11_state.plan_buf + 12288;
+            int32_t * num_tiles    = g_s11_state.plan_buf + 16384;
+            const bool reuse_plan = (g_s11_state.last_ids_data == ids->data) &&
+                                    (g_s11_state.last_ids_tokens == tokens) &&
+                                    (g_s11_state.last_ids_slots == slots) &&
+                                    (g_s11_state.last_ids_nb0 == ids->nb[0]) &&
+                                    (g_s11_state.last_ids_nb1 == ids->nb[1]);
+            if (!reuse_plan) {
+                s11_build_routed_plan_kernel<<<1, 256, 0, ctx.stream()>>>(
+                    static_cast<const char *>(ids->data), slots, tokens, ids->nb[0], ids->nb[1],
+                    tile_experts, tile_starts, tile_counts, sorted_assn, num_tiles);
+                CUDA_CHECK(cudaGetLastError());
+                g_s11_state.last_ids_data = ids->data;
+                g_s11_state.last_ids_tokens = tokens;
+                g_s11_state.last_ids_slots = slots;
+                g_s11_state.last_ids_nb0 = ids->nb[0];
+                g_s11_state.last_ids_nb1 = ids->nb[1];
+            }
+            const int m = tokens * slots;
+            const int max_tiles = std::min(m, (m + 15) / 16 + std::min(m, 256));
+            s11_routed_up_gate_swiglu_wmma_k128_kernel<<<dim3((n + 63) / 64, max_tiles), 128, 0, ctx.stream()>>>(
+                static_cast<const char *>(w_up->data), static_cast<const char *>(w_gate->data),
+                q_ptr, scales_ptr, tile_experts, tile_starts, tile_counts, sorted_assn, num_tiles,
+                prob_weights ? static_cast<const char *>(prob_weights->data) : nullptr,
+                static_cast<char *>(out_node->data), k, n, slots, input_slots,
+                w_up->nb[1], w_up->nb[2],
+                prob_weights ? prob_weights->nb[1] : 0, prob_weights ? prob_weights->nb[2] : 0,
+                out_node->nb[1], out_node->nb[2]);
+        } else {
+            if (prob_weights) {
+                g_s11_state.last_ids_data = ids->data;
+                g_s11_state.last_ids_tokens = tokens;
+                g_s11_state.last_ids_slots = slots;
+                g_s11_state.last_ids_nb0 = ids->nb[0];
+                g_s11_state.last_ids_nb1 = ids->nb[1];
+            }
+            s11_fused_up_gate_swiglu_kernel<GGML_TYPE_S11_W2><<<dim3((n + 3) / 4, tokens * slots), 128, 0, ctx.stream()>>>(
+                static_cast<const char *>(w_up->data), static_cast<const char *>(w_gate->data),
+                q_ptr, scales_ptr, ids ? static_cast<const char *>(ids->data) : nullptr,
+                prob_weights ? static_cast<const char *>(prob_weights->data) : nullptr,
+                static_cast<char *>(out_node->data), k, n, slots, tokens, input_slots,
+                w_up->nb[1], w_up->nb[2], ids ? ids->nb[0] : 0, ids ? ids->nb[1] : 0,
+                prob_weights ? prob_weights->nb[1] : 0, prob_weights ? prob_weights->nb[2] : 0,
+                out_node->nb[1], out_node->nb[2]);
         }
-        s11_fused_up_gate_swiglu_kernel<GGML_TYPE_S11_W2><<<dim3((n + 3) / 4, tokens * slots), 128, 0, ctx.stream()>>>(
-            static_cast<const char *>(w_up->data), static_cast<const char *>(w_gate->data),
-            q_ptr, scales_ptr, ids ? static_cast<const char *>(ids->data) : nullptr,
-            prob_weights ? static_cast<const char *>(prob_weights->data) : nullptr,
-            static_cast<char *>(out_node->data), k, n, slots, tokens, input_slots,
-            w_up->nb[1], w_up->nb[2], ids ? ids->nb[0] : 0, ids ? ids->nb[1] : 0,
-            prob_weights ? prob_weights->nb[1] : 0, prob_weights ? prob_weights->nb[2] : 0,
-            out_node->nb[1], out_node->nb[2]);
     } else {
         s11_fused_up_gate_swiglu_kernel<GGML_TYPE_S11_W2_BF16><<<dim3((n + 3) / 4, tokens * slots), 128, 0, ctx.stream()>>>(
             static_cast<const char *>(w_up->data), static_cast<const char *>(w_gate->data),

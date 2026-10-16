@@ -3001,6 +3001,7 @@ static bool ggml_cuda_topk_moe_fusion(const struct ggml_cgraph * cgraph, int nod
     args.delayed_softmax = false;
     args.prob_bias       = false;
     args.norm            = false;
+    args.scale           = false;
 
     const int      n_nodes = cgraph->n_nodes;
     ggml_tensor ** nodes   = cgraph->nodes;
@@ -3187,7 +3188,8 @@ static bool ggml_cuda_check_fusion_memory_ranges(const ggml_cgraph * cgraph,
             for (int src_idx = 0; src_idx < GGML_MAX_SRC; ++src_idx) {
                 const ggml_tensor * src = cgraph->nodes[j]->src[src_idx];
 
-                if (!src || src->op == GGML_OP_NONE || src == logits_may_alias) {
+                if (!src || src->op == GGML_OP_NONE || src == logits_may_alias ||
+                    (logits_may_alias != nullptr && src->view_src == logits_may_alias)) {
                     continue;
                 }
 
@@ -3624,12 +3626,28 @@ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
     return false;
 }
 
+static int ggml_cuda_try_fuse_non_s11(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i);
+
 // try and fuse nodes and return the number of nodes to skip
 static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
     const int s11_fused = ggml_cuda_s11_try_fuse(*cuda_ctx, cgraph, i);
     if (s11_fused > 0) {
         return s11_fused;
     }
+    const int other_fused = ggml_cuda_try_fuse_non_s11(cuda_ctx, cgraph, i);
+    if (other_fused > 0) {
+        for (int k = 1; k <= other_fused && i + k < cgraph->n_nodes; ++k) {
+            const ggml_tensor * skipped = cgraph->nodes[i + k];
+            ggml_cuda_s11_invalidate_if_written(skipped->data);
+            if (skipped->view_src) {
+                ggml_cuda_s11_invalidate_if_written(skipped->view_src->data);
+            }
+        }
+    }
+    return other_fused;
+}
+
+static int ggml_cuda_try_fuse_non_s11(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
     const ggml_tensor * first = cgraph->nodes[i];
     if ((first->op == GGML_OP_MUL_MAT || first->op == GGML_OP_MUL_MAT_ID) &&
         (ggml_cuda_is_s11(first->src[0]->type) || ggml_get_op_params_i32(first, 15) == 0x533131)) {
@@ -3742,7 +3760,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
                 out_nodes[1] = i + ops.size() - 1;
 
                 if (ggml_can_fuse_subgraph(cgraph, i, ops.size(), ops.data(), out_nodes, 2) &&
-                        ggml_cuda_should_use_topk_moe(node, logits, weights, ids) &&
+                        ggml_cuda_should_use_topk_moe(node, weights, logits, ids) &&
                         ggml_cuda_check_fusion_memory_ranges(cgraph, i, ops.size(), out_nodes, 2, /*is_topk_moe=*/true)) {
                     ggml_cuda_op_topk_moe(*cuda_ctx, logits, weights, ids, clamp, scale, bias, args);
                     return ops.size() - 1;
@@ -3757,7 +3775,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
 
                 int out_nodes[2] = { i + 1, i + 5 };
                 if (ggml_can_fuse_subgraph(cgraph, i, ops.size(), ops.data(), out_nodes, 2) &&
-                        ggml_cuda_should_use_topk_moe(softmax, logits, weights, ids) &&
+                        ggml_cuda_should_use_topk_moe(softmax, weights, logits, ids) &&
                         ggml_cuda_check_fusion_memory_ranges(cgraph, i, ops.size(), out_nodes, 2, /*is_topk_moe=*/true)) {
                     ggml_cuda_op_topk_moe(*cuda_ctx, logits, weights, ids, clamp, scale, bias, args);
                     return ops.size() - 1;
@@ -4515,6 +4533,9 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                 ggml_tensor * node = cgraph->nodes[i];
                 if (!ggml_cuda_is_view_or_noop(node)) {
                     ggml_cuda_s11_invalidate_if_written(node->data);
+                    if (node->view_src) {
+                        ggml_cuda_s11_invalidate_if_written(node->view_src->data);
+                    }
                 }
                 if (is_concurrent_event_active) {
                     GGML_ASSERT(concurrent_event);
@@ -4652,7 +4673,7 @@ static bool ggml_cuda_graph_set_enabled(ggml_backend_cuda_context * cuda_ctx, co
 }
 #endif // USE_CUDA_GRAPH
 
-static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, ggml_cgraph * cgraph) {
+static enum ggml_status ggml_backend_cuda_graph_compute_single(ggml_backend_t backend, ggml_cgraph * cgraph, bool allow_cuda_graph) {
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
 
     ggml_cuda_set_device(cuda_ctx->device);
@@ -4662,34 +4683,36 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
     const void * graph_key = nullptr;
 
 #ifdef USE_CUDA_GRAPH
-    graph_key = ggml_cuda_graph_get_key(cgraph);
+    if (allow_cuda_graph && cgraph->n_nodes > 0) {
+        graph_key = ggml_cuda_graph_get_key(cgraph);
 
-    ggml_cuda_graph_set_enabled(cuda_ctx, graph_key);
+        ggml_cuda_graph_set_enabled(cuda_ctx, graph_key);
 
-    ggml_cuda_graph * graph = cuda_ctx->cuda_graph(graph_key);
-    if (graph->is_enabled()) {
-        const bool graph_compatible = ggml_cuda_graph_check_compability(cgraph);
-        if (graph_compatible) {
-            const bool properties_changed = ggml_cuda_graph_update_required(cuda_ctx, cgraph);
+        ggml_cuda_graph * graph = cuda_ctx->cuda_graph(graph_key);
+        if (graph->is_enabled()) {
+            const bool graph_compatible = ggml_cuda_graph_check_compability(cgraph);
+            if (graph_compatible) {
+                const bool properties_changed = ggml_cuda_graph_update_required(cuda_ctx, cgraph);
 
-            if (!graph->warmup_complete) {
-                // Warmup: need at least 2 calls with no property change on the 2nd call
-                if (!properties_changed) {
-                    graph->warmup_complete = true;
-                    GGML_LOG_DEBUG("%s: CUDA graph warmup complete\n", __func__);
-                    use_cuda_graph = true;
-                    cuda_graph_update_required = true;
-                }
-                // else: properties changed or first call - execute directly (use_cuda_graph stays false)
-            } else {
-                // Post-warmup: normal CUDA graph operation
-                if (properties_changed) {
-                    // Properties changed - reset warmup, execute directly until stable again
-                    graph->warmup_complete = false;
-                    GGML_LOG_DEBUG("%s: CUDA graph warmup reset\n", __func__);
+                if (!graph->warmup_complete) {
+                    // Warmup: need at least 2 calls with no property change on the 2nd call
+                    if (!properties_changed) {
+                        graph->warmup_complete = true;
+                        GGML_LOG_DEBUG("%s: CUDA graph warmup complete\n", __func__);
+                        use_cuda_graph = true;
+                        cuda_graph_update_required = true;
+                    }
+                    // else: properties changed or first call - execute directly (use_cuda_graph stays false)
                 } else {
-                    use_cuda_graph = true;
-                    cuda_graph_update_required = graph->instance == nullptr;
+                    // Post-warmup: normal CUDA graph operation
+                    if (properties_changed) {
+                        // Properties changed - reset warmup, execute directly until stable again
+                        graph->warmup_complete = false;
+                        GGML_LOG_DEBUG("%s: CUDA graph warmup reset\n", __func__);
+                    } else {
+                        use_cuda_graph = true;
+                        cuda_graph_update_required = graph->instance == nullptr;
+                    }
                 }
             }
         }
@@ -4711,6 +4734,52 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
     ggml_cuda_graph_evaluate_and_capture(cuda_ctx, cgraph, use_cuda_graph, cuda_graph_update_required, graph_key);
 
     return GGML_STATUS_SUCCESS;
+}
+
+static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, ggml_cgraph * cgraph) {
+    ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
+
+    // O3.2: In multi-token prefill (n_tokens > 1), FLASH_ATTN_EXT nodes have dynamic KV cache view
+    // dimensions (n_kv) that change across microbatches and would otherwise reset CUDA Graph warmup
+    // for all static GDN/MoE layers. Decouple dynamic FLASH_ATTN_EXT nodes from static segments.
+    if (cuda_ctx->stream_context().concurrent_events.empty() && cgraph->n_nodes > 1) {
+        bool has_prefill_fa = false;
+        for (int i = 0; i < cgraph->n_nodes; ++i) {
+            const ggml_tensor * node = cgraph->nodes[i];
+            if (node->op == GGML_OP_FLASH_ATTN_EXT && node->src[0] && node->src[0]->ne[1] > 1) {
+                has_prefill_fa = true;
+                break;
+            }
+        }
+        if (has_prefill_fa) {
+            int seg_start = 0;
+            for (int i = 0; i < cgraph->n_nodes; ++i) {
+                const ggml_tensor * node = cgraph->nodes[i];
+                if (node->op == GGML_OP_FLASH_ATTN_EXT && node->src[0] && node->src[0]->ne[1] > 1) {
+                    if (i > seg_start) {
+                        ggml_cgraph seg = ggml_graph_view(cgraph, seg_start, i);
+                        enum ggml_status st = ggml_backend_cuda_graph_compute_single(backend, &seg, true);
+                        if (st != GGML_STATUS_SUCCESS) {
+                            return st;
+                        }
+                    }
+                    ggml_cgraph fa_seg = ggml_graph_view(cgraph, i, i + 1);
+                    enum ggml_status st = ggml_backend_cuda_graph_compute_single(backend, &fa_seg, false);
+                    if (st != GGML_STATUS_SUCCESS) {
+                        return st;
+                    }
+                    seg_start = i + 1;
+                }
+            }
+            if (seg_start < cgraph->n_nodes) {
+                ggml_cgraph seg = ggml_graph_view(cgraph, seg_start, cgraph->n_nodes);
+                return ggml_backend_cuda_graph_compute_single(backend, &seg, true);
+            }
+            return GGML_STATUS_SUCCESS;
+        }
+    }
+
+    return ggml_backend_cuda_graph_compute_single(backend, cgraph, true);
 }
 
 static void ggml_backend_cuda_event_record(ggml_backend_t backend, ggml_backend_event_t event) {
@@ -4840,9 +4909,21 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
                         out_nodes[1] = i + ops.size() - 1;
 
                         if (ggml_can_fuse_subgraph(cgraph, i, ops.size(), ops.data(), out_nodes, 2) &&
-                                ggml_cuda_should_use_topk_moe(node, logits, weights, ids)) {
+                                ggml_cuda_should_use_topk_moe(node, weights, logits, ids)) {
 
                             add_alloc_deps(i, i + ops.size());
+                            i += ops.size() - 1;
+                        }
+                    } else if (!args.norm && !args.prob_bias) {
+                        ops.insert(ops.end(), { GGML_OP_ARGSORT, GGML_OP_VIEW, GGML_OP_GET_ROWS, GGML_OP_RESHAPE,
+                                                GGML_OP_SOFT_MAX, GGML_OP_RESHAPE });
+                        weights                     = cgraph->nodes[i + 5];
+                        ids                         = cgraph->nodes[i + 1];
+                        const ggml_tensor * softmax = cgraph->nodes[i + 4];
+                        int out_nodes[2] = { i + 1, i + 5 };
+                        if (ggml_can_fuse_subgraph(cgraph, i, ops.size(), ops.data(), out_nodes, 2) &&
+                                ggml_cuda_should_use_topk_moe(softmax, weights, logits, ids)) {
+                            add_alloc_deps(i, i + ops.size() - 1);
                             i += ops.size() - 1;
                         }
                     }
