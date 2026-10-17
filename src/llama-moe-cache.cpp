@@ -661,18 +661,23 @@ struct llama_moe_cache::impl {
         // the selected experts must be computed in an earlier split
         // the scheduler starts a new split at the lookup because it reads a host weight, but only if the split already has inputs
         const ggml_tensor * sel = lookup->src[1];
+#ifndef NDEBUG
         for (int i = 0; i < n_nodes; ++i) {
             const ggml_tensor * node = ggml_graph_node(graph, i);
             if (node == sel || node == sel->view_src) {
                 GGML_ABORT("the experts of layer %d are selected in the same split as their MoE cache lookup", il);
             }
         }
+#endif
         GGML_ASSERT(ggml_is_contiguous(sel));
 
         const size_t n_sel = ggml_nelements(sel);
-        const char * s11_mode = std::getenv("S11_EXPERT_MODE");
+        static const bool s11_hybrid_mode = [] {
+            const char * s11_mode = std::getenv("S11_EXPERT_MODE");
+            return s11_mode && std::strcmp(s11_mode, "hybrid") == 0;
+        }();
         const bool cpu_miss = !l.experts.empty() && l.experts[0]->type == GGML_TYPE_S11_W2 &&
-            s11_mode && std::strcmp(s11_mode, "hybrid") == 0 && n_sel <= 8;
+            s11_hybrid_mode && n_sel <= 8;
         const bool is_s11_fast = !l.experts.empty() && l.experts[0]->type == GGML_TYPE_S11_W2 &&
             !cpu_miss && !s11_route_trace.is_open() && !s11_event_sync &&
             n_sel <= 8 && il >= 0 && il < 64 && g.lru.n_expert <= 256 && current_ubatch_hash != 0;

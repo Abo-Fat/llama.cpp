@@ -9,7 +9,65 @@
 #include <random>
 #include <vector>
 
+static int check_roundtrip_alias() {
+    ggml_backend_t backend = ggml_backend_cuda_init(0);
+    if (!backend) {
+        std::fprintf(stderr, "CUDA backend initialization failed\n");
+        return 1;
+    }
+    bool passed = true;
+    for (int shift : {0, 128, -128, 16384}) {
+        constexpr int count = 8192;
+        ggml_context * ctx = ggml_init({size_t(2) << 20, nullptr, true});
+        ggml_tensor * storage = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, count + 16384 + 128);
+        const size_t src_offset = shift < 0 ? 128 * sizeof(float) : 0;
+        const size_t dst_offset = size_t(shift < 0 ? 0 : shift) * sizeof(float);
+        ggml_tensor * input = ggml_view_1d(ctx, storage, count, src_offset);
+        ggml_tensor * bf16 = ggml_cast(ctx, input, GGML_TYPE_BF16);
+        ggml_tensor * output = ggml_cast(ctx, bf16, GGML_TYPE_F32);
+        ggml_cgraph * graph = ggml_new_graph(ctx);
+        ggml_build_forward_expand(graph, output);
+        ggml_backend_buffer_t buffer = ggml_backend_alloc_ctx_tensors(ctx, backend);
+        if (!buffer) {
+            std::fprintf(stderr, "Roundtrip alias buffer allocation failed\n");
+            ggml_free(ctx);
+            ggml_backend_free(backend);
+            return 1;
+        }
+        // Reproduce a legal allocator layout without an extra view node between the copies.
+        output->data = static_cast<char *>(storage->data) + dst_offset;
+        std::vector<float> values(count), actual(count);
+        for (int i = 0; i < count; ++i) {
+            values[i] = float(i * 17 % 4093 - 2046) / 37.0f;
+        }
+        for (int repeat = 0; repeat < 3; ++repeat) {
+            ggml_backend_tensor_set(input, values.data(), 0, values.size() * sizeof(float));
+            if (ggml_backend_graph_compute(backend, graph) != GGML_STATUS_SUCCESS) {
+                passed = false;
+                break;
+            }
+            ggml_backend_tensor_get(output, actual.data(), 0, actual.size() * sizeof(float));
+            for (int i = 0; i < count; ++i) {
+                if (actual[i] != ggml_bf16_to_fp32(ggml_fp32_to_bf16(values[i]))) {
+                    std::fprintf(stderr, "BF16 roundtrip alias mismatch: shift=%d repeat=%d index=%d\n",
+                                 shift, repeat, i);
+                    passed = false;
+                    break;
+                }
+            }
+        }
+        ggml_backend_buffer_free(buffer);
+        ggml_free(ctx);
+    }
+    ggml_backend_free(backend);
+    std::printf("BF16 roundtrip alias: %s\n", passed ? "PASS" : "FAIL");
+    return passed ? 0 : 1;
+}
+
 int main(int argc, char ** argv) {
+    if (argc == 2 && std::strcmp(argv[1], "--roundtrip-alias") == 0) {
+        return check_roundtrip_alias();
+    }
     const bool cpu = argc == 2 && std::strcmp(argv[1], "--cpu") == 0;
     ggml_backend_t backend = cpu ? ggml_backend_cpu_init() : ggml_backend_cuda_init(0);
     if (!backend) {

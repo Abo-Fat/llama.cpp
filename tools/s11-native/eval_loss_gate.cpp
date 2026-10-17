@@ -197,6 +197,14 @@ int main(int argc, char ** argv) {
     const char * oracle_path = argv[3];
     const bool dump_mode = std::strcmp(argv[4], "dump") == 0;
     const int max_tasks = argc >= 6 ? std::atoi(argv[5]) : 200;
+    std::ofstream task_trace;
+    if (const char * path = std::getenv("S11_GATE_TRACE")) {
+        task_trace.open(path, std::ios::out | std::ios::binary);
+        if (!task_trace) {
+            std::fprintf(stderr, "Cannot open S11_GATE_TRACE: %s\n", path);
+            return 1;
+        }
+    }
 
     InputData input;
     if (!load_input_bin(input_path, input)) {
@@ -399,6 +407,25 @@ int main(int argc, char ** argv) {
             correct_tasks += 1;
         }
         task_records[t_idx] = rec;
+        if (task_trace.is_open()) {
+            uint64_t hash = 14695981039346656037ULL;
+            const auto * bytes = reinterpret_cast<const uint8_t *>(l);
+            for (size_t i = 0; i < size_t(vocab) * sizeof(float); ++i) {
+                hash = (hash ^ bytes[i]) * 1099511628211ULL;
+            }
+            char line[512];
+            std::snprintf(line, sizeof(line),
+                "{\"task\":%d,\"tokens\":%d,\"hash\":\"%016llx\",\"choice\":%d,"
+                "\"top1\":%d,\"logits\":[%.9g,%.9g,%.9g,%.9g]}\n",
+                t_idx, n_tok, (unsigned long long) hash, best_c, rec.full_top1_id,
+                rec.choice_logits[0], rec.choice_logits[1], rec.choice_logits[2], rec.choice_logits[3]);
+            task_trace << line;
+            task_trace.flush();
+            if (!task_trace) {
+                std::fprintf(stderr, "Cannot write S11_GATE_TRACE\n");
+                return 1;
+            }
+        }
         llama_batch_free(batch);
     }
 

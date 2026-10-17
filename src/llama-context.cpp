@@ -1418,7 +1418,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         return nullptr;
     }
 
-    auto * res = get_gf_res_prev();
+    auto * res = get_gf_res_prev(ubatch.n_tokens);
     auto * gf  = res->get_gf();
 
     // the new graph parameters
@@ -2464,8 +2464,9 @@ llm_graph_result * llama_context::get_gf_res_reserve() const {
     return static_cast<llm_graph_result *>(gf_res_reserve.get());
 }
 
-llm_graph_result * llama_context::get_gf_res_prev() {
-    auto & res = gf_res_prev[n_outputs > 0];
+llm_graph_result * llama_context::get_gf_res_prev(uint32_t n_tokens) {
+    const size_t slot = ((n_tokens == 1) ? 2u : 0u) + (n_outputs > 0 ? 1u : 0u);
+    auto & res = gf_res_prev[slot];
     if (!res) {
         res.reset(new llm_graph_result(gf_res_reserve->get_max_nodes()));
     }
@@ -3753,7 +3754,7 @@ void llama_context::opt_epoch_iter(
                 break;
             }
 
-            auto * res = get_gf_res_prev();
+            auto * res = get_gf_res_prev(ubatch.n_tokens);
 
             const auto gparams = graph_params(res, ubatch, mctx.get(), ctx_type_to_graph_type(cparams.ctx_type));
 

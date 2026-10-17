@@ -234,6 +234,19 @@ counts. Prefix reuse and speculative decoding are not part of the protocol.
 
 ## Qualification tools
 
+- O4.13 rejects shifted-overlap BF16 roundtrip fusion and retains the original
+  two-copy path for that allocator layout. `check_gpu.cpp --roundtrip-alias`
+  checks exact, shifted (both directions), and disjoint layouts.
+- O4.15 keeps S11 resident decode's static segments captured while dynamic
+  FlashAttention runs separately. Parent-graph consumer ranges are indexed once
+  when fusion is evaluated, not scanned again for every candidate. The default
+  is `split` for `S11_EXPERT_MODE=gpu-resident`; `S11_DECODE_GRAPH=warmup`
+  restores the old policy. GPU-cache and other models keep their decode policy.
+- `S11_GATE_TRACE=PATH` on the rebuilt loss evaluator writes per-task full-logit
+  fingerprints and choice logits. It does not change the Oracle or thresholds.
+  Evidence and rejected candidates are in
+  [the O4 second batch](../../../outputs/s11-native/20261016-o4-r2/).
+
 - `check_cpu.py`: independent actual-source CPU expert and malformed-input tests.
 - `check_gpu.cpp`: native type arithmetic and repeated-expert indexing.
 - `check_expert_chain.cpp`: real S11 CPU/CUDA complete expert chains.

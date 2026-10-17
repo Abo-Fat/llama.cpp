@@ -3629,8 +3629,9 @@ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
 static int ggml_cuda_try_fuse_non_s11(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i);
 
 // try and fuse nodes and return the number of nodes to skip
-static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
-    const int s11_fused = ggml_cuda_s11_try_fuse(*cuda_ctx, cgraph, i);
+static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i,
+                             ggml_cuda_s11_fusion_scope * scope) {
+    const int s11_fused = ggml_cuda_s11_try_fuse(*cuda_ctx, cgraph, i, scope);
     if (s11_fused > 0) {
         return s11_fused;
     }
@@ -4431,7 +4432,9 @@ static int ggml_cuda_try_fuse_non_s11(ggml_backend_cuda_context * cuda_ctx, ggml
     return 0;
 }
 
-static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, const bool use_cuda_graph, const bool cuda_graph_update_required, const void * graph_key) {
+static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph,
+        const bool use_cuda_graph, const bool cuda_graph_update_required, const void * graph_key,
+        ggml_cuda_s11_fusion_scope * scope) {
     bool graph_evaluated_or_captured = false;
 
     // flag used to determine whether it is an integrated_gpu
@@ -4577,7 +4580,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                     continue;
                 }
 
-                int nodes_to_skip = ggml_cuda_try_fuse(cuda_ctx, cgraph, i);
+                int nodes_to_skip = ggml_cuda_try_fuse(cuda_ctx, cgraph, i, scope);
 
                 if (nodes_to_skip != 0) {
 #ifdef GGML_CUDA_DEBUG
@@ -4616,6 +4619,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                     try_launch_concurrent_event(node);
                }
             }
+            ggml_cuda_s11_record_graph_exit_state(graph_key);
         }
 
 #ifdef USE_CUDA_GRAPH
@@ -4648,6 +4652,9 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
         }
         // Launch graph
         CUDA_CHECK(cudaGraphLaunch(graph->instance, cuda_ctx->stream()));
+        if (!cuda_graph_update_required) {
+            ggml_cuda_s11_restore_graph_exit_state(graph_key);
+        }
         s11_graph_replays.fetch_add(1, std::memory_order_relaxed);
 #else
         GGML_UNUSED(graph_key);
@@ -4673,7 +4680,8 @@ static bool ggml_cuda_graph_set_enabled(ggml_backend_cuda_context * cuda_ctx, co
 }
 #endif // USE_CUDA_GRAPH
 
-static enum ggml_status ggml_backend_cuda_graph_compute_single(ggml_backend_t backend, ggml_cgraph * cgraph, bool allow_cuda_graph) {
+static enum ggml_status ggml_backend_cuda_graph_compute_single(ggml_backend_t backend, ggml_cgraph * cgraph,
+        bool allow_cuda_graph, ggml_cuda_s11_fusion_scope * scope = nullptr) {
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
 
     ggml_cuda_set_device(cuda_ctx->device);
@@ -4692,6 +4700,10 @@ static enum ggml_status ggml_backend_cuda_graph_compute_single(ggml_backend_t ba
         if (graph->is_enabled()) {
             const bool graph_compatible = ggml_cuda_graph_check_compability(cgraph);
             if (graph_compatible) {
+                const bool same_shape = (int) graph->node_props.size() == cgraph->n_nodes &&
+                    cgraph->n_nodes > 0 &&
+                    graph->node_props[cgraph->n_nodes - 1].node.ne[1] == cgraph->nodes[cgraph->n_nodes - 1]->ne[1] &&
+                    graph->node_props[cgraph->n_nodes - 1].node.ne[2] == cgraph->nodes[cgraph->n_nodes - 1]->ne[2];
                 const bool properties_changed = ggml_cuda_graph_update_required(cuda_ctx, cgraph);
 
                 if (!graph->warmup_complete) {
@@ -4706,9 +4718,14 @@ static enum ggml_status ggml_backend_cuda_graph_compute_single(ggml_backend_t ba
                 } else {
                     // Post-warmup: normal CUDA graph operation
                     if (properties_changed) {
-                        // Properties changed - reset warmup, execute directly until stable again
-                        graph->warmup_complete = false;
-                        GGML_LOG_DEBUG("%s: CUDA graph warmup reset\n", __func__);
+                        if (same_shape && graph->instance != nullptr) {
+                            use_cuda_graph = true;
+                            cuda_graph_update_required = true;
+                        } else {
+                            // Properties changed - reset warmup, execute directly until stable again
+                            graph->warmup_complete = false;
+                            GGML_LOG_DEBUG("%s: CUDA graph warmup reset\n", __func__);
+                        }
                     } else {
                         use_cuda_graph = true;
                         cuda_graph_update_required = graph->instance == nullptr;
@@ -4719,7 +4736,7 @@ static enum ggml_status ggml_backend_cuda_graph_compute_single(ggml_backend_t ba
     }
 #endif // USE_CUDA_GRAPH
 
-    ggml_cuda_s11_reset_graph_state();
+    ggml_cuda_s11_begin_split(cgraph);
 
     if (use_cuda_graph && cuda_graph_update_required) {
         // Start CUDA graph capture
@@ -4731,13 +4748,42 @@ static enum ggml_status ggml_backend_cuda_graph_compute_single(ggml_backend_t ba
         CUDA_CHECK(cudaStreamBeginCapture(cuda_ctx->stream(), cudaStreamCaptureModeRelaxed));
     }
 
-    ggml_cuda_graph_evaluate_and_capture(cuda_ctx, cgraph, use_cuda_graph, cuda_graph_update_required, graph_key);
+    ggml_cuda_graph_evaluate_and_capture(cuda_ctx, cgraph, use_cuda_graph, cuda_graph_update_required, graph_key, scope);
 
     return GGML_STATUS_SUCCESS;
 }
 
 static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, ggml_cgraph * cgraph) {
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
+    static const bool split_decode = [] {
+        const char * value = std::getenv("S11_DECODE_GRAPH");
+        if (!value) {
+            const char * mode = std::getenv("S11_EXPERT_MODE");
+            return mode && std::strcmp(mode, "gpu-resident") == 0;
+        }
+        if (std::strcmp(value, "warmup") == 0) {
+            return false;
+        }
+        if (std::strcmp(value, "split") != 0) {
+            GGML_ABORT("S11_DECODE_GRAPH must be warmup or split");
+        }
+        return true;
+    }();
+    bool s11_resident = false;
+    const char * mode = std::getenv("S11_EXPERT_MODE");
+    if (split_decode && mode && std::strcmp(mode, "gpu-resident") == 0) {
+        for (int i = 0; i < cgraph->n_nodes; ++i) {
+            const auto * node = cgraph->nodes[i];
+            if (node->op == GGML_OP_MUL_MAT && node->src[0] && ggml_cuda_is_s11(node->src[0]->type)) {
+                s11_resident = true;
+                break;
+            }
+        }
+    }
+    const auto dynamic_attention = [s11_resident](const ggml_tensor * node) {
+        return node->op == GGML_OP_FLASH_ATTN_EXT && node->src[0] &&
+            (node->src[0]->ne[1] > 1 || s11_resident);
+    };
 
     // O3.2: In multi-token prefill (n_tokens > 1), FLASH_ATTN_EXT nodes have dynamic KV cache view
     // dimensions (n_kv) that change across microbatches and would otherwise reset CUDA Graph warmup
@@ -4746,25 +4792,26 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
         bool has_prefill_fa = false;
         for (int i = 0; i < cgraph->n_nodes; ++i) {
             const ggml_tensor * node = cgraph->nodes[i];
-            if (node->op == GGML_OP_FLASH_ATTN_EXT && node->src[0] && node->src[0]->ne[1] > 1) {
+            if (dynamic_attention(node)) {
                 has_prefill_fa = true;
                 break;
             }
         }
         if (has_prefill_fa) {
+            ggml_cuda_s11_fusion_scope scope{cgraph, false, {}};
             int seg_start = 0;
             for (int i = 0; i < cgraph->n_nodes; ++i) {
                 const ggml_tensor * node = cgraph->nodes[i];
-                if (node->op == GGML_OP_FLASH_ATTN_EXT && node->src[0] && node->src[0]->ne[1] > 1) {
+                if (dynamic_attention(node)) {
                     if (i > seg_start) {
                         ggml_cgraph seg = ggml_graph_view(cgraph, seg_start, i);
-                        enum ggml_status st = ggml_backend_cuda_graph_compute_single(backend, &seg, true);
+                        enum ggml_status st = ggml_backend_cuda_graph_compute_single(backend, &seg, true, &scope);
                         if (st != GGML_STATUS_SUCCESS) {
                             return st;
                         }
                     }
                     ggml_cgraph fa_seg = ggml_graph_view(cgraph, i, i + 1);
-                    enum ggml_status st = ggml_backend_cuda_graph_compute_single(backend, &fa_seg, false);
+                    enum ggml_status st = ggml_backend_cuda_graph_compute_single(backend, &fa_seg, false, &scope);
                     if (st != GGML_STATUS_SUCCESS) {
                         return st;
                     }
@@ -4773,7 +4820,7 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
             }
             if (seg_start < cgraph->n_nodes) {
                 ggml_cgraph seg = ggml_graph_view(cgraph, seg_start, cgraph->n_nodes);
-                return ggml_backend_cuda_graph_compute_single(backend, &seg, true);
+                return ggml_backend_cuda_graph_compute_single(backend, &seg, true, &scope);
             }
             return GGML_STATUS_SUCCESS;
         }
