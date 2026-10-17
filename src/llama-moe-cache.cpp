@@ -28,7 +28,11 @@ struct moe_cache_lru {
     std::vector<uint8_t>   decode_pinned; // [n_slots] 1 if used by small (decode) batch
     int32_t                n_occupied = 0;
     int32_t                n_pinned   = 0;
+    int32_t                max_pinned = 2048;
     int32_t                scratch_cursor = 0;
+    std::array<std::array<uint64_t, 4>, 64> resident_mask{};
+    std::array<std::array<uint64_t, 4>, 64> pinned_mask{};
+    std::array<uint64_t, 64> dirty_gen{};
 
     // doubly linked list of the slots, head is the least recently used
     std::vector<int32_t> prev;
@@ -49,7 +53,14 @@ struct moe_cache_lru {
         decode_pinned.assign(n_slots, 0);
         n_occupied = 0;
         n_pinned   = 0;
+        max_pinned = std::min<int32_t>(3328, std::max<int32_t>(2048, n_slots - 1957));
+        if (const char * env_pin = std::getenv("S11_MOE_MAX_PINNED")) {
+            max_pinned = std::min<int32_t>(std::max<int32_t>(2048, std::atoi(env_pin)), std::max<int32_t>(2048, n_slots - 512));
+        }
         scratch_cursor = 0;
+        resident_mask = {};
+        pinned_mask = {};
+        dirty_gen.fill(1ULL);
         prev.resize(n_slots);
         next.resize(n_slots);
         for (int32_t s = 0; s < n_slots; ++s) {
@@ -93,7 +104,7 @@ struct moe_cache_lru {
         int32_t cur = head;
         while (cur >= 0) {
             if ((key_of[cur] < 0 || (key_of[cur] / n_expert) != il) &&
-                (is_decode || !decode_pinned[cur] || n_pinned >= 2048)) {
+                (is_decode || !decode_pinned[cur] || n_pinned >= max_pinned)) {
                 return cur;
             }
             cur = next[cur];
@@ -114,9 +125,12 @@ struct moe_cache_lru {
         for (int32_t e : uniq) {
             const int32_t s = slots[e];
             if (s >= 0) {
-                if (is_decode && !decode_pinned[s] && n_pinned < 2048) {
+                if (is_decode && !decode_pinned[s] && n_pinned < max_pinned) {
                     decode_pinned[s] = 1;
                     n_pinned++;
+                    if (il >= 0 && il < 64 && e >= 0 && e < 256) {
+                        pinned_mask[il][e >> 6] |= (1ULL << (e & 63));
+                    }
                 }
                 touch(s);
                 n_hit++;
@@ -125,7 +139,6 @@ struct moe_cache_lru {
         if (!admit || n_hit == uniq.size()) {
             return true;
         }
-        std::sort(uniq.begin(), uniq.end());
         for (int32_t e : uniq) {
             if (slots[e] >= 0) {
                 continue;
@@ -136,6 +149,11 @@ struct moe_cache_lru {
                 const int32_t old_e  = key_of[s] % n_expert;
                 slot_map[old_il][old_e] = -1;
                 dirty_layers[old_il] = true;
+                if (old_il >= 0 && old_il < 64 && old_e >= 0 && old_e < 256) {
+                    resident_mask[old_il][old_e >> 6] &= ~(1ULL << (old_e & 63));
+                    pinned_mask[old_il][old_e >> 6] &= ~(1ULL << (old_e & 63));
+                    dirty_gen[old_il]++;
+                }
                 if (decode_pinned[s]) {
                     decode_pinned[s] = 0;
                     n_pinned--;
@@ -146,9 +164,16 @@ struct moe_cache_lru {
             key_of[s] = il*n_expert + e;
             slots[e] = s;
             dirty_layers[il] = true;
-            if (is_decode && n_pinned < 2048) {
+            if (il >= 0 && il < 64 && e >= 0 && e < 256) {
+                resident_mask[il][e >> 6] |= (1ULL << (e & 63));
+                dirty_gen[il]++;
+            }
+            if (is_decode && n_pinned < max_pinned) {
                 decode_pinned[s] = 1;
                 n_pinned++;
+                if (il >= 0 && il < 64 && e >= 0 && e < 256) {
+                    pinned_mask[il][e >> 6] |= (1ULL << (e & 63));
+                }
             }
             touch(s);
             fills.push_back({ e, s });
@@ -171,6 +196,7 @@ struct moe_cache_lru {
                 uniq.push_back(ids[i]);
             }
         }
+        std::sort(uniq.begin(), uniq.end());
         return plan_from_uniq(il, n_ids, fills, n_hit, admit);
     }
 };
@@ -282,8 +308,11 @@ struct llama_moe_cache::impl {
     uint64_t current_ubatch_hash = 0;
     std::unordered_map<uint64_t, ubatch_route_record> known_ubatches;
     std::vector<const void *> last_dst_ptr;
+    std::vector<uint64_t> uploaded_gen;
+    std::array<std::pair<const ggml_tensor *, const ggml_tensor *>, 64> lookup_cache{};
     std::array<std::array<int32_t, 256>, 256> slot_map_ring{};
     size_t slot_map_ring_idx = 0;
+    ggml_backend_buffer_ptr buf_stage;
 
     // slot maps in host memory
     ggml_context_ptr ctx_host;
@@ -294,7 +323,7 @@ struct llama_moe_cache::impl {
     ggml_context_ptr ctx_views;
 
     impl(const llama_model & model, const std::vector<ggml_backend_t> & backends, const std::vector<ggml_backend_buffer_type_t> & bufts, size_t size) :
-            n_expert_used(model.hparams.n_expert_used_max()), layers(model.layers.size()), last_dst_ptr(model.layers.size(), nullptr) {
+            n_expert_used(model.hparams.n_expert_used_max()), layers(model.layers.size()), last_dst_ptr(model.layers.size(), nullptr), uploaded_gen(model.layers.size(), 0ULL) {
         if (const char * mode = std::getenv("S11_ROUTE_SYNC")) {
             if (std::strcmp(mode, "event") == 0) {
                 if (!model.output || model.output->type != GGML_TYPE_S11_I8) {
@@ -517,6 +546,12 @@ struct llama_moe_cache::impl {
             }
             ggml_backend_buffer_clear(buf_host.get(), 0xff); // all slots are -1
             buf_host_size = ggml_backend_buffer_get_size(buf_host.get());
+            if (!devices.empty()) {
+                ggml_backend_buffer_type_t stage_buft = ggml_backend_dev_host_buffer_type(ggml_backend_get_device(devices[0].backend));
+                if (stage_buft != nullptr) {
+                    buf_stage.reset(ggml_backend_buft_alloc_buffer(stage_buft, sizeof(slot_map_ring)));
+                }
+            }
 
             for (group & g : groups) {
                 for (int32_t il : g.layers) {
@@ -650,10 +685,19 @@ struct llama_moe_cache::impl {
         // the get_rows that looks up the slots of the selected experts
         const int n_nodes = ggml_graph_n_nodes(graph);
         const ggml_tensor * lookup = nullptr;
-        for (int i = 0; i < n_nodes && lookup == nullptr; ++i) {
-            const ggml_tensor * node = ggml_graph_node(graph, i);
-            if (node->op == GGML_OP_GET_ROWS && node->src[0] == dst) {
-                lookup = node;
+        if (n_nodes > 0 && il >= 0 && il < 64 && lookup_cache[il].first == ggml_graph_node(graph, 0) &&
+            lookup_cache[il].second != nullptr && lookup_cache[il].second->op == GGML_OP_GET_ROWS &&
+            lookup_cache[il].second->src[0] == dst) {
+            lookup = lookup_cache[il].second;
+        } else {
+            for (int i = 0; i < n_nodes && lookup == nullptr; ++i) {
+                const ggml_tensor * node = ggml_graph_node(graph, i);
+                if (node->op == GGML_OP_GET_ROWS && node->src[0] == dst) {
+                    lookup = node;
+                }
+            }
+            if (n_nodes > 0 && il >= 0 && il < 64) {
+                lookup_cache[il] = { ggml_graph_node(graph, 0), lookup };
             }
         }
         GGML_ASSERT(lookup != nullptr);
@@ -680,7 +724,7 @@ struct llama_moe_cache::impl {
             s11_hybrid_mode && n_sel <= 8;
         const bool is_s11_fast = !l.experts.empty() && l.experts[0]->type == GGML_TYPE_S11_W2 &&
             !cpu_miss && !s11_route_trace.is_open() && !s11_event_sync &&
-            n_sel <= 8 && il >= 0 && il < 64 && g.lru.n_expert <= 256 && current_ubatch_hash != 0;
+            n_sel <= (size_t) (128 * n_expert_used) && il >= 0 && il < 64 && g.lru.n_expert <= 256 && current_ubatch_hash != 0;
 
         size_t n_hit = 0;
         bool used_fast_route = false;
@@ -691,18 +735,38 @@ struct llama_moe_cache::impl {
                 it_rec->second.n_ids == n_sel &&
                 (it_rec->second.valid_layers & (1ULL << il)) != 0) {
                 used_fast_route = true;
-                g.lru.uniq.clear();
                 const auto & mask = it_rec->second.masks[il];
-                for (int w = 0; w < 4; ++w) {
-                    uint64_t bits = mask[w];
-                    while (bits != 0) {
-                        const int b = __builtin_ctzll(bits);
-                        g.lru.uniq.push_back(w * 64 + b);
-                        bits &= (bits - 1);
+                const bool is_decode = n_sel <= 32;
+                const uint64_t miss_pinned =
+                    (mask[0] & ~g.lru.pinned_mask[il][0]) |
+                    (mask[1] & ~g.lru.pinned_mask[il][1]) |
+                    (mask[2] & ~g.lru.pinned_mask[il][2]) |
+                    (mask[3] & ~g.lru.pinned_mask[il][3]);
+                const uint64_t miss_res =
+                    (mask[0] & ~g.lru.resident_mask[il][0]) |
+                    (mask[1] & ~g.lru.resident_mask[il][1]) |
+                    (mask[2] & ~g.lru.resident_mask[il][2]) |
+                    (mask[3] & ~g.lru.resident_mask[il][3]);
+                if ((is_decode && miss_pinned == 0 && g.lru.n_pinned < g.lru.max_pinned) ||
+                    (!is_decode && miss_res == 0 && g.lru.n_occupied < g.lru.n_slots)) {
+                    fills.clear();
+                    n_hit = (size_t) (__builtin_popcountll(mask[0]) +
+                                      __builtin_popcountll(mask[1]) +
+                                      __builtin_popcountll(mask[2]) +
+                                      __builtin_popcountll(mask[3]));
+                } else {
+                    g.lru.uniq.clear();
+                    for (int w = 0; w < 4; ++w) {
+                        uint64_t bits = mask[w];
+                        while (bits != 0) {
+                            const int b = __builtin_ctzll(bits);
+                            g.lru.uniq.push_back(w * 64 + b);
+                            bits &= (bits - 1);
+                        }
                     }
-                }
-                if (!g.lru.plan_from_uniq(il, n_sel, fills, n_hit, true)) {
-                    GGML_ABORT("the MoE cache is too small for the experts selected in layer %d", il);
+                    if (!g.lru.plan_from_uniq(il, n_sel, fills, n_hit, true)) {
+                        GGML_ABORT("the MoE cache is too small for the experts selected in layer %d", il);
+                    }
                 }
             }
         }
@@ -777,16 +841,18 @@ struct llama_moe_cache::impl {
         st.misses += fills.size();
         st.bytes  += bytes;
 
-        if (!is_s11_fast || g.lru.dirty_layers[il] || last_dst_ptr[il] != dst->data) {
+        if (!is_s11_fast || last_dst_ptr[il] != dst->data || uploaded_gen[il] != g.lru.dirty_gen[il]) {
             if (is_s11_fast && ggml_nbytes(src) <= sizeof(slot_map_ring[0])) {
-                auto & stage = slot_map_ring[slot_map_ring_idx++ & 255];
-                std::memcpy(stage.data(), src->data, ggml_nbytes(src));
-                ggml_backend_tensor_set_async(backend, dst, stage.data(), 0, ggml_nbytes(src));
+                int32_t * ring_base = buf_stage ? (int32_t *) ggml_backend_buffer_get_base(buf_stage.get()) : slot_map_ring[0].data();
+                int32_t * stage = ring_base + ((slot_map_ring_idx++ & 255) * 256);
+                std::memcpy(stage, src->data, ggml_nbytes(src));
+                ggml_backend_tensor_set_async(backend, dst, stage, 0, ggml_nbytes(src));
             } else {
                 ggml_backend_tensor_set_async(backend, dst, src->data, 0, ggml_nbytes(src));
             }
             g.lru.dirty_layers[il] = false;
             last_dst_ptr[il] = dst->data;
+            uploaded_gen[il] = g.lru.dirty_gen[il];
         }
 
         return true;

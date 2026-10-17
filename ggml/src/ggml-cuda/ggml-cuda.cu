@@ -4908,6 +4908,48 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
                 i += match.node_count - 1;
             }
 
+            // S11 Pattern E: 18-node Down-Exps + 8 Views + 7 Adds + BF16 round in Decode (tokens < 8)
+            if (i + 17 < cgraph->n_nodes &&
+                cgraph->nodes[i]->op == GGML_OP_MUL_MAT_ID &&
+                cgraph->nodes[i]->src[0] && cgraph->nodes[i]->src[0]->type == GGML_TYPE_S11_W2 &&
+                cgraph->nodes[i]->ne[1] == 8 && cgraph->nodes[i]->ne[2] < 8 &&
+                cgraph->nodes[i + 16]->op == GGML_OP_CPY && cgraph->nodes[i + 17]->op == GGML_OP_CPY) {
+                ggml_tensor * ids = cgraph->nodes[i]->src[2];
+                ggml_tensor * c2  = cgraph->nodes[i + 17];
+                if (ids) {
+                    params->add_alloc_dep(params->user_data, ids, c2);
+                    if (ids->view_src) {
+                        params->add_alloc_dep(params->user_data, ids->view_src, c2);
+                    }
+                }
+            }
+
+            // S11 Pattern D: 6-node Routed Up + Gate + SwiGLU + ProbWeight MUL + BF16 round
+            if (i + 5 < cgraph->n_nodes &&
+                cgraph->nodes[i]->op == GGML_OP_MUL_MAT_ID &&
+                cgraph->nodes[i + 1]->op == GGML_OP_MUL_MAT_ID &&
+                cgraph->nodes[i + 2]->op == GGML_OP_GLU &&
+                cgraph->nodes[i + 3]->op == GGML_OP_MUL &&
+                cgraph->nodes[i + 4]->op == GGML_OP_CPY &&
+                cgraph->nodes[i + 5]->op == GGML_OP_CPY &&
+                cgraph->nodes[i]->src[0] && cgraph->nodes[i]->src[0]->type == GGML_TYPE_S11_W2) {
+                ggml_tensor * ids = cgraph->nodes[i]->src[2];
+                ggml_tensor * pw  = cgraph->nodes[i + 3]->src[1];
+                ggml_tensor * c2  = cgraph->nodes[i + 5];
+                if (ids) {
+                    params->add_alloc_dep(params->user_data, ids, c2);
+                    if (ids->view_src) {
+                        params->add_alloc_dep(params->user_data, ids->view_src, c2);
+                    }
+                }
+                if (pw) {
+                    params->add_alloc_dep(params->user_data, pw, c2);
+                    if (pw->view_src) {
+                        params->add_alloc_dep(params->user_data, pw->view_src, c2);
+                    }
+                }
+            }
+
             if (cgraph->nodes[i]->op == GGML_OP_UNARY || cgraph->nodes[i]->op == GGML_OP_SOFT_MAX ||
                     cgraph->nodes[i]->op == GGML_OP_ARGSORT) {
                 ggml_cuda_topk_moe_args args;

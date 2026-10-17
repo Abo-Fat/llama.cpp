@@ -267,12 +267,15 @@ std::pair<ggml_tensor *, ggml_tensor *> llama_model_qwen35moe::graph::build_qkvz
     const int64_t n_seqs       = ubatch.n_seqs;
     const int64_t n_seq_tokens = ubatch.n_seq_tokens;
 
-    ggml_tensor * qkv_mixed = build_lora_mm(model.layers[il].wqkv, input, model.layers[il].wqkv_s);
-    qkv_mixed = ggml_reshape_3d(ctx0, qkv_mixed, qkv_mixed->ne[0], n_seq_tokens, n_seqs);
-    cb(qkv_mixed, "linear_attn_qkv_mixed", il);
-
+    ggml_tensor * raw_qkv = build_lora_mm(model.layers[il].wqkv, input, model.layers[il].wqkv_s);
     ggml_tensor * z = build_lora_mm(model.layers[il].wqkv_gate, input, model.layers[il].wqkv_gate_s);
     cb(z, "z", il);
+
+    ggml_build_forward_expand(gf, raw_qkv);
+    ggml_build_forward_expand(gf, z);
+
+    ggml_tensor * qkv_mixed = ggml_reshape_3d(ctx0, raw_qkv, raw_qkv->ne[0], n_seq_tokens, n_seqs);
+    cb(qkv_mixed, "linear_attn_qkv_mixed", il);
 
     return { qkv_mixed, z };
 }
@@ -315,6 +318,9 @@ ggml_tensor * llama_model_qwen35moe::graph::build_layer_attn(
     cb(Qcur_full, "Qcur_full", il);
     cb(Kcur, "Kcur", il);
     cb(Vcur, "Vcur", il);
+    ggml_build_forward_expand(gf, Qcur_full);
+    ggml_build_forward_expand(gf, Kcur);
+    ggml_build_forward_expand(gf, Vcur);
 
     ggml_tensor * Qcur = ggml_view_3d(ctx0, Qcur_full, n_embd_head, n_head, n_tokens,
         ggml_element_size(Qcur_full) * n_embd_head * 2,
