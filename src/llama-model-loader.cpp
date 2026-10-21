@@ -835,6 +835,46 @@ llama_model_loader::llama_model_loader(
         check_tensors = true;
     }
 
+    if (load_mtp && !fname.empty() && weights_map.find("blk.40.nextn.eh_proj.weight") == weights_map.end()) {
+        std::string mtp_fname;
+        if (const char * env_mtp = getenv("S11_MTP_GGUF")) {
+            mtp_fname = env_mtp;
+        } else {
+            const size_t slash = fname.find_last_of("/\\");
+            mtp_fname = (slash == std::string::npos ? std::string("") : fname.substr(0, slash + 1)) + "s11-mtp.gguf";
+        }
+        FILE * f_mtp = fopen(mtp_fname.c_str(), "rb");
+        if (f_mtp != nullptr) {
+            fclose(f_mtp);
+            struct ggml_context * ctx_mtp_ggml = nullptr;
+            struct gguf_init_params mtp_params = {
+                /*.no_alloc = */ true,
+                /*.ctx      = */ &ctx_mtp_ggml,
+            };
+            gguf_context_ptr ctx_mtp_gguf { gguf_init_from_file(mtp_fname.c_str(), mtp_params) };
+            if (!ctx_mtp_gguf) {
+                throw std::runtime_error(format("%s: failed to load MTP sidecar GGUF from %s", __func__, mtp_fname.c_str()));
+            }
+            const uint16_t idx_mtp = (uint16_t) files.size();
+            files.emplace_back(new llama_file(mtp_fname.c_str(), "rb", use_direct_io));
+            contexts.emplace_back(ctx_mtp_ggml);
+            for (ggml_tensor * cur = ggml_get_first_tensor(ctx_mtp_ggml); cur; cur = ggml_get_next_tensor(ctx_mtp_ggml, cur)) {
+                std::string tensor_name = std::string(cur->name);
+                if (weights_map.find(tensor_name) != weights_map.end()) {
+                    throw std::runtime_error(format("invalid MTP sidecar: tensor '%s' is duplicated", ggml_get_name(cur)));
+                }
+                n_elements += ggml_nelements(cur);
+                n_bytes    += ggml_nbytes(cur);
+                weights_map.emplace(tensor_name, llama_tensor_weight(files.back().get(), idx_mtp, ctx_mtp_gguf.get(), cur));
+            }
+            n_tensors = weights_map.size();
+            gguf_set_val_u32(metadata, "qwen35moe.block_count", 41);
+            gguf_set_val_u32(metadata, "qwen35moe.nextn_predict_layers", 1);
+            gguf_remove_key(metadata, "qwen35moe.attention.recurrent_layers");
+            LLAMA_LOG_INFO("%s: attached S11 MTP sidecar '%s' (%d total tensors)\n", __func__, mtp_fname.c_str(), n_tensors);
+        }
+    }
+
     LLAMA_LOG_INFO("%s: loaded meta data with %d key-value pairs and %d tensors from %s (version %s)\n",
             __func__, n_kv, n_tensors, fname.empty() ? "(file*)" : fname.c_str(), llama_file_version_name(fver));
 
@@ -1347,8 +1387,8 @@ struct ggml_tensor * llama_model_loader::create_tensor(
 
         ggml_backend_buffer_type_t buft = nullptr;
 
-        // check overrides
-        if (tensor_buft_overrides) {
+        // check overrides (keep NextN/MTP blocks on GPU for fast single-layer draft execution)
+        if (tensor_buft_overrides && tn.bid < (int) hparams.n_layer()) {
             std::string tensor_name = tn.str();
             for (const auto * overrides = tensor_buft_overrides; overrides->pattern != nullptr; ++overrides) {
                 std::regex pattern(overrides->pattern);

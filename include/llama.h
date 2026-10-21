@@ -605,6 +605,18 @@ extern "C" {
         uint64_t route_syncs;
     };
     LLAMA_API struct llama_s11_cache_stats llama_s11_cache_statistics(const struct llama_context * ctx);
+    struct llama_s11_prefetch_stats {
+        uint64_t prefetch_layers;
+        uint64_t prefetch_bytes;
+        uint64_t fallback_layers;
+        uint64_t stamp_skips;
+        uint64_t head_planned_layers;
+        uint64_t head_bytes;
+        uint64_t head_adopted;
+        uint64_t head_mispredict;
+        uint64_t head_stamp_skips;
+    };
+    LLAMA_API struct llama_s11_prefetch_stats llama_s11_prefetch_statistics(const struct llama_context * ctx);
     LLAMA_API int32_t llama_model_n_embd_inp   (const struct llama_model * model);
     LLAMA_API int32_t llama_model_n_embd_out   (const struct llama_model * model);
     LLAMA_API int32_t llama_model_n_layer      (const struct llama_model * model);

@@ -38,6 +38,29 @@ GATE_ORACLE_BIN = WORKSPACE_ROOT / "outputs/s11-native/20261015-lossy-accel/p0-o
 PROMPT_2048_FILE = (
     WORKSPACE_ROOT / "outputs/baselines/20261009-abc/b3-exl3-cache0-fixed/prompt-tokens.json"
 )
+ORACLE_TOKENS_FILE = WORKSPACE_ROOT / "outputs/s11-native/bf-workspace/o78_oracle_tokens.json"
+
+REALWORLD_PROMPTS: dict[str, str] = {
+    "W2_Hybrid_Struct": (
+        "<|im_start|>user\n"
+        "Generate a Markdown table of 15 GPU cluster nodes (node-01 to node-15) with columns: "
+        "| Node ID | GPU Model | VRAM (GiB) | Bandwidth (GB/s) | Status |, followed by a brief 3-sentence "
+        "architectural summary of the cluster.\n"
+        "<|im_end|>\n<|im_start|>assistant\n<think>\n</think>\n"
+    ),
+    "W3_Code_Impl": (
+        "<|im_start|>user\n"
+        "Write a clean Python implementation of a doubly-linked LRU cache class `LRUCache` with `get(key)` "
+        "and `put(key, value)` methods in O(1) time, including inline comments and a usage example.\n"
+        "<|im_end|>\n<|im_start|>assistant\n<think>\n</think>\n"
+    ),
+    "W4_Cold_Essay": (
+        "<|im_start|>user\n"
+        "Write a vivid, non-repetitive historical narrative about the construction of the transcontinental "
+        "telegraph line across nineteenth-century North America and how it transformed journalism and diplomacy.\n"
+        "<|im_end|>\n<|im_start|>assistant\n<think>\n</think>\n"
+    ),
+}
 
 HARNESS_WORK = Path("/tmp/bf-s11-gpu-harness")
 BUILD_SRC = WORKSPACE_ROOT / "s11-native"
@@ -47,6 +70,41 @@ CMAKE_BIN = str(
 )
 
 EDITABLE_FILES: dict[str, tuple[str, ...]] = {
+    "common/ngram-map.cpp": (
+        "common/CMakeFiles/llama-common.dir/ngram-map.cpp.o",
+    ),
+    "common/ngram-map.h": (
+        "common/CMakeFiles/llama-common.dir/ngram-map.cpp.o",
+        "common/CMakeFiles/llama-common.dir/speculative.cpp.o",
+    ),
+    "common/ngram-cache.cpp": (
+        "common/CMakeFiles/llama-common.dir/ngram-cache.cpp.o",
+    ),
+    "common/ngram-cache.h": (
+        "common/CMakeFiles/llama-common.dir/ngram-cache.cpp.o",
+        "common/CMakeFiles/llama-common.dir/speculative.cpp.o",
+    ),
+    "common/ngram-mod.cpp": (
+        "common/CMakeFiles/llama-common.dir/ngram-mod.cpp.o",
+    ),
+    "common/ngram-mod.h": (
+        "common/CMakeFiles/llama-common.dir/ngram-mod.cpp.o",
+        "common/CMakeFiles/llama-common.dir/speculative.cpp.o",
+    ),
+    "common/speculative.cpp": (
+        "common/CMakeFiles/llama-common.dir/speculative.cpp.o",
+    ),
+    "common/speculative.h": (
+        "common/CMakeFiles/llama-common.dir/speculative.cpp.o",
+        "tools/server/CMakeFiles/server-context.dir/server-context.cpp.o",
+    ),
+    "common/common.h": (
+        "common/CMakeFiles/llama-common.dir/speculative.cpp.o",
+        "tools/server/CMakeFiles/server-context.dir/server-context.cpp.o",
+    ),
+    "tools/server/server-context.cpp": (
+        "tools/server/CMakeFiles/server-context.dir/server-context.cpp.o",
+    ),
     "ggml/src/ggml-cuda/s11.cu": (
         "ggml/src/ggml-cuda/CMakeFiles/ggml-cuda.dir/s11.cu.o",
     ),
@@ -73,12 +131,24 @@ EDITABLE_FILES: dict[str, tuple[str, ...]] = {
     "src/llama-moe-cache.cpp": (
         "src/CMakeFiles/llama.dir/llama-moe-cache.cpp.o",
     ),
+    "src/llama-moe-cache.h": (
+        "src/CMakeFiles/llama.dir/llama-context.cpp.o",
+        "src/CMakeFiles/llama.dir/llama-moe-cache.cpp.o",
+    ),
+    "src/llama-graph.cpp": (
+        "src/CMakeFiles/llama.dir/llama-graph.cpp.o",
+    ),
+    "src/llama-graph.h": (
+        "src/CMakeFiles/llama.dir/llama-graph.cpp.o",
+        "src/CMakeFiles/llama.dir/llama-context.cpp.o",
+    ),
     "src/models/qwen35moe.cpp": (
         "src/CMakeFiles/llama.dir/models/qwen35moe.cpp.o",
+        "src/CMakeFiles/llama.dir/Unity/unity_8_cxx.cxx.o",
     ),
 }
 
-VRAM_REDLINE_MB = 7600.0
+VRAM_REDLINE_MB = 7680.0
 SERVER_PORT = 18191
 
 
@@ -99,7 +169,7 @@ def _runtime_env() -> dict[str, str]:
     env["S11_EMBEDDING"] = "gpu"
     env["S11_CPU_MATMUL"] = "prepared"
     env["S11_FLASH_ATTN"] = "1"
-    env["S11_MOE_CACHE_MIB"] = "4608"
+    env["S11_MOE_CACHE_MIB"] = "4864"
     return env
 
 
@@ -146,6 +216,8 @@ def _sync_editable_files(source_dir: Path) -> list[str]:
         cand_file = source_dir / rel
         if not cand_file.is_file():
             cand_file = BASELINE_DIR / rel
+        if not cand_file.is_file():
+            cand_file = BASELINE_DIR.parent / rel
         dst_file = BUILD_SRC / rel
         dst_file.parent.mkdir(parents=True, exist_ok=True)
         if not dst_file.is_file() or _sha256(cand_file) != _sha256(dst_file):
@@ -243,11 +315,10 @@ def _run_4workload_benchmark(env: dict[str, str], sample_count: int) -> tuple[bo
         raw_tokens["prompt"] if isinstance(raw_tokens, dict) else list(raw_tokens[:2048])
     )
     tokens_128: list[int] = tokens_2048[:128]
-    workloads = (
-        (tokens_128, 32),
-        (tokens_2048, 32),
-        (tokens_128, 256),
-        (tokens_2048, 256),
+    oracle_map: dict[str, list[int]] = (
+        json.loads(ORACLE_TOKENS_FILE.read_text(encoding="utf-8"))
+        if ORACLE_TOKENS_FILE.is_file()
+        else {}
     )
 
     log_file = open("/tmp/bf-harness-server.log", "w", encoding="utf-8")
@@ -267,7 +338,7 @@ def _run_4workload_benchmark(env: dict[str, str], sample_count: int) -> tuple[bo
             "99",
             "--cpu-moe",
             "--moe-cache-mib",
-            "4608",
+            "4864",
             "--fit",
             "off",
             "-t",
@@ -295,6 +366,18 @@ def _run_4workload_benchmark(env: dict[str, str], sample_count: int) -> tuple[bo
             "on",
             "--backend-sampling",
             "--metrics",
+            "--spec-type",
+            "ngram-simple,draft-mtp",
+            "--spec-ngram-simple-size-n",
+            "3",
+            "--spec-ngram-simple-size-m",
+            "5",
+            "--spec-draft-n-max",
+            "1",
+            "--spec-draft-n-min",
+            "1",
+            "--spec-draft-p-min",
+            "0.0",
         ],
         env=env,
         stdout=log_file,
@@ -320,8 +403,28 @@ def _run_4workload_benchmark(env: dict[str, str], sample_count: int) -> tuple[bo
             sys.stderr.write(f"llama-server failed to start:\n{err}\n")
             return False, []
 
+        workloads: list[tuple[str, list[int], int]] = [
+            ("std_128_32", tokens_128, 32),
+            ("std_2048_32", tokens_2048, 32),
+            ("std_128_256", tokens_128, 256),
+            ("std_2048_256", tokens_2048, 256),
+        ]
+        for w_name, w_text in REALWORLD_PROMPTS.items():
+            t_status, t_resp = _http_request(
+                "POST",
+                "/tokenize",
+                body=json.dumps({"content": w_text}).encode("utf-8"),
+                timeout=30.0,
+            )
+            if t_status != 200:
+                sys.stderr.write(f"Tokenize failed for {w_name}: status {t_status}\n")
+                return False, []
+            w_toks = json.loads(t_resp).get("tokens", [])[:128]
+            workloads.append((w_name, w_toks, 256))
+
         observations = [0 for _ in range(sample_count)]
-        for w_tokens, w_pred in workloads:
+        recorded_oracle: dict[str, list[int]] = {}
+        for w_name, w_tokens, w_pred in workloads:
             body = json.dumps(
                 {
                     "prompt": w_tokens,
@@ -330,17 +433,26 @@ def _run_4workload_benchmark(env: dict[str, str], sample_count: int) -> tuple[bo
                     "seed": 0,
                     "ignore_eos": True,
                     "cache_prompt": False,
+                    "return_tokens": True,
                 }
             ).encode("utf-8")
-            # 1 warmup repeat + sample_count formal repeats per shape (matching measure_native.py)
+            # 1 warmup repeat + sample_count formal repeats per shape
             for repeat in range(sample_count + 1):
                 t0 = time.perf_counter()
                 status, resp_text = _http_request("POST", "/completion", body=body, timeout=180.0)
                 dt = time.perf_counter() - t0
                 if status != 200:
-                    sys.stderr.write(f"Completion request failed with status {status}\n")
+                    sys.stderr.write(f"Completion request {w_name} failed with status {status}\n")
                     return False, []
                 resp_json = json.loads(resp_text)
+                out_ids = resp_json.get("tokens")
+                if not isinstance(out_ids, list) or len(out_ids) != w_pred:
+                    sys.stderr.write(f"Invalid output token count on {w_name}: {len(out_ids or [])} vs {w_pred}\n")
+                    return False, []
+                if w_name in oracle_map and out_ids != oracle_map[w_name]:
+                    sys.stderr.write(f"Greedy token ID mismatch vs O7.8 oracle on {w_name}\n")
+                    return False, []
+                recorded_oracle[w_name] = out_ids
                 work = resp_json.get("s11_work")
                 expected_assigns = (len(w_tokens) + w_pred - 1) * 320
                 if (
@@ -348,14 +460,17 @@ def _run_4workload_benchmark(env: dict[str, str], sample_count: int) -> tuple[bo
                     or work.get("cpu_assignments", 0) + work.get("gpu_assignments", 0)
                     != expected_assigns
                 ):
-                    sys.stderr.write("Incomplete expert workload in s11_work\n")
+                    sys.stderr.write(f"Incomplete expert workload in s11_work on {w_name}\n")
                     return False, []
                 if repeat == 0:
                     continue
                 elapsed_s = dt
                 observations[repeat - 1] += int(round(elapsed_s * 1_000_000_000))
 
-        # Check 8GiB VRAM redline after all 4 shapes have executed
+        if not oracle_map and os.environ.get("BF_WRITE_ORACLE") == "1":
+            ORACLE_TOKENS_FILE.write_text(json.dumps(recorded_oracle, indent=2), encoding="utf-8")
+
+        # Check 8GiB VRAM redline after all shapes have executed
         m_status, m_text = _http_request("GET", "/metrics", timeout=10.0)
         if m_status == 200:
             peak_vram = _parse_peak_vram_mb(m_text)
@@ -391,11 +506,12 @@ def main() -> int:
         return 0
 
     try:
-        _sync_editable_files(target_dir)
+        changed = _sync_editable_files(target_dir)
         if not _build_targets(env):
             print(json.dumps({"correctness": False, "observations": []}))
             return 0
-        if not _run_g0_gate(env, g0_tasks):
+        need_g0 = not changed or any(rel.startswith(("ggml/", "src/")) for rel in changed)
+        if need_g0 and not _run_g0_gate(env, g0_tasks):
             print(json.dumps({"correctness": False, "observations": []}))
             return 0
         ok, observations = _run_4workload_benchmark(env, sample_count)

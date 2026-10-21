@@ -259,6 +259,15 @@ llama_s11_cache_stats llama_s11_cache_statistics(const llama_context * ctx) {
     return {values[0], values[1], values[2]};
 }
 
+llama_s11_prefetch_stats llama_s11_prefetch_statistics(const llama_context * ctx) {
+    const auto * cache = ctx ? ctx->get_moe_cache() : nullptr;
+    if (!cache) {
+        return {0, 0, 0, 0, 0, 0, 0, 0, 0};
+    }
+    const auto values = cache->prefetch_statistics();
+    return {values[0], values[1], values[2], values[3], values[4], values[5], values[6], values[7], values[8]};
+}
+
 ggml_tensor * llama_s11_cpu_misses(ggml_context * ctx, const llama_model & model,
                                  const llama_moe_cache * cache, int layer,
                                  ggml_tensor * input, ggml_tensor * ids, ggml_tensor * probabilities) {

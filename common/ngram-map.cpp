@@ -49,64 +49,120 @@ static std::string common_tokens_to_str(const llama_tokens & inp, size_t start, 
 llama_tokens common_ngram_simple_draft(
         const common_ngram_simple_config & config,
         const llama_tokens & tokens, llama_token sampled) {
-
-    // Simple implementation of self-speculative decoding without a draft model.
-    //
     const size_t cur_len = tokens.size();
-
-    const size_t n_draft_min = config.size_ngram; // size of n-gram to lookup in token history
-    const size_t n_draft_max = config.size_mgram; // the m-gram following the found n-gram is used for draft
-
-    // vector for tokens we want to verify.
-    // return empty vector if there is no match.
+    const size_t n_draft_max = config.size_mgram;
     llama_tokens draft_tokens;
-
-    // We need at least n_draft_min + n_draft_max + 1 tokens.
-    if (cur_len <= static_cast<size_t>(n_draft_min + n_draft_max + 1)) {
+    if (cur_len < 2 || n_draft_max == 0) {
         return draft_tokens;
     }
 
-    // pattern search
-    llama_tokens pattern;
-    pattern.reserve(n_draft_min);
-    for (size_t j = cur_len - n_draft_min + 1; j < cur_len; ++j) {
-        pattern.push_back(tokens[j]);
-    }
-    pattern.push_back(sampled); // add the last token to the pattern
+    auto token_at = [&](size_t idx) -> llama_token {
+        return idx < cur_len ? tokens[idx] : sampled;
+    };
+    const size_t total_len = cur_len + 1;
+    const size_t max_n = std::min<size_t>(std::max<size_t>(2, config.size_ngram), std::min<size_t>(4, cur_len));
 
-    size_t match_pos = 0; // we ignore position 0, position 0 == no match
-                          // search backwards, but skip the current match (we are currently there)
-    for (size_t j = cur_len - n_draft_min - 1; j > 0; --j) {
-        bool match = true;
-        for (size_t k = 0; k < pattern.size(); ++k) {
-            if (tokens[j + k] != pattern[k]) {
-                match = false;
+    size_t best_pos = SIZE_MAX;
+    size_t best_n   = 0;
+    bool   is_span  = false;
+
+    for (size_t n = max_n; n >= 3; --n) {
+        const size_t pat_start = total_len - n;
+        for (size_t j = cur_len - n; ; --j) {
+            bool match = true;
+            for (size_t k = 0; k < n; ++k) {
+                if (token_at(j + k) != token_at(pat_start + k)) {
+                    match = false;
+                    break;
+                }
+            }
+            if (match) {
+                const size_t cand_span = total_len - (j + n);
+                bool has_special = false;
+                for (size_t k = 0; k < n; ++k) {
+                    if (token_at(pat_start + k) >= 151643) {
+                        has_special = true;
+                        break;
+                    }
+                }
+                const bool periodic = !has_special &&
+                    ((j >= cand_span && cand_span >= n &&
+                      token_at(j) == token_at(j - cand_span) &&
+                      token_at(j + 1) == token_at(j - cand_span + 1) &&
+                      token_at(j + n - 1) == token_at(j - cand_span + n - 1)) ||
+                     (cand_span >= 8 && cand_span <= 16 && n >= 4 && j >= 2 &&
+                      token_at(j - 1) == token_at(pat_start - 1) &&
+                      token_at(j - 2) == token_at(pat_start - 2)));
+                if (periodic) {
+                    best_pos = j;
+                    best_n   = n;
+                    is_span  = true;
+                    break;
+                }
+            }
+            if (j == 0) {
                 break;
             }
         }
-        if (match) {
-            match_pos = j;
+        if (best_pos != SIZE_MAX) {
             break;
         }
     }
-    if (match_pos == 0) {
+
+    // Pass 2: Fixed-width K=5 (M=6) 4-gram gapped counter-slot alignment for structured tables/numbered lists
+    auto is_digit_tok = [](llama_token t) -> bool {
+        return t >= 15 && t <= 24;
+    };
+    if (best_pos == SIZE_MAX && cur_len >= 6 && is_digit_tok(sampled)) {
+        const size_t p4 = cur_len - 4;
+        const size_t min_j = cur_len > 52 ? cur_len - 52 : 0;
+        if (tokens[p4 + 3] == 15 || tokens[p4 + 3] == 12) {
+            for (size_t j = cur_len - 5; j >= min_j; --j) {
+                if (is_digit_tok(tokens[j + 4]) &&
+                    tokens[j]     == tokens[p4]     &&
+                    tokens[j + 1] == tokens[p4 + 1] &&
+                    tokens[j + 2] == tokens[p4 + 2] &&
+                    tokens[j + 3] == tokens[p4 + 3]) {
+                    best_pos = j;
+                    best_n   = 5;
+                    is_span  = true;
+                    break;
+                }
+                if (j == min_j) break;
+            }
+        }
+        if (best_pos == SIZE_MAX && cur_len >= 7 && tokens[cur_len - 1] == 16) {
+            const size_t p4_2 = cur_len - 5;
+            for (size_t j = cur_len - 6; j >= min_j; --j) {
+                if (is_digit_tok(tokens[j + 4]) && is_digit_tok(tokens[j + 5]) &&
+                    tokens[j]     == tokens[p4_2]     &&
+                    tokens[j + 1] == tokens[p4_2 + 1] &&
+                    tokens[j + 2] == tokens[p4_2 + 2] &&
+                    tokens[j + 3] == tokens[p4_2 + 3]) {
+                    best_pos = j;
+                    best_n   = 6;
+                    is_span  = true;
+                    break;
+                }
+                if (j == min_j) break;
+            }
+        }
+    }
+
+    if (best_pos == SIZE_MAX) {
         return draft_tokens;
     }
 
-    const size_t copy_max = std::min(
-            n_draft_max,
-            cur_len - (match_pos + n_draft_min)
-            );
-    if (copy_max < n_draft_min) {
+    const size_t src_start = best_pos + best_n;
+    const size_t span = total_len - src_start;
+    if (span == 0) {
         return draft_tokens;
     }
-    LOG_DBG("%s: #tokens = %zu: found matching pattern at pos %zu, length %zu, draft length %zu\n",
-            __func__, cur_len,
-            match_pos, pattern.size(), copy_max);
 
-    draft_tokens.reserve(copy_max);
-    for (size_t j = 0; j < copy_max; ++j) {
-        draft_tokens.push_back(tokens[match_pos + n_draft_min + j]);
+    const size_t eff_draft = is_span ? n_draft_max : 1;
+    draft_tokens.reserve(eff_draft);
+    for (size_t k = 0; k < eff_draft; ++k) {
+        draft_tokens.push_back(token_at(src_start + (k % span)));
     }
     return draft_tokens;
 }

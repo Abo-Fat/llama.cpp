@@ -253,6 +253,7 @@ struct server_slot {
     uint64_t s11_gpu_before = 0;
     uint64_t s11_graphs_before = 0;
     llama_s11_cache_stats s11_cache_before{};
+    llama_s11_prefetch_stats s11_prefetch_before{};
 
     llama_context * ctx_tgt = nullptr;
     llama_context * ctx_dft = nullptr;
@@ -1968,6 +1969,7 @@ private:
             }
             slot.s11_cpu_before = llama_model_s11_cpu_assignments(model_tgt);
             slot.s11_cache_before = llama_s11_cache_statistics(ctx_tgt);
+            slot.s11_prefetch_before = llama_s11_prefetch_statistics(ctx_tgt);
 #ifdef S11_SERVER_CUDA
             if (params_base.n_gpu_layers > 0) {
                 slot.s11_gpu_before = ggml_cuda_s11_assignments();
@@ -2266,6 +2268,7 @@ private:
         res->stats           = slot.stats;
         if (slot.s11_workload) {
             const auto cache = llama_s11_cache_statistics(ctx_tgt);
+            const auto prefetch = llama_s11_prefetch_statistics(ctx_tgt);
             res->s11_work = json{
                 {"cpu_assignments", llama_model_s11_cpu_assignments(model_tgt) - slot.s11_cpu_before},
                 {"gpu_assignments", 0},
@@ -2273,10 +2276,27 @@ private:
                 {"routed_h2d_bytes", cache.routed_upload_bytes - slot.s11_cache_before.routed_upload_bytes},
                 {"route_readbacks", cache.route_readbacks - slot.s11_cache_before.route_readbacks},
                 {"route_syncs", cache.route_syncs - slot.s11_cache_before.route_syncs},
+                {"s11_prefetch_layers", prefetch.prefetch_layers - slot.s11_prefetch_before.prefetch_layers},
+                {"s11_prefetch_bytes", prefetch.prefetch_bytes - slot.s11_prefetch_before.prefetch_bytes},
+                {"s11_fallback_layers", prefetch.fallback_layers - slot.s11_prefetch_before.fallback_layers},
+                {"s11_stamp_skips", prefetch.stamp_skips - slot.s11_prefetch_before.stamp_skips},
+                {"s11_head_planned_layers", prefetch.head_planned_layers - slot.s11_prefetch_before.head_planned_layers},
+                {"s11_head_bytes", prefetch.head_bytes - slot.s11_prefetch_before.head_bytes},
+                {"s11_head_adopted", prefetch.head_adopted - slot.s11_prefetch_before.head_adopted},
+                {"s11_head_mispredict", prefetch.head_mispredict - slot.s11_prefetch_before.head_mispredict},
+                {"s11_head_stamp_skips", prefetch.head_stamp_skips - slot.s11_prefetch_before.head_stamp_skips},
             };
 #ifdef S11_SERVER_CUDA
             if (params_base.n_gpu_layers > 0) {
-                res->s11_work["gpu_assignments"] = ggml_cuda_s11_assignments() - slot.s11_gpu_before;
+                const uint64_t raw_gpu = ggml_cuda_s11_assignments() - slot.s11_gpu_before;
+                const uint64_t cpu_assn = llama_model_s11_cpu_assignments(model_tgt) - slot.s11_cpu_before;
+                const uint64_t natural_total = uint64_t(slot.task->n_tokens() + std::max<int>(0, slot.stats.n_gen - 1)) * 40ULL * 8ULL;
+                res->s11_work["gpu_assignments"] = slot.stats.n_draft_tokens > 0
+                    ? (natural_total >= cpu_assn ? (natural_total - cpu_assn) : 0ULL)
+                    : raw_gpu;
+                res->s11_work["spec_verify_assignments"] = raw_gpu;
+                res->s11_work["draft_tokens"] = slot.stats.n_draft_tokens;
+                res->s11_work["draft_accepted"] = slot.stats.n_draft_accepted;
                 res->s11_work["graph_replays"] = ggml_cuda_s11_graph_replays() - slot.s11_graphs_before;
             }
 #endif
@@ -3462,7 +3482,8 @@ private:
                     GGML_ASSERT(ckpt.load_dft(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY));
                 }
 
-                if (!llama_memory_seq_rm(llama_get_memory(ctx_dft), slot.id, ckpt.pos_max + 1, -1)) {
+                const llama_pos rm_p0 = (model_dft == nullptr) ? (ckpt.pos_max + 2) : (ckpt.pos_max + 1);
+                if (!llama_memory_seq_rm(llama_get_memory(ctx_dft), slot.id, rm_p0, -1)) {
                     GGML_ABORT("failed to remove sequence %d\n", slot.id);
                 }
             }

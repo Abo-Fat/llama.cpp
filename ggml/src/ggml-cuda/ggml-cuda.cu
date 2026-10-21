@@ -4771,7 +4771,7 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
     }();
     bool s11_resident = false;
     const char * mode = std::getenv("S11_EXPERT_MODE");
-    if (split_decode && mode && std::strcmp(mode, "gpu-resident") == 0) {
+    if (split_decode && mode && std::strcmp(mode, "gpu-resident") == 0 && cgraph->n_nodes >= 200) {
         for (int i = 0; i < cgraph->n_nodes; ++i) {
             const auto * node = cgraph->nodes[i];
             if (node->op == GGML_OP_MUL_MAT && node->src[0] && ggml_cuda_is_s11(node->src[0]->type)) {
@@ -4782,7 +4782,7 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
     }
     const auto dynamic_attention = [s11_resident](const ggml_tensor * node) {
         return node->op == GGML_OP_FLASH_ATTN_EXT && node->src[0] &&
-            (node->src[0]->ne[1] > 1 || s11_resident);
+            (node->src[0]->ne[1] > 12 || s11_resident);
     };
 
     // O3.2: In multi-token prefill (n_tokens > 1), FLASH_ATTN_EXT nodes have dynamic KV cache view
@@ -4805,6 +4805,7 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
                 if (dynamic_attention(node)) {
                     if (i > seg_start) {
                         ggml_cgraph seg = ggml_graph_view(cgraph, seg_start, i);
+                        seg.uid = cgraph->uid ? ((cgraph->uid << 16) ^ uint64_t(seg_start + 1)) : 0;
                         enum ggml_status st = ggml_backend_cuda_graph_compute_single(backend, &seg, true, &scope);
                         if (st != GGML_STATUS_SUCCESS) {
                             return st;
@@ -4820,6 +4821,7 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
             }
             if (seg_start < cgraph->n_nodes) {
                 ggml_cgraph seg = ggml_graph_view(cgraph, seg_start, cgraph->n_nodes);
+                seg.uid = cgraph->uid ? ((cgraph->uid << 16) ^ uint64_t(seg_start + 1)) : 0;
                 return ggml_backend_cuda_graph_compute_single(backend, &seg, true, &scope);
             }
             return GGML_STATUS_SUCCESS;
@@ -4908,14 +4910,21 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
                 i += match.node_count - 1;
             }
 
-            // S11 Pattern E: 18-node Down-Exps + 8 Views + 7 Adds + BF16 round in Decode (tokens < 8)
+            // S11 Pattern E: 18-node Down-Exps + 8 Views + 7 Adds + BF16 round in Decode (tokens <= 8)
             if (i + 17 < cgraph->n_nodes &&
                 cgraph->nodes[i]->op == GGML_OP_MUL_MAT_ID &&
                 cgraph->nodes[i]->src[0] && cgraph->nodes[i]->src[0]->type == GGML_TYPE_S11_W2 &&
-                cgraph->nodes[i]->ne[1] == 8 && cgraph->nodes[i]->ne[2] < 8 &&
+                cgraph->nodes[i]->ne[1] == 8 && cgraph->nodes[i]->ne[2] <= 8 &&
                 cgraph->nodes[i + 16]->op == GGML_OP_CPY && cgraph->nodes[i + 17]->op == GGML_OP_CPY) {
+                ggml_tensor * x   = cgraph->nodes[i]->src[1];
                 ggml_tensor * ids = cgraph->nodes[i]->src[2];
                 ggml_tensor * c2  = cgraph->nodes[i + 17];
+                if (x) {
+                    params->add_alloc_dep(params->user_data, x, c2);
+                    if (x->view_src) {
+                        params->add_alloc_dep(params->user_data, x->view_src, c2);
+                    }
+                }
                 if (ids) {
                     params->add_alloc_dep(params->user_data, ids, c2);
                     if (ids->view_src) {
@@ -4947,6 +4956,117 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
                     if (pw->view_src) {
                         params->add_alloc_dep(params->user_data, pw->view_src, c2);
                     }
+                }
+            }
+
+            auto pin_s11_tensor = [&](ggml_tensor * t, ggml_tensor * consumer) {
+                if (t && consumer) {
+                    params->add_alloc_dep(params->user_data, t, consumer);
+                    if (t->view_src) {
+                        params->add_alloc_dep(params->user_data, t->view_src, consumer);
+                    }
+                }
+            };
+
+            // S11 Pattern H-Conv-State: 21-node GDN build_conv_state + SSM_CONV + SILU + Q/K L2-norm
+            if (i + 20 < cgraph->n_nodes &&
+                cgraph->nodes[i]->op == GGML_OP_PERMUTE &&
+                cgraph->nodes[i + 1]->op == GGML_OP_CONT &&
+                cgraph->nodes[i + 2]->op == GGML_OP_CONCAT &&
+                cgraph->nodes[i + 3]->op == GGML_OP_VIEW &&
+                cgraph->nodes[i + 4]->op == GGML_OP_VIEW &&
+                cgraph->nodes[i + 5]->op == GGML_OP_CPY &&
+                cgraph->nodes[i + 6]->op == GGML_OP_CPY &&
+                cgraph->nodes[i + 7]->op == GGML_OP_SSM_CONV &&
+                cgraph->nodes[i + 8]->op == GGML_OP_UNARY &&
+                cgraph->nodes[i + 10]->op == GGML_OP_CPY &&
+                cgraph->nodes[i + 15]->op == GGML_OP_CPY &&
+                cgraph->nodes[i + 20]->op == GGML_OP_CPY &&
+                cgraph->nodes[i + 7]->src[0] == cgraph->nodes[i + 2] &&
+                cgraph->nodes[i + 7]->src[1] == cgraph->nodes[i + 6]) {
+                ggml_tensor * h11 = cgraph->nodes[i + 20];
+                pin_s11_tensor(cgraph->nodes[i]->src[0], h11);
+                pin_s11_tensor(cgraph->nodes[i + 2]->src[0], h11);
+                pin_s11_tensor(cgraph->nodes[i + 5], h11);
+                pin_s11_tensor(cgraph->nodes[i + 6]->src[0], h11);
+                pin_s11_tensor(cgraph->nodes[i + 7]->src[0], h11);
+                pin_s11_tensor(cgraph->nodes[i + 10], h11);
+                pin_s11_tensor(cgraph->nodes[i + 15], h11);
+            }
+
+            // S11 Pattern H-Conv: 15-node GDN CPY(ssm_conv1d, F32) + SSM_CONV + SILU + Q/K L2-norm
+            if (i + 14 < cgraph->n_nodes &&
+                cgraph->nodes[i]->op == GGML_OP_CPY &&
+                cgraph->nodes[i]->ne[0] == 4 && cgraph->nodes[i]->ne[1] == 8192 &&
+                cgraph->nodes[i + 1]->op == GGML_OP_SSM_CONV &&
+                cgraph->nodes[i + 1]->src[1] == cgraph->nodes[i] &&
+                cgraph->nodes[i + 2]->op == GGML_OP_UNARY &&
+                cgraph->nodes[i + 4]->op == GGML_OP_CPY &&
+                cgraph->nodes[i + 9]->op == GGML_OP_CPY &&
+                cgraph->nodes[i + 14]->op == GGML_OP_CPY) {
+                ggml_tensor * h11 = cgraph->nodes[i + 14];
+                pin_s11_tensor(cgraph->nodes[i + 1]->src[0], h11);
+                pin_s11_tensor(cgraph->nodes[i]->src[0], h11);
+                pin_s11_tensor(cgraph->nodes[i + 4], h11);
+                pin_s11_tensor(cgraph->nodes[i + 9], h11);
+            }
+
+            // S11 Pattern B-Prologue: 12-node GDN beta + sigmoid + alpha + gate prologue
+            if (i + 11 < cgraph->n_nodes &&
+                cgraph->nodes[i]->op == GGML_OP_MUL_MAT &&
+                cgraph->nodes[i]->src[0] && cgraph->nodes[i]->src[0]->type == GGML_TYPE_BF16 &&
+                cgraph->nodes[i]->src[0]->ne[0] == 2048 && cgraph->nodes[i]->src[0]->ne[1] == 32 &&
+                cgraph->nodes[i + 4]->op == GGML_OP_CPY &&
+                cgraph->nodes[i + 5]->op == GGML_OP_MUL_MAT &&
+                cgraph->nodes[i + 5]->src[1] == cgraph->nodes[i]->src[1] &&
+                cgraph->nodes[i + 11]->op == GGML_OP_RESHAPE) {
+                ggml_tensor * g_res = cgraph->nodes[i + 11];
+                pin_s11_tensor(cgraph->nodes[i]->src[1], g_res);
+                pin_s11_tensor(cgraph->nodes[i + 4], g_res);
+            }
+
+            // S11 Pattern FA-QK-Norm-14: 14-node Full-Attention Qcur + Kcur k=256 head RMSNorms
+            if (i + 13 < cgraph->n_nodes &&
+                cgraph->nodes[i]->op == GGML_OP_VIEW &&
+                cgraph->nodes[i]->ne[0] == 256 && cgraph->nodes[i]->ne[1] == 16 &&
+                cgraph->nodes[i + 1]->op == GGML_OP_RMS_NORM && cgraph->nodes[i + 1]->src[0] == cgraph->nodes[i] &&
+                cgraph->nodes[i + 2]->op == GGML_OP_CPY &&
+                cgraph->nodes[i + 6]->op == GGML_OP_CPY &&
+                cgraph->nodes[i + 7]->op == GGML_OP_RESHAPE &&
+                cgraph->nodes[i + 7]->ne[0] == 256 && cgraph->nodes[i + 7]->ne[1] == 2 &&
+                cgraph->nodes[i + 8]->op == GGML_OP_RMS_NORM && cgraph->nodes[i + 8]->src[0] == cgraph->nodes[i + 7] &&
+                cgraph->nodes[i + 9]->op == GGML_OP_CPY &&
+                cgraph->nodes[i + 13]->op == GGML_OP_CPY) {
+                ggml_tensor * k_normed = cgraph->nodes[i + 13];
+                pin_s11_tensor(cgraph->nodes[i]->src[0], k_normed);
+                pin_s11_tensor(cgraph->nodes[i + 7]->src[0], k_normed);
+                pin_s11_tensor(cgraph->nodes[i + 2]->src[0], k_normed);
+                pin_s11_tensor(cgraph->nodes[i + 9]->src[0], k_normed);
+                pin_s11_tensor(cgraph->nodes[i + 6], k_normed);
+            }
+
+            // S11 Pattern FA-QKV-SetRows-9: 9-node Full-Attention post-RoPE Q/K BF16 round + K/V F16 cache SET_ROWS
+            if (i + 8 < cgraph->n_nodes &&
+                cgraph->nodes[i]->op == GGML_OP_CPY &&
+                cgraph->nodes[i + 1]->op == GGML_OP_CPY && cgraph->nodes[i + 1]->src[0] == cgraph->nodes[i] &&
+                cgraph->nodes[i + 5]->op == GGML_OP_VIEW &&
+                cgraph->nodes[i + 6]->op == GGML_OP_SET_ROWS && cgraph->nodes[i + 6]->src[0] == cgraph->nodes[i + 5] &&
+                cgraph->nodes[i + 7]->op == GGML_OP_VIEW &&
+                cgraph->nodes[i + 8]->op == GGML_OP_SET_ROWS && cgraph->nodes[i + 8]->src[0] == cgraph->nodes[i + 7]) {
+                ggml_tensor * k_c0  = (cgraph->nodes[i + 2]->op == GGML_OP_RESHAPE) ? cgraph->nodes[i + 3] : cgraph->nodes[i + 2];
+                ggml_tensor * k_cur = (cgraph->nodes[i + 2]->op == GGML_OP_RESHAPE) ? cgraph->nodes[i + 4] : cgraph->nodes[i + 3];
+                ggml_tensor * v_res = (cgraph->nodes[i + 2]->op == GGML_OP_RESHAPE) ? cgraph->nodes[i + 2] : cgraph->nodes[i + 4];
+                if (k_c0->op == GGML_OP_CPY && k_cur->op == GGML_OP_CPY && k_cur->src[0] == k_c0 &&
+                    v_res->op == GGML_OP_RESHAPE &&
+                    cgraph->nodes[i + 5]->src[0] == k_cur && cgraph->nodes[i + 7]->src[0] == v_res) {
+                    ggml_tensor * v_set = cgraph->nodes[i + 8];
+                    pin_s11_tensor(cgraph->nodes[i]->src[0], v_set);
+                    pin_s11_tensor(k_c0->src[0], v_set);
+                    pin_s11_tensor(v_res->src[0], v_set);
+                    pin_s11_tensor(cgraph->nodes[i + 6]->src[1], v_set);
+                    pin_s11_tensor(cgraph->nodes[i + 8]->src[1], v_set);
+                    pin_s11_tensor(cgraph->nodes[i + 1], v_set);
+                    pin_s11_tensor(k_cur, v_set);
                 }
             }
 
@@ -5363,6 +5483,142 @@ void ggml_backend_cuda_unregister_host_buffer(void * buffer) {
         // clear the error
         (void)cudaGetLastError();
     }
+}
+
+// page-locks a read-only host range regardless of GGML_CUDA_REGISTER_HOST, used by the MoE cache for its host experts
+// returns true if the range is registered, *already is set if it was registered before this call
+static bool ggml_backend_cuda_pin_host_range(void * ptr, size_t size, int * already) {
+    if (already != nullptr) {
+        *already = 0;
+    }
+#if CUDART_VERSION >= 11010 && !defined(GGML_USE_MUSA) && !defined(GGML_USE_HIP)
+    int device = 0;
+    if (cudaGetDevice(&device) != cudaSuccess) {
+        (void)cudaGetLastError();
+        return false;
+    }
+    int read_only_supported = 0;
+    if (cudaDeviceGetAttribute(&read_only_supported, cudaDevAttrHostRegisterReadOnlySupported, device) != cudaSuccess || read_only_supported == 0) {
+        (void)cudaGetLastError();
+        GGML_LOG_WARN("%s: read-only host registration is not supported by device %d\n", __func__, device);
+        return false;
+    }
+    const cudaError_t err = cudaHostRegister(ptr, size, cudaHostRegisterPortable | cudaHostRegisterReadOnly);
+    if (err == cudaErrorHostMemoryAlreadyRegistered) {
+        (void)cudaGetLastError();
+        if (already != nullptr) {
+            *already = 1;
+        }
+        return true;
+    }
+    if (err != cudaSuccess) {
+        (void)cudaGetLastError();
+        GGML_LOG_WARN("%s: failed to register %.2f MiB of host memory: %s\n", __func__,
+                      size / 1024.0 / 1024.0, cudaGetErrorString(err));
+        return false;
+    }
+    return true;
+#else
+    GGML_UNUSED(ptr);
+    GGML_UNUSED(size);
+    return false;
+#endif
+}
+
+static void ggml_backend_cuda_unpin_host_range(void * ptr) {
+#if CUDART_VERSION >= 11010 && !defined(GGML_USE_MUSA) && !defined(GGML_USE_HIP)
+    // no copy may still read the range when it is unregistered
+    if (cudaDeviceSynchronize() != cudaSuccess) {
+        (void)cudaGetLastError();
+    }
+    if (cudaHostUnregister(ptr) != cudaSuccess) {
+        (void)cudaGetLastError();
+    }
+#else
+    GGML_UNUSED(ptr);
+#endif
+}
+
+static bool ggml_backend_cuda_is_host_registered(const void * ptr) {
+#if CUDART_VERSION >= 11010 && !defined(GGML_USE_MUSA) && !defined(GGML_USE_HIP)
+    cudaPointerAttributes attr = {};
+    if (cudaPointerGetAttributes(&attr, ptr) != cudaSuccess) {
+        (void)cudaGetLastError();
+        return false;
+    }
+    return attr.type == cudaMemoryTypeHost;
+#else
+    GGML_UNUSED(ptr);
+    return false;
+#endif
+}
+
+// MoE cache expert prefetch: a non-blocking copy stream on the device of a CUDA backend, ordered with its compute stream by events
+struct ggml_backend_cuda_h2d_stream {
+    int          device;
+    cudaStream_t stream;
+};
+
+static void * ggml_backend_cuda_h2d_stream_new(ggml_backend_t backend) {
+    if (backend == nullptr || !ggml_backend_is_cuda(backend)) {
+        return nullptr;
+    }
+    ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
+    ggml_cuda_set_device(cuda_ctx->device);
+    cudaStream_t stream = nullptr;
+    if (cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking) != cudaSuccess) {
+        (void)cudaGetLastError();
+        return nullptr;
+    }
+    return new ggml_backend_cuda_h2d_stream { cuda_ctx->device, stream };
+}
+
+static void ggml_backend_cuda_h2d_stream_free(void * h2d) {
+    auto * s = (ggml_backend_cuda_h2d_stream *) h2d;
+    if (s == nullptr) {
+        return;
+    }
+    ggml_cuda_set_device(s->device);
+    if (cudaStreamSynchronize(s->stream) != cudaSuccess) {
+        (void)cudaGetLastError();
+    }
+    if (cudaStreamDestroy(s->stream) != cudaSuccess) {
+        (void)cudaGetLastError();
+    }
+    delete s;
+}
+
+static void ggml_backend_cuda_h2d_memcpy(void * h2d, void * dst, const void * src, size_t size) {
+    auto * s = (ggml_backend_cuda_h2d_stream *) h2d;
+    ggml_cuda_set_device(s->device);
+    CUDA_CHECK(cudaMemcpyAsync(dst, src, size, cudaMemcpyHostToDevice, s->stream));
+}
+
+static void ggml_backend_cuda_h2d_record(void * h2d, ggml_backend_event_t event) {
+    auto * s = (ggml_backend_cuda_h2d_stream *) h2d;
+    CUDA_CHECK(cudaEventRecord((cudaEvent_t) event->context, s->stream));
+}
+
+static void ggml_backend_cuda_h2d_wait(void * h2d, ggml_backend_event_t event) {
+    auto * s = (ggml_backend_cuda_h2d_stream *) h2d;
+    CUDA_CHECK(cudaStreamWaitEvent(s->stream, (cudaEvent_t) event->context, 0));
+}
+
+static void ggml_backend_cuda_h2d_sync(void * h2d) {
+    auto * s = (ggml_backend_cuda_h2d_stream *) h2d;
+    CUDA_CHECK(cudaStreamSynchronize(s->stream));
+}
+
+static bool ggml_backend_cuda_stream_is_capturing(ggml_backend_t backend) {
+#if !defined(GGML_USE_MUSA) && !defined(GGML_USE_HIP)
+    ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
+    cudaStreamCaptureStatus status = cudaStreamCaptureStatusNone;
+    CUDA_CHECK(cudaStreamIsCapturing(cuda_ctx->stream(), &status));
+    return status != cudaStreamCaptureStatusNone;
+#else
+    GGML_UNUSED(backend);
+    return false;
+#endif
 }
 
 
@@ -6218,6 +6474,36 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     }
     if (strcmp(name, "ggml_backend_unregister_host_buffer") == 0) {
         return (void *)ggml_backend_cuda_unregister_host_buffer;
+    }
+    if (strcmp(name, "ggml_backend_cuda_pin_host_range") == 0) {
+        return (void *)ggml_backend_cuda_pin_host_range;
+    }
+    if (strcmp(name, "ggml_backend_cuda_unpin_host_range") == 0) {
+        return (void *)ggml_backend_cuda_unpin_host_range;
+    }
+    if (strcmp(name, "ggml_backend_cuda_is_host_registered") == 0) {
+        return (void *)ggml_backend_cuda_is_host_registered;
+    }
+    if (strcmp(name, "ggml_backend_cuda_h2d_stream_new") == 0) {
+        return (void *)ggml_backend_cuda_h2d_stream_new;
+    }
+    if (strcmp(name, "ggml_backend_cuda_h2d_stream_free") == 0) {
+        return (void *)ggml_backend_cuda_h2d_stream_free;
+    }
+    if (strcmp(name, "ggml_backend_cuda_h2d_memcpy") == 0) {
+        return (void *)ggml_backend_cuda_h2d_memcpy;
+    }
+    if (strcmp(name, "ggml_backend_cuda_h2d_record") == 0) {
+        return (void *)ggml_backend_cuda_h2d_record;
+    }
+    if (strcmp(name, "ggml_backend_cuda_h2d_wait") == 0) {
+        return (void *)ggml_backend_cuda_h2d_wait;
+    }
+    if (strcmp(name, "ggml_backend_cuda_h2d_sync") == 0) {
+        return (void *)ggml_backend_cuda_h2d_sync;
+    }
+    if (strcmp(name, "ggml_backend_cuda_stream_is_capturing") == 0) {
+        return (void *)ggml_backend_cuda_stream_is_capturing;
     }
     if (strcmp(name, "ggml_backend_get_features") == 0) {
         return (void *)ggml_backend_cuda_get_features;

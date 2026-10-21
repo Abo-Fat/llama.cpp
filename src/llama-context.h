@@ -120,6 +120,11 @@ struct llama_context {
 
     void set_embeddings (bool value);
     void set_embeddings_nextn(bool value, bool masked);
+
+    // fused MTP-in-verify (QWEN35MOE): the target graph also runs the nextn block and returns one draft per output row
+    bool        mtp_fused_supported() const;
+    bool        set_mtp_fused(bool value);
+    llama_token get_mtp_draft_ith(int32_t idx);
     void set_embeddings_layer_inp(uint32_t lid, bool enable);
     void set_nextn_layer_offset(int32_t offset);
     void set_causal_attn(bool value);
@@ -316,6 +321,11 @@ private:
     // sets llm_graph_result::t_h_nextn
     buffer_view<float> embd_nextn = {nullptr, 0};
 
+    // fused MTP draft of each output row ([n_outputs]), populated only when mtp_fused is set
+    buffer_view<llama_token> mtp_draft = {nullptr, 0};
+
+    bool mtp_fused = false;
+
     // host buffers for output layer input embeddings, per layer
     // populated when cparams.output_layer_inp[il] is true
     std::vector<buffer_view<float>> embd_layer_inp;
@@ -397,8 +407,8 @@ private:
     std::vector<ggml_backend_buffer_type_t> backend_buft;
     std::vector<size_t>                     backend_buf_exp_size; // expected buffer sizes
 
-    // Separate arenas give prefill/decode and batches with/without outputs distinct CUDA graph cache keys.
-    std::array<llm_graph_result_ptr, 4> gf_res_prev;
+    // Separate arenas give prefill/decode/verify and batches with/without outputs distinct CUDA graph cache keys.
+    std::array<llm_graph_result_ptr, 16> gf_res_prev;
     llm_graph_result_ptr gf_res_reserve;
 
     llm_graph_result * gf_res_prev_active = nullptr;
@@ -428,3 +438,8 @@ private:
 
     mutable int32_t n_reused = 0; // number of times the previous graph was reused
 };
+
+// staging API of the fused MTP-in-verify path, also declared by common/speculative.cpp
+LLAMA_API bool        llama_set_mtp_fused      (struct llama_context * ctx, bool value);
+LLAMA_API bool        llama_mtp_fused_supported(const struct llama_context * ctx);
+LLAMA_API llama_token llama_get_mtp_draft_ith  (struct llama_context * ctx, int32_t i);

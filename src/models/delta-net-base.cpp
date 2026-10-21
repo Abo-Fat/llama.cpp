@@ -476,7 +476,7 @@ ggml_tensor * llm_build_delta_net_base::build_conv_state(
 
     const size_t row_size  = ggml_row_size(conv_states_all->type, row_count);
 
-    if (cparams.n_rs_seq == 0) {
+    if (cparams.n_rs_seq == 0 || qkv_mixed->ne[0] <= 1 || qkv_mixed->ne[0] > (int64_t) cparams.n_rs_seq + 1) {
         const int64_t s_idx  = conv_input->ne[0] - conv_states->ne[0];
         const int64_t s_slot = 0;
 
@@ -499,7 +499,7 @@ ggml_tensor * llm_build_delta_net_base::build_conv_state(
         // this logic assumes that the last (n_rs_seq + 1) tokens of a sequence in a batch are inside
         //   the same ubatch, which `split_equal()` guarantees via its n_keep_tail argument
 
-        const int64_t K = (int64_t) cparams.n_rs_seq + 1;
+        const int64_t K = std::min<int64_t>(qkv_mixed->ne[0], (int64_t) cparams.n_rs_seq + 1);
 
         for (int64_t t = 1; t <= K; ++t) {
             const int64_t s_idx  = std::max<int64_t>(0, conv_input->ne[0] - conv_states->ne[0] - K + t);
@@ -524,6 +524,24 @@ ggml_tensor * llm_build_delta_net_base::build_conv_state(
     return conv_input;
 }
 
+// base+tip recurrent rollback (S11_RS_REPLAY): the gated delta net reads the replay control, the input ring and the
+// SSM cache from extra sources; the values match GDN_RS_MODE_* in ggml-cuda/gated_delta_net.cu
+static constexpr int LLM_GDN_RS_MODE_OP_PARAM  = 15;
+static constexpr int LLM_GDN_RS_MODE_REPLAY    = 1;
+static constexpr int LLM_GDN_RS_MODE_KEEP_RING = 2;
+
+static void rs_replay_attach(ggml_tensor * gdn, ggml_tensor * ctl, ggml_tensor * ring, ggml_tensor * states, int32_t mode) {
+    GGML_ASSERT(gdn != nullptr && gdn->op == GGML_OP_GATED_DELTA_NET);
+    GGML_ASSERT(ctl != nullptr && ring != nullptr && states != nullptr);
+    GGML_ASSERT(gdn->src[6] == nullptr && gdn->src[7] == nullptr && gdn->src[8] == nullptr);
+
+    gdn->src[6] = ctl;
+    gdn->src[7] = ring;
+    gdn->src[8] = states;
+
+    gdn->op_params[LLM_GDN_RS_MODE_OP_PARAM] = mode;
+}
+
 ggml_tensor * llm_build_delta_net_base::build_recurrent_attn(
         llm_graph_input_rs * inp,
         ggml_tensor *        ssm_states_all,
@@ -543,12 +561,24 @@ ggml_tensor * llm_build_delta_net_base::build_recurrent_attn(
     const int64_t n_seqs       = s->ne[3];
     const int64_t n_seq_tokens = q->ne[2];
 
-    const bool keep = cparams.n_rs_seq > 0;
+    const bool keep = cparams.n_rs_seq > 0 && n_seq_tokens > 1 && n_seq_tokens <= (int64_t) cparams.n_rs_seq + 1;
+
+    // base+tip recurrent rollback: s is a view of the cache and the kernel loads the selected state row itself
+    const bool rs_ring = inp->rs_ctl != nullptr;
+    if (rs_ring) {
+        GGML_ASSERT(cparams.fused_gdn_ar && cparams.fused_gdn_ch);
+        GGML_ASSERT(n_seqs == 1);
+    }
 
     if (!keep) {
         auto attn_out = build_delta_net(q, k, v, g, b, s, il);
         ggml_tensor * output    = attn_out.first;
         ggml_tensor * new_state = attn_out.second;
+        if (rs_ring) {
+            // the final state still reaches group 0 through the fused cache write below
+            rs_replay_attach(output->view_src, inp->rs_ctl, mctx_cur->get_ring_l(il), ssm_states_all,
+                    LLM_GDN_RS_MODE_REPLAY);
+        }
         cb(output, "attn_output", il);
         cb(new_state, "new_state", il);
 
@@ -556,6 +586,25 @@ ggml_tensor * llm_build_delta_net_base::build_recurrent_attn(
                 ggml_cpy(ctx0, new_state,
                     ggml_view_2d(ctx0, ssm_states_all, hparams.n_embd_s(), n_seqs, ssm_states_all->nb[1],
                         kv_head * hparams.n_embd_s() * ggml_element_size(ssm_states_all))));
+
+        return output;
+    }
+
+    if (rs_ring) {
+        // keep ubatch: the kernel writes the tip (and a replayed base) to the cache and its rows to the ring,
+        // so no snapshot leaves the kernel
+        ggml_tensor * gdn_out = ggml_gated_delta_net(ctx0, q, k, v, g, b, s, 1);
+        res->add_fused_node({LLM_FUSED_OP_GDN_CH, gdn_out, il});
+        rs_replay_attach(gdn_out, inp->rs_ctl, mctx_cur->get_ring_l(il), ssm_states_all,
+                LLM_GDN_RS_MODE_REPLAY | LLM_GDN_RS_MODE_KEEP_RING);
+
+        ggml_tensor * output = ggml_view_4d(ctx0, gdn_out,
+            S_v, H_v, n_seq_tokens, n_seqs,
+            ggml_row_size(gdn_out->type, S_v),
+            ggml_row_size(gdn_out->type, S_v * H_v),
+            ggml_row_size(gdn_out->type, S_v * H_v * n_seq_tokens),
+            0);
+        cb(output, "attn_output", il);
 
         return output;
     }

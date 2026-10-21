@@ -1,6 +1,7 @@
 #include "s11.cuh"
 #include <cuda_bf16.h>
 #include <mma.h>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 
@@ -349,22 +350,66 @@ static __global__ void s11_projection_packed(
     }
 }
 
+static __device__ __forceinline__ void s11_quantize_k128_warp_to_sh(
+        const float * __restrict__ src_group,
+        signed char * __restrict__ q_dst,
+        float * __restrict__ s_dst,
+        int lane) {
+    float values[4];
+    float maximum = 1e-5f;
+    #pragma unroll
+    for (int i = 0; i < 4; ++i) {
+        values[i] = s11_bf16(src_group[lane + 32 * i]);
+        maximum = fmaxf(maximum, fabsf(values[i]));
+    }
+    for (int offset = 16; offset > 0; offset /= 2) {
+        maximum = fmaxf(maximum, __shfl_xor_sync(0xffffffff, maximum, offset));
+    }
+    const float inverse = __fmul_rn(__fdiv_rn(1.0f, maximum), 127.0f);
+    if (lane == 0) {
+        *s_dst = __fdiv_rn(1.0f, inverse);
+    }
+    #pragma unroll
+    for (int i = 0; i < 4; ++i) {
+        const int quant = max(-128, min(127, __float2int_rn(__fmul_rn(values[i], inverse))));
+        q_dst[lane + 32 * i] = static_cast<signed char>(quant);
+    }
+}
+
 template<int TYPE>
 static __global__ void __launch_bounds__(256) s11_projection_packed_m1(
         const char * __restrict__ weights, const signed char * __restrict__ q,
         const float * __restrict__ activation_scales, char * __restrict__ output,
-        int k, int n, size_t weight_row) {
+        int k, int n, size_t weight_row, const float * __restrict__ x_f32 = nullptr) {
     __shared__ __align__(16) signed char q_sh[4096];
     __shared__ float scales_sh[32];
     const int t = threadIdx.x;
     const int num_groups = k / 128;
-    if (t < num_groups) {
-        scales_sh[t] = activation_scales[t];
-    }
-    const int4 * q4_in = reinterpret_cast<const int4 *>(q);
-    int4 * q4_sh = reinterpret_cast<int4 *>(q_sh);
-    for (int idx = t; idx < k / 16; idx += 256) {
-        q4_sh[idx] = q4_in[idx];
+    if constexpr (TYPE == GGML_TYPE_S11_W2_BF16) {
+        if (x_f32 != nullptr && k == 512) {
+            const int w = t / 32;
+            if (w < 4) {
+                s11_quantize_k128_warp_to_sh(x_f32 + w * 128, q_sh + w * 128, &scales_sh[w], t % 32);
+            }
+        } else {
+            if (t < num_groups) {
+                scales_sh[t] = activation_scales[t];
+            }
+            const int4 * q4_in = reinterpret_cast<const int4 *>(q);
+            int4 * q4_sh = reinterpret_cast<int4 *>(q_sh);
+            for (int idx = t; idx < k / 16; idx += 256) {
+                q4_sh[idx] = q4_in[idx];
+            }
+        }
+    } else {
+        if (t < num_groups) {
+            scales_sh[t] = activation_scales[t];
+        }
+        const int4 * q4_in = reinterpret_cast<const int4 *>(q);
+        int4 * q4_sh = reinterpret_cast<int4 *>(q_sh);
+        for (int idx = t; idx < k / 16; idx += 256) {
+            q4_sh[idx] = q4_in[idx];
+        }
     }
     __syncthreads();
 
@@ -420,6 +465,141 @@ static __global__ void __launch_bounds__(256) s11_projection_packed_m1(
     }
     if (!lane) {
         *reinterpret_cast<float *>(output + size_t(row) * sizeof(float)) = s11_bf16(sum);
+    }
+}
+
+template<int TYPE, int COLS>
+static __global__ void __launch_bounds__(256) s11_projection_packed_multi(
+        const char * __restrict__ weights, const signed char * __restrict__ q,
+        const float * __restrict__ activation_scales, char * __restrict__ output,
+        int k, int n, int tokens, size_t weight_row, size_t output_token,
+        const float * __restrict__ x_f32 = nullptr, size_t x_token_stride = 0) {
+    constexpr int MAX_K = (TYPE == GGML_TYPE_S11_W2_BF16) ? 2048 : 4096;
+    constexpr int MAX_G = MAX_K / 128;
+    __shared__ __align__(16) signed char q_sh[COLS][MAX_K];
+    __shared__ float scales_sh[COLS][MAX_G];
+    const int t = threadIdx.x;
+    const int first = int(blockIdx.y) * COLS;
+    const int num_groups = k / 128;
+
+    if constexpr (TYPE == GGML_TYPE_S11_W2_BF16) {
+        if (x_f32 != nullptr && k == 512) {
+            const int w = t / 32;
+            const int lane = t % 32;
+            #pragma unroll
+            for (int idx = w; idx < COLS * 4; idx += 8) {
+                const int c = idx / 4;
+                const int g = idx % 4;
+                const int tok = first + c;
+                if (tok < tokens) {
+                    const float * x_tok = reinterpret_cast<const float *>(
+                        reinterpret_cast<const char *>(x_f32) + size_t(tok) * x_token_stride);
+                    s11_quantize_k128_warp_to_sh(x_tok + g * 128, &q_sh[c][g * 128], &scales_sh[c][g], lane);
+                } else {
+                    if (lane == 0) scales_sh[c][g] = 0.0f;
+                    #pragma unroll
+                    for (int i = 0; i < 4; ++i) q_sh[c][g * 128 + lane + 32 * i] = 0;
+                }
+            }
+        } else {
+            #pragma unroll
+            for (int c = 0; c < COLS; ++c) {
+                const int tok = first + c;
+                int4 * q4_sh = reinterpret_cast<int4 *>(q_sh[c]);
+                if (tok < tokens) {
+                    if (t < num_groups) scales_sh[c][t] = activation_scales[size_t(tok) * num_groups + t];
+                    const int4 * q4_in = reinterpret_cast<const int4 *>(q + size_t(tok) * k);
+                    for (int idx = t; idx < k / 16; idx += 256) q4_sh[idx] = q4_in[idx];
+                } else {
+                    if (t < num_groups) scales_sh[c][t] = 0.0f;
+                    for (int idx = t; idx < k / 16; idx += 256) q4_sh[idx] = make_int4(0, 0, 0, 0);
+                }
+            }
+        }
+    } else {
+        #pragma unroll
+        for (int c = 0; c < COLS; ++c) {
+            const int tok = first + c;
+            int4 * q4_sh = reinterpret_cast<int4 *>(q_sh[c]);
+            if (tok < tokens) {
+                if (t < num_groups) scales_sh[c][t] = activation_scales[size_t(tok) * num_groups + t];
+                const int4 * q4_in = reinterpret_cast<const int4 *>(q + size_t(tok) * k);
+                for (int idx = t; idx < k / 16; idx += 256) q4_sh[idx] = q4_in[idx];
+            } else {
+                if (t < num_groups) scales_sh[c][t] = 0.0f;
+                for (int idx = t; idx < k / 16; idx += 256) q4_sh[idx] = make_int4(0, 0, 0, 0);
+            }
+        }
+    }
+    __syncthreads();
+
+    const int lane = t % 32;
+    const int row = blockIdx.x * 8 + t / 32;
+    if (row >= n) {
+        return;
+    }
+    constexpr int bytes = TYPE <= GGML_TYPE_S11_W2_BF16 ? 36 : 68;
+    const char * weight = weights + size_t(row) * weight_row;
+    float sums[COLS] = {};
+    const int quarter = lane / 8;
+    const int sub = lane % 8;
+    const int num_g4 = k / 512;
+    if constexpr (TYPE <= GGML_TYPE_S11_W2_BF16) {
+        for (int g4 = 0; g4 < num_g4; ++g4) {
+            const int group = g4 * 4 + quarter;
+            const auto * block = reinterpret_cast<const unsigned char *>(weight + group * bytes);
+            const float scale = s11_scale(block, TYPE);
+            const uint32_t w32 = *reinterpret_cast<const uint32_t *>(block + sub * 4);
+            const int p0 = s11_unpack4_w2_byte(w32 & 0xffu);
+            const int p1 = s11_unpack4_w2_byte((w32 >> 8) & 0xffu);
+            const int p2 = s11_unpack4_w2_byte((w32 >> 16) & 0xffu);
+            const int p3 = s11_unpack4_w2_byte(w32 >> 24);
+            #pragma unroll
+            for (int c = 0; c < COLS; ++c) {
+                const int4 act4 = *reinterpret_cast<const int4 *>(&q_sh[c][group * 128 + sub * 16]);
+                int dot = __dp4a(p0, act4.x, 0);
+                dot = __dp4a(p1, act4.y, dot);
+                dot = __dp4a(p2, act4.z, dot);
+                dot = __dp4a(p3, act4.w, dot);
+                sums[c] = __fadd_rn(sums[c], __fmul_rn(float(dot), __fmul_rn(scales_sh[c][group], scale)));
+            }
+        }
+    } else {
+        for (int g4 = 0; g4 < num_g4; ++g4) {
+            const int group = g4 * 4 + quarter;
+            const auto * block = reinterpret_cast<const unsigned char *>(weight + group * bytes);
+            const float scale = s11_scale(block, TYPE);
+            const uint32_t w_lo = *reinterpret_cast<const uint32_t *>(block + sub * 8);
+            const uint32_t w_hi = *reinterpret_cast<const uint32_t *>(block + sub * 8 + 4);
+            const int p0 = s11_unpack4_w4_u16(w_lo & 0xffffu);
+            const int p1 = s11_unpack4_w4_u16(w_lo >> 16);
+            const int p2 = s11_unpack4_w4_u16(w_hi & 0xffffu);
+            const int p3 = s11_unpack4_w4_u16(w_hi >> 16);
+            #pragma unroll
+            for (int c = 0; c < COLS; ++c) {
+                const int4 act4 = *reinterpret_cast<const int4 *>(&q_sh[c][group * 128 + sub * 16]);
+                int dot = __dp4a(p0, act4.x, 0);
+                dot = __dp4a(p1, act4.y, dot);
+                dot = __dp4a(p2, act4.z, dot);
+                dot = __dp4a(p3, act4.w, dot);
+                sums[c] = __fadd_rn(sums[c], __fmul_rn(float(dot), __fmul_rn(scales_sh[c][group], scale)));
+            }
+        }
+    }
+    for (int offset = 16; offset > 0; offset /= 2) {
+        #pragma unroll
+        for (int c = 0; c < COLS; ++c) {
+            sums[c] = __fadd_rn(sums[c], __shfl_down_sync(0xffffffff, sums[c], offset));
+        }
+    }
+    if (!lane) {
+        #pragma unroll
+        for (int c = 0; c < COLS; ++c) {
+            const int tok = first + c;
+            if (tok < tokens) {
+                *reinterpret_cast<float *>(output + size_t(tok) * output_token + size_t(row) * sizeof(float)) = s11_bf16(sums[c]);
+            }
+        }
     }
 }
 
@@ -496,30 +676,48 @@ static __global__ void __launch_bounds__(256) s11_w4_multi_projection_packed_m1(
 }
 
 template <int COLS>
-static __global__ void __launch_bounds__(128) s11_w4_multi_projection_packed(
+static __global__ void __launch_bounds__(256) s11_w4_multi_projection_packed(
         const char * __restrict__ w0, const char * __restrict__ w1, const char * __restrict__ w2,
         char * __restrict__ out0, char * __restrict__ out1, char * __restrict__ out2,
         const signed char * __restrict__ q, const float * __restrict__ activation_scales,
         int n0, int n1, int n2, int tokens,
         size_t wr0, size_t wr1, size_t wr2,
         size_t ot0, size_t ot1, size_t ot2) {
-    const int lane = threadIdx.x % 32;
+    __shared__ __align__(16) signed char q_sh[COLS][2048];
+    __shared__ float scales_sh[COLS][16];
+    const int t = threadIdx.x;
+    const int first = blockIdx.y * COLS;
+    #pragma unroll
+    for (int c = 0; c < COLS; ++c) {
+        const int tok = first + c;
+        int4 * q4_sh = reinterpret_cast<int4 *>(q_sh[c]);
+        if (tok < tokens) {
+            if (t < 16) scales_sh[c][t] = activation_scales[size_t(tok) * 16 + t];
+            const int4 * q4_in = reinterpret_cast<const int4 *>(q + size_t(tok) * 2048);
+            if (t < 128) q4_sh[t] = q4_in[t];
+        } else {
+            if (t < 16) scales_sh[c][t] = 0.0f;
+            if (t < 128) q4_sh[t] = make_int4(0, 0, 0, 0);
+        }
+    }
+    __syncthreads();
+
+    const int lane = t % 32;
     const int b = blockIdx.x;
-    const int b0 = n0 / 4;
-    const int b1 = n1 / 4;
+    const int b0 = n0 / 8;
+    const int b1 = n1 / 8;
     const char * weights = nullptr;
     char * output = nullptr;
     int row = 0;
     size_t weight_row = 0;
     size_t output_token = 0;
     if (b < b0) {
-        weights = w0; output = out0; row = b * 4 + threadIdx.x / 32; weight_row = wr0; output_token = ot0;
+        weights = w0; output = out0; row = b * 8 + t / 32; weight_row = wr0; output_token = ot0;
     } else if (b < b0 + b1) {
-        weights = w1; output = out1; row = (b - b0) * 4 + threadIdx.x / 32; weight_row = wr1; output_token = ot1;
+        weights = w1; output = out1; row = (b - b0) * 8 + t / 32; weight_row = wr1; output_token = ot1;
     } else {
-        weights = w2; output = out2; row = (b - b0 - b1) * 4 + threadIdx.x / 32; weight_row = wr2; output_token = ot2;
+        weights = w2; output = out2; row = (b - b0 - b1) * 8 + t / 32; weight_row = wr2; output_token = ot2;
     }
-    const int first = blockIdx.y * COLS;
     const char * weight = weights + size_t(row) * weight_row;
     float sums[COLS] = {};
     const int quarter = lane / 8;
@@ -537,16 +735,12 @@ static __global__ void __launch_bounds__(128) s11_w4_multi_projection_packed(
         const int p3 = s11_unpack4_w4_u16(w_hi >> 16);
         #pragma unroll
         for (int c = 0; c < COLS; ++c) {
-            const int token = first + c;
-            if (token < tokens) {
-                const int4 act4 = *reinterpret_cast<const int4 *>(q + size_t(token) * 2048 + group * 128 + sub * 16);
-                int dot = __dp4a(p0, act4.x, 0);
-                dot = __dp4a(p1, act4.y, dot);
-                dot = __dp4a(p2, act4.z, dot);
-                dot = __dp4a(p3, act4.w, dot);
-                const float act_s = activation_scales[size_t(token) * 16 + group];
-                sums[c] = __fadd_rn(sums[c], __fmul_rn(float(dot), __fmul_rn(act_s, scale)));
-            }
+            const int4 act4 = *reinterpret_cast<const int4 *>(&q_sh[c][group * 128 + sub * 16]);
+            int dot = __dp4a(p0, act4.x, 0);
+            dot = __dp4a(p1, act4.y, dot);
+            dot = __dp4a(p2, act4.z, dot);
+            dot = __dp4a(p3, act4.w, dot);
+            sums[c] = __fadd_rn(sums[c], __fmul_rn(float(dot), __fmul_rn(scales_sh[c][group], scale)));
         }
     }
     for (int offset = 16; offset > 0; offset /= 2) {
@@ -567,7 +761,7 @@ static __global__ void __launch_bounds__(128) s11_w4_multi_projection_packed(
 }
 
 template <int M_TILES = 1>
-static __global__ void __launch_bounds__(128) s11_w4_multi_wmma_k128_kernel(
+static __global__ void __launch_bounds__(128, 2) s11_w4_multi_wmma_k128_kernel(
         const char * __restrict__ w0, const char * __restrict__ w1, const char * __restrict__ w2,
         char * __restrict__ out0, char * __restrict__ out1, char * __restrict__ out2,
         const signed char * __restrict__ q, const float * __restrict__ activation_scales,
@@ -620,26 +814,32 @@ static __global__ void __launch_bounds__(128) s11_w4_multi_wmma_k128_kernel(
                 ? s11_scale(reinterpret_cast<const unsigned char *>(weights + size_t(r) * weight_row + group * bytes), GGML_TYPE_S11_W4)
                 : 0.0f;
         }
+        const int sub = t % 8;
+        const int row_sub = t / 8;
         #pragma unroll
-        for (int idx = t; idx < 16 * M_TILES * 32; idx += 128) {
-            const int tok_local = idx / 32;
-            const int col4 = idx % 32;
+        for (int tok_base = 0; tok_base < 16 * M_TILES; tok_base += 16) {
+            const int tok_local = tok_base + row_sub;
             const int tok = first_token + tok_local;
-            *reinterpret_cast<int *>(&a_sh[tok_local * kStride + col4 * 4]) = (tok < tokens)
-                ? *reinterpret_cast<const int *>(q + size_t(tok) * 2048 + group * 128 + col4 * 4)
-                : 0;
+            *reinterpret_cast<int4 *>(&a_sh[tok_local * kStride + sub * 16]) = (tok < tokens)
+                ? *reinterpret_cast<const int4 *>(q + size_t(tok) * 2048 + group * 128 + sub * 16)
+                : make_int4(0, 0, 0, 0);
         }
         #pragma unroll
-        for (int idx = t; idx < 64 * 32; idx += 128) {
-            const int r_local = idx / 32;
-            const int col4 = idx % 32;
+        for (int r_base = 0; r_base < 64; r_base += 16) {
+            const int r_local = r_base + row_sub;
             const int r = first_row + r_local;
-            int packed = 0;
+            int4 packed4 = make_int4(0, 0, 0, 0);
             if (r < n) {
                 const auto * block = reinterpret_cast<const unsigned char *>(weights + size_t(r) * weight_row + group * bytes);
-                packed = s11_unpack4_w4(block, col4);
+                const uint32_t w_lo = *reinterpret_cast<const uint32_t *>(block + sub * 8);
+                const uint32_t w_hi = *reinterpret_cast<const uint32_t *>(block + sub * 8 + 4);
+                packed4 = make_int4(
+                    s11_unpack4_w4_u16(w_lo & 0xffffu),
+                    s11_unpack4_w4_u16(w_lo >> 16),
+                    s11_unpack4_w4_u16(w_hi & 0xffffu),
+                    s11_unpack4_w4_u16(w_hi >> 16));
             }
-            *reinterpret_cast<int *>(&b_sh[r_local * kStride + col4 * 4]) = packed;
+            *reinterpret_cast<int4 *>(&b_sh[r_local * kStride + sub * 16]) = packed4;
         }
         __syncthreads();
 
@@ -694,7 +894,7 @@ static __global__ void __launch_bounds__(128) s11_w4_multi_wmma_k128_kernel(
 }
 
 template <int TYPE, int M_TILES = 1>
-static __global__ void __launch_bounds__(128) s11_wmma_k128_kernel(
+static __global__ void __launch_bounds__(128, 2) s11_wmma_k128_kernel(
         const char * __restrict__ weights, const signed char * __restrict__ q,
         const float * __restrict__ activation_scales, char * __restrict__ output,
         int k, int n, int tokens, size_t weight_row, size_t output_token) {
@@ -729,28 +929,41 @@ static __global__ void __launch_bounds__(128) s11_wmma_k128_kernel(
                 ? s11_scale(reinterpret_cast<const unsigned char *>(weights + size_t(r) * weight_row + group * bytes), TYPE)
                 : 0.0f;
         }
+        const int sub = t % 8;
+        const int row_sub = t / 8;
         #pragma unroll
-        for (int idx = t; idx < 16 * M_TILES * 32; idx += 128) {
-            const int tok_local = idx / 32;
-            const int col4 = idx % 32;
+        for (int tok_base = 0; tok_base < 16 * M_TILES; tok_base += 16) {
+            const int tok_local = tok_base + row_sub;
             const int tok = first_token + tok_local;
-            *reinterpret_cast<int *>(&a_sh[tok_local * kStride + col4 * 4]) = (tok < tokens)
-                ? *reinterpret_cast<const int *>(q + size_t(tok) * k + group * 128 + col4 * 4)
-                : 0;
+            *reinterpret_cast<int4 *>(&a_sh[tok_local * kStride + sub * 16]) = (tok < tokens)
+                ? *reinterpret_cast<const int4 *>(q + size_t(tok) * k + group * 128 + sub * 16)
+                : make_int4(0, 0, 0, 0);
         }
         #pragma unroll
-        for (int idx = t; idx < 64 * 32; idx += 128) {
-            const int r_local = idx / 32;
-            const int col4 = idx % 32;
+        for (int r_base = 0; r_base < 64; r_base += 16) {
+            const int r_local = r_base + row_sub;
             const int r = first_row + r_local;
-            int packed = 0;
+            int4 packed4 = make_int4(0, 0, 0, 0);
             if (r < n) {
                 const auto * block = reinterpret_cast<const unsigned char *>(weights + size_t(r) * weight_row + group * bytes);
-                packed = (TYPE <= GGML_TYPE_S11_W2_BF16)
-                    ? s11_unpack4_w2(block, col4)
-                    : s11_unpack4_w4(block, col4);
+                if constexpr (TYPE <= GGML_TYPE_S11_W2_BF16) {
+                    const uint32_t w32 = *reinterpret_cast<const uint32_t *>(block + sub * 4);
+                    packed4 = make_int4(
+                        s11_unpack4_w2_byte(w32 & 0xffu),
+                        s11_unpack4_w2_byte((w32 >> 8) & 0xffu),
+                        s11_unpack4_w2_byte((w32 >> 16) & 0xffu),
+                        s11_unpack4_w2_byte(w32 >> 24));
+                } else {
+                    const uint32_t w_lo = *reinterpret_cast<const uint32_t *>(block + sub * 8);
+                    const uint32_t w_hi = *reinterpret_cast<const uint32_t *>(block + sub * 8 + 4);
+                    packed4 = make_int4(
+                        s11_unpack4_w4_u16(w_lo & 0xffffu),
+                        s11_unpack4_w4_u16(w_lo >> 16),
+                        s11_unpack4_w4_u16(w_hi & 0xffffu),
+                        s11_unpack4_w4_u16(w_hi >> 16));
+                }
             }
-            *reinterpret_cast<int *>(&b_sh[r_local * kStride + col4 * 4]) = packed;
+            *reinterpret_cast<int4 *>(&b_sh[r_local * kStride + sub * 16]) = packed4;
         }
         __syncthreads();
 
@@ -804,6 +1017,7 @@ static __global__ void __launch_bounds__(128) s11_wmma_k128_kernel(
 #endif
 }
 
+template <int M_TILES = 1>
 static __global__ void __launch_bounds__(128) s11_shexp_up_gate_swiglu_wmma_k128_kernel(
         const char * __restrict__ up_weights, const char * __restrict__ gate_weights,
         const signed char * __restrict__ q, const float * __restrict__ activation_scales,
@@ -815,35 +1029,36 @@ static __global__ void __launch_bounds__(128) s11_shexp_up_gate_swiglu_wmma_k128
     const int warp = t / 32;
     const int lane = t % 32;
     const int first_row = blockIdx.x * 64;
-    const int first_token = blockIdx.y * 16;
+    const int first_token = blockIdx.y * (16 * M_TILES);
     if (first_row >= n || first_token >= tokens) {
         return;
     }
 
-    __shared__ __align__(32) signed char a_sh[16 * kStride];
+    __shared__ __align__(32) signed char a_sh[16 * M_TILES * kStride];
     __shared__ __align__(32) signed char b_up_sh[64 * kStride];
     __shared__ __align__(32) signed char b_gate_sh[64 * kStride];
     __shared__ __align__(32) int dots_sh[4][16 * 16];
-    __shared__ float a_scales_sh[16];
+    __shared__ float a_scales_sh[16 * M_TILES];
     __shared__ float w_up_scales_sh[64];
     __shared__ float w_gate_scales_sh[64];
 
-    float sums_up[8] = {};
-    float sums_gate[8] = {};
+    float sums_up[M_TILES][8] = {};
+    float sums_gate[M_TILES][8] = {};
 
     for (int group = 0; group < k / 128; ++group) {
-        if (t < 16) {
+        if (t < 16 * M_TILES) {
             const int tok = first_token + t;
             a_scales_sh[t] = (tok < tokens) ? activation_scales[size_t(tok) * (k / 128) + group] : 0.0f;
         }
+        const int sub = t % 8;
+        const int row_sub = t / 8;
         #pragma unroll
-        for (int idx = t; idx < 16 * 32; idx += 128) {
-            const int tok_local = idx / 32;
-            const int col4 = idx % 32;
+        for (int tok_base = 0; tok_base < 16 * M_TILES; tok_base += 16) {
+            const int tok_local = tok_base + row_sub;
             const int tok = first_token + tok_local;
-            *reinterpret_cast<int *>(&a_sh[tok_local * kStride + col4 * 4]) = (tok < tokens)
-                ? *reinterpret_cast<const int *>(q + size_t(tok) * k + group * 128 + col4 * 4)
-                : 0;
+            *reinterpret_cast<int4 *>(&a_sh[tok_local * kStride + sub * 16]) = (tok < tokens)
+                ? *reinterpret_cast<const int4 *>(q + size_t(tok) * k + group * 128 + sub * 16)
+                : make_int4(0, 0, 0, 0);
         }
         if (t < 64) {
             const int r = first_row + t;
@@ -856,73 +1071,463 @@ static __global__ void __launch_bounds__(128) s11_shexp_up_gate_swiglu_wmma_k128
             }
         }
         #pragma unroll
-        for (int idx = t; idx < 64 * 32; idx += 128) {
-            const int r_local = idx / 32;
-            const int col4 = idx % 32;
+        for (int r_base = 0; r_base < 64; r_base += 16) {
+            const int r_local = r_base + row_sub;
             const int r = first_row + r_local;
-            int packed_up = 0;
-            int packed_gate = 0;
+            int4 packed_up4 = make_int4(0, 0, 0, 0);
+            int4 packed_gate4 = make_int4(0, 0, 0, 0);
             if (r < n) {
-                packed_up = s11_unpack4_w2(reinterpret_cast<const unsigned char *>(up_weights + size_t(r) * weight_row + group * bytes), col4);
-                packed_gate = s11_unpack4_w2(reinterpret_cast<const unsigned char *>(gate_weights + size_t(r) * weight_row + group * bytes), col4);
+                const auto * up_block = reinterpret_cast<const unsigned char *>(up_weights + size_t(r) * weight_row + group * bytes);
+                const auto * gate_block = reinterpret_cast<const unsigned char *>(gate_weights + size_t(r) * weight_row + group * bytes);
+                const uint32_t u32 = *reinterpret_cast<const uint32_t *>(up_block + sub * 4);
+                const uint32_t g32 = *reinterpret_cast<const uint32_t *>(gate_block + sub * 4);
+                packed_up4 = make_int4(
+                    s11_unpack4_w2_byte(u32 & 0xffu),
+                    s11_unpack4_w2_byte((u32 >> 8) & 0xffu),
+                    s11_unpack4_w2_byte((u32 >> 16) & 0xffu),
+                    s11_unpack4_w2_byte(u32 >> 24));
+                packed_gate4 = make_int4(
+                    s11_unpack4_w2_byte(g32 & 0xffu),
+                    s11_unpack4_w2_byte((g32 >> 8) & 0xffu),
+                    s11_unpack4_w2_byte((g32 >> 16) & 0xffu),
+                    s11_unpack4_w2_byte(g32 >> 24));
             }
-            *reinterpret_cast<int *>(&b_up_sh[r_local * kStride + col4 * 4]) = packed_up;
-            *reinterpret_cast<int *>(&b_gate_sh[r_local * kStride + col4 * 4]) = packed_gate;
+            *reinterpret_cast<int4 *>(&b_up_sh[r_local * kStride + sub * 16]) = packed_up4;
+            *reinterpret_cast<int4 *>(&b_gate_sh[r_local * kStride + sub * 16]) = packed_gate4;
         }
         __syncthreads();
 
         namespace wmma = nvcuda::wmma;
-        wmma::fragment<wmma::accumulator, 16, 16, 16, int> acc_up;
-        wmma::fragment<wmma::accumulator, 16, 16, 16, int> acc_gate;
-        wmma::fill_fragment(acc_up, 0);
-        wmma::fill_fragment(acc_gate, 0);
+        wmma::fragment<wmma::accumulator, 16, 16, 16, int> acc_up[M_TILES];
+        wmma::fragment<wmma::accumulator, 16, 16, 16, int> acc_gate[M_TILES];
+        #pragma unroll
+        for (int mt = 0; mt < M_TILES; ++mt) {
+            wmma::fill_fragment(acc_up[mt], 0);
+            wmma::fill_fragment(acc_gate[mt], 0);
+        }
         #pragma unroll
         for (int ks = 0; ks < 128; ks += 16) {
-            wmma::fragment<wmma::matrix_a, 16, 16, 16, signed char, wmma::row_major> af;
             wmma::fragment<wmma::matrix_b, 16, 16, 16, signed char, wmma::col_major> bf_up;
             wmma::fragment<wmma::matrix_b, 16, 16, 16, signed char, wmma::col_major> bf_gate;
-            wmma::load_matrix_sync(af, a_sh + ks, kStride);
             wmma::load_matrix_sync(bf_up, b_up_sh + (warp * 16) * kStride + ks, kStride);
             wmma::load_matrix_sync(bf_gate, b_gate_sh + (warp * 16) * kStride + ks, kStride);
-            wmma::mma_sync(acc_up, af, bf_up, acc_up);
-            wmma::mma_sync(acc_gate, af, bf_gate, acc_gate);
+            #pragma unroll
+            for (int mt = 0; mt < M_TILES; ++mt) {
+                wmma::fragment<wmma::matrix_a, 16, 16, 16, signed char, wmma::row_major> af;
+                wmma::load_matrix_sync(af, a_sh + (mt * 16) * kStride + ks, kStride);
+                wmma::mma_sync(acc_up[mt], af, bf_up, acc_up[mt]);
+                wmma::mma_sync(acc_gate[mt], af, bf_gate, acc_gate[mt]);
+            }
         }
-        wmma::store_matrix_sync(dots_sh[warp], acc_up, 16, wmma::mem_row_major);
-        __syncwarp();
         #pragma unroll
-        for (int p = 0; p < 8; ++p) {
-            const int idx = lane + p * 32;
-            const int tok_local = idx / 16;
-            const int row_in_warp = idx % 16;
-            const int dot = dots_sh[warp][idx];
-            const float scale_prod = __fmul_rn(a_scales_sh[tok_local], w_up_scales_sh[warp * 16 + row_in_warp]);
-            sums_up[p] = __fadd_rn(sums_up[p], __fmul_rn(float(dot), scale_prod));
-        }
-        __syncwarp();
-        wmma::store_matrix_sync(dots_sh[warp], acc_gate, 16, wmma::mem_row_major);
-        __syncwarp();
-        #pragma unroll
-        for (int p = 0; p < 8; ++p) {
-            const int idx = lane + p * 32;
-            const int tok_local = idx / 16;
-            const int row_in_warp = idx % 16;
-            const int dot = dots_sh[warp][idx];
-            const float scale_prod = __fmul_rn(a_scales_sh[tok_local], w_gate_scales_sh[warp * 16 + row_in_warp]);
-            sums_gate[p] = __fadd_rn(sums_gate[p], __fmul_rn(float(dot), scale_prod));
+        for (int mt = 0; mt < M_TILES; ++mt) {
+            wmma::store_matrix_sync(dots_sh[warp], acc_up[mt], 16, wmma::mem_row_major);
+            __syncwarp();
+            #pragma unroll
+            for (int p = 0; p < 8; ++p) {
+                const int idx = lane + p * 32;
+                const int tok_local = mt * 16 + idx / 16;
+                const int row_in_warp = idx % 16;
+                const int dot = dots_sh[warp][idx];
+                const float scale_prod = __fmul_rn(a_scales_sh[tok_local], w_up_scales_sh[warp * 16 + row_in_warp]);
+                sums_up[mt][p] = __fadd_rn(sums_up[mt][p], __fmul_rn(float(dot), scale_prod));
+            }
+            __syncwarp();
+            wmma::store_matrix_sync(dots_sh[warp], acc_gate[mt], 16, wmma::mem_row_major);
+            __syncwarp();
+            #pragma unroll
+            for (int p = 0; p < 8; ++p) {
+                const int idx = lane + p * 32;
+                const int tok_local = mt * 16 + idx / 16;
+                const int row_in_warp = idx % 16;
+                const int dot = dots_sh[warp][idx];
+                const float scale_prod = __fmul_rn(a_scales_sh[tok_local], w_gate_scales_sh[warp * 16 + row_in_warp]);
+                sums_gate[mt][p] = __fadd_rn(sums_gate[mt][p], __fmul_rn(float(dot), scale_prod));
+            }
+            __syncwarp();
         }
         __syncthreads();
     }
 
     #pragma unroll
-    for (int p = 0; p < 8; ++p) {
-        const int idx = lane + p * 32;
-        const int tok = first_token + idx / 16;
-        const int row = first_row + warp * 16 + idx % 16;
-        if (tok < tokens && row < n) {
-            const float u = s11_bf16(sums_up[p]);
-            const float g = s11_bf16(sums_gate[p]);
-            const float silu_g = g / (1.0f + expf(-g));
-            *reinterpret_cast<float *>(output + size_t(tok) * output_token + size_t(row) * sizeof(float)) = __fmul_rn(silu_g, u);
+    for (int mt = 0; mt < M_TILES; ++mt) {
+        #pragma unroll
+        for (int p = 0; p < 8; ++p) {
+            const int idx = lane + p * 32;
+            const int tok = first_token + mt * 16 + idx / 16;
+            const int row = first_row + warp * 16 + idx % 16;
+            if (tok < tokens && row < n) {
+                const float u = s11_bf16(sums_up[mt][p]);
+                const float g = s11_bf16(sums_gate[mt][p]);
+                const float silu_g = g / (1.0f + expf(-g));
+                *reinterpret_cast<float *>(output + size_t(tok) * output_token + size_t(row) * sizeof(float)) = __fmul_rn(silu_g, u);
+            }
+        }
+    }
+#endif
+}
+
+// Register-prefetch variant of s11_wmma_k128_kernel, dispatched only when S11_K128_PF enables it.
+// Group g+1's raw global words are held in registers while group g's WMMA and epilogue run. Unpacking and the
+// r < n zero predicate are applied at store time (s11_unpack4_w2_byte(0) yields -1 codes), so each group's
+// shared-memory bytes, int32 dots, __fmul_rn/__fadd_rn sequence (ascending groups) and the final s11_bf16 are
+// identical to s11_wmma_k128_kernel.
+template <int TYPE, int M_TILES = 1>
+static __global__ void __launch_bounds__(128, 2) s11_wmma_k128_pf_kernel(
+        const char * __restrict__ weights, const signed char * __restrict__ q,
+        const float * __restrict__ activation_scales, char * __restrict__ output,
+        int k, int n, int tokens, size_t weight_row, size_t output_token) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+    constexpr bool kW2 = TYPE <= GGML_TYPE_S11_W2_BF16;
+    constexpr int bytes = kW2 ? 36 : 68;
+    constexpr int scale_off = kW2 ? 32 : TYPE == GGML_TYPE_S11_W4 ? 64 : 128;
+    constexpr int kWords = kW2 ? 1 : 2;
+    constexpr int kStride = 144;
+    const int t = threadIdx.x;
+    const int warp = t / 32;
+    const int lane = t % 32;
+    const int first_row = blockIdx.x * 64;
+    const int first_token = blockIdx.y * (16 * M_TILES);
+    if (first_row >= n || first_token >= tokens) {
+        return;
+    }
+
+    __shared__ __align__(32) signed char a_sh[16 * M_TILES * kStride];
+    __shared__ __align__(32) signed char b_sh[64 * kStride];
+    __shared__ __align__(32) int dots_sh[4][16 * 16];
+    __shared__ float a_scales_sh[16 * M_TILES];
+    __shared__ float w_scales_sh[64];
+
+    float sums[M_TILES][8] = {};
+
+    const int groups = k / 128;
+    const int sub = t % 8;
+    const int row_sub = t / 8;
+
+    float a_scale_reg = 0.0f;
+    float w_scale_reg = 0.0f;
+    int4 a_reg[M_TILES];
+    uint32_t w_reg[4][kWords];
+
+    auto load_group = [&](const int group) {
+        if (t < 16 * M_TILES) {
+            const int tok = first_token + t;
+            a_scale_reg = (tok < tokens) ? __ldg(activation_scales + size_t(tok) * groups + group) : 0.0f;
+        }
+        if (t < 64) {
+            const int r = first_row + t;
+            w_scale_reg = (r < n)
+                ? __ldg(reinterpret_cast<const float *>(weights + size_t(r) * weight_row + group * bytes + scale_off))
+                : 0.0f;
+        }
+        #pragma unroll
+        for (int mt = 0; mt < M_TILES; ++mt) {
+            const int tok = first_token + mt * 16 + row_sub;
+            a_reg[mt] = (tok < tokens)
+                ? __ldg(reinterpret_cast<const int4 *>(q + size_t(tok) * k + group * 128 + sub * 16))
+                : make_int4(0, 0, 0, 0);
+        }
+        #pragma unroll
+        for (int i = 0; i < 4; ++i) {
+            const int r = first_row + i * 16 + row_sub;
+            if (r < n) {
+                const char * block = weights + size_t(r) * weight_row + group * bytes;
+                if constexpr (kW2) {
+                    w_reg[i][0] = __ldg(reinterpret_cast<const unsigned int *>(block + sub * 4));
+                } else {
+                    w_reg[i][0] = __ldg(reinterpret_cast<const unsigned int *>(block + sub * 8));
+                    w_reg[i][kWords - 1] = __ldg(reinterpret_cast<const unsigned int *>(block + sub * 8 + 4));
+                }
+            } else {
+                #pragma unroll
+                for (int wi = 0; wi < kWords; ++wi) {
+                    w_reg[i][wi] = 0u;
+                }
+            }
+        }
+    };
+
+    if (groups > 0) {
+        load_group(0);
+    }
+    for (int group = 0; group < groups; ++group) {
+        if (t < 16 * M_TILES) {
+            a_scales_sh[t] = a_scale_reg;
+        }
+        if (t < 64) {
+            w_scales_sh[t] = w_scale_reg;
+        }
+        #pragma unroll
+        for (int mt = 0; mt < M_TILES; ++mt) {
+            *reinterpret_cast<int4 *>(&a_sh[(mt * 16 + row_sub) * kStride + sub * 16]) = a_reg[mt];
+        }
+        #pragma unroll
+        for (int i = 0; i < 4; ++i) {
+            const int r_local = i * 16 + row_sub;
+            const int r = first_row + r_local;
+            int4 packed4 = make_int4(0, 0, 0, 0);
+            if (r < n) {
+                if constexpr (kW2) {
+                    const uint32_t w32 = w_reg[i][0];
+                    packed4 = make_int4(
+                        s11_unpack4_w2_byte(w32 & 0xffu),
+                        s11_unpack4_w2_byte((w32 >> 8) & 0xffu),
+                        s11_unpack4_w2_byte((w32 >> 16) & 0xffu),
+                        s11_unpack4_w2_byte(w32 >> 24));
+                } else {
+                    const uint32_t w_lo = w_reg[i][0];
+                    const uint32_t w_hi = w_reg[i][kWords - 1];
+                    packed4 = make_int4(
+                        s11_unpack4_w4_u16(w_lo & 0xffffu),
+                        s11_unpack4_w4_u16(w_lo >> 16),
+                        s11_unpack4_w4_u16(w_hi & 0xffffu),
+                        s11_unpack4_w4_u16(w_hi >> 16));
+                }
+            }
+            *reinterpret_cast<int4 *>(&b_sh[r_local * kStride + sub * 16]) = packed4;
+        }
+        __syncthreads();
+
+        if (group + 1 < groups) {
+            load_group(group + 1);
+        }
+
+        namespace wmma = nvcuda::wmma;
+        wmma::fragment<wmma::accumulator, 16, 16, 16, int> acc[M_TILES];
+        #pragma unroll
+        for (int mt = 0; mt < M_TILES; ++mt) {
+            wmma::fill_fragment(acc[mt], 0);
+        }
+        #pragma unroll
+        for (int ks = 0; ks < 128; ks += 16) {
+            wmma::fragment<wmma::matrix_b, 16, 16, 16, signed char, wmma::col_major> bf;
+            wmma::load_matrix_sync(bf, b_sh + (warp * 16) * kStride + ks, kStride);
+            #pragma unroll
+            for (int mt = 0; mt < M_TILES; ++mt) {
+                wmma::fragment<wmma::matrix_a, 16, 16, 16, signed char, wmma::row_major> af;
+                wmma::load_matrix_sync(af, a_sh + (mt * 16) * kStride + ks, kStride);
+                wmma::mma_sync(acc[mt], af, bf, acc[mt]);
+            }
+        }
+        #pragma unroll
+        for (int mt = 0; mt < M_TILES; ++mt) {
+            wmma::store_matrix_sync(dots_sh[warp], acc[mt], 16, wmma::mem_row_major);
+            __syncwarp();
+            #pragma unroll
+            for (int p = 0; p < 8; ++p) {
+                const int idx = lane + p * 32;
+                const int tok_local = mt * 16 + idx / 16;
+                const int row_in_warp = idx % 16;
+                const int dot = dots_sh[warp][idx];
+                const float scale_prod = __fmul_rn(a_scales_sh[tok_local], w_scales_sh[warp * 16 + row_in_warp]);
+                sums[mt][p] = __fadd_rn(sums[mt][p], __fmul_rn(float(dot), scale_prod));
+            }
+            __syncwarp();
+        }
+        __syncthreads();
+    }
+
+    #pragma unroll
+    for (int mt = 0; mt < M_TILES; ++mt) {
+        #pragma unroll
+        for (int p = 0; p < 8; ++p) {
+            const int idx = lane + p * 32;
+            const int tok = first_token + mt * 16 + idx / 16;
+            const int row = first_row + warp * 16 + idx % 16;
+            if (tok < tokens && row < n) {
+                *reinterpret_cast<float *>(output + size_t(tok) * output_token + size_t(row) * sizeof(float)) = s11_bf16(sums[mt][p]);
+            }
+        }
+    }
+#endif
+}
+
+// Register-prefetch variant of s11_shexp_up_gate_swiglu_wmma_k128_kernel. Same bit-exactness argument as
+// s11_wmma_k128_pf_kernel: identical shared-memory bytes per group, verbatim WMMA, epilogue and SwiGLU store.
+template <int M_TILES = 1>
+static __global__ void __launch_bounds__(128) s11_shexp_up_gate_swiglu_wmma_k128_pf_kernel(
+        const char * __restrict__ up_weights, const char * __restrict__ gate_weights,
+        const signed char * __restrict__ q, const float * __restrict__ activation_scales,
+        char * __restrict__ output, int k, int n, int tokens, size_t weight_row, size_t output_token) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+    constexpr int bytes = 36;
+    constexpr int scale_off = 32;
+    constexpr int kStride = 144;
+    const int t = threadIdx.x;
+    const int warp = t / 32;
+    const int lane = t % 32;
+    const int first_row = blockIdx.x * 64;
+    const int first_token = blockIdx.y * (16 * M_TILES);
+    if (first_row >= n || first_token >= tokens) {
+        return;
+    }
+
+    __shared__ __align__(32) signed char a_sh[16 * M_TILES * kStride];
+    __shared__ __align__(32) signed char b_up_sh[64 * kStride];
+    __shared__ __align__(32) signed char b_gate_sh[64 * kStride];
+    __shared__ __align__(32) int dots_sh[4][16 * 16];
+    __shared__ float a_scales_sh[16 * M_TILES];
+    __shared__ float w_up_scales_sh[64];
+    __shared__ float w_gate_scales_sh[64];
+
+    float sums_up[M_TILES][8] = {};
+    float sums_gate[M_TILES][8] = {};
+
+    const int groups = k / 128;
+    const int sub = t % 8;
+    const int row_sub = t / 8;
+
+    float a_scale_reg = 0.0f;
+    float w_up_scale_reg = 0.0f;
+    float w_gate_scale_reg = 0.0f;
+    int4 a_reg[M_TILES];
+    uint32_t u_reg[4];
+    uint32_t g_reg[4];
+
+    auto load_group = [&](const int group) {
+        if (t < 16 * M_TILES) {
+            const int tok = first_token + t;
+            a_scale_reg = (tok < tokens) ? __ldg(activation_scales + size_t(tok) * groups + group) : 0.0f;
+        }
+        #pragma unroll
+        for (int mt = 0; mt < M_TILES; ++mt) {
+            const int tok = first_token + mt * 16 + row_sub;
+            a_reg[mt] = (tok < tokens)
+                ? __ldg(reinterpret_cast<const int4 *>(q + size_t(tok) * k + group * 128 + sub * 16))
+                : make_int4(0, 0, 0, 0);
+        }
+        if (t < 64) {
+            const int r = first_row + t;
+            if (r < n) {
+                w_up_scale_reg = __ldg(reinterpret_cast<const float *>(up_weights + size_t(r) * weight_row + group * bytes + scale_off));
+                w_gate_scale_reg = __ldg(reinterpret_cast<const float *>(gate_weights + size_t(r) * weight_row + group * bytes + scale_off));
+            } else {
+                w_up_scale_reg = 0.0f;
+                w_gate_scale_reg = 0.0f;
+            }
+        }
+        #pragma unroll
+        for (int i = 0; i < 4; ++i) {
+            const int r = first_row + i * 16 + row_sub;
+            if (r < n) {
+                u_reg[i] = __ldg(reinterpret_cast<const unsigned int *>(up_weights + size_t(r) * weight_row + group * bytes + sub * 4));
+                g_reg[i] = __ldg(reinterpret_cast<const unsigned int *>(gate_weights + size_t(r) * weight_row + group * bytes + sub * 4));
+            } else {
+                u_reg[i] = 0u;
+                g_reg[i] = 0u;
+            }
+        }
+    };
+
+    if (groups > 0) {
+        load_group(0);
+    }
+    for (int group = 0; group < groups; ++group) {
+        if (t < 16 * M_TILES) {
+            a_scales_sh[t] = a_scale_reg;
+        }
+        #pragma unroll
+        for (int mt = 0; mt < M_TILES; ++mt) {
+            *reinterpret_cast<int4 *>(&a_sh[(mt * 16 + row_sub) * kStride + sub * 16]) = a_reg[mt];
+        }
+        if (t < 64) {
+            w_up_scales_sh[t] = w_up_scale_reg;
+            w_gate_scales_sh[t] = w_gate_scale_reg;
+        }
+        #pragma unroll
+        for (int i = 0; i < 4; ++i) {
+            const int r_local = i * 16 + row_sub;
+            const int r = first_row + r_local;
+            int4 packed_up4 = make_int4(0, 0, 0, 0);
+            int4 packed_gate4 = make_int4(0, 0, 0, 0);
+            if (r < n) {
+                const uint32_t u32 = u_reg[i];
+                const uint32_t g32 = g_reg[i];
+                packed_up4 = make_int4(
+                    s11_unpack4_w2_byte(u32 & 0xffu),
+                    s11_unpack4_w2_byte((u32 >> 8) & 0xffu),
+                    s11_unpack4_w2_byte((u32 >> 16) & 0xffu),
+                    s11_unpack4_w2_byte(u32 >> 24));
+                packed_gate4 = make_int4(
+                    s11_unpack4_w2_byte(g32 & 0xffu),
+                    s11_unpack4_w2_byte((g32 >> 8) & 0xffu),
+                    s11_unpack4_w2_byte((g32 >> 16) & 0xffu),
+                    s11_unpack4_w2_byte(g32 >> 24));
+            }
+            *reinterpret_cast<int4 *>(&b_up_sh[r_local * kStride + sub * 16]) = packed_up4;
+            *reinterpret_cast<int4 *>(&b_gate_sh[r_local * kStride + sub * 16]) = packed_gate4;
+        }
+        __syncthreads();
+
+        if (group + 1 < groups) {
+            load_group(group + 1);
+        }
+
+        namespace wmma = nvcuda::wmma;
+        wmma::fragment<wmma::accumulator, 16, 16, 16, int> acc_up[M_TILES];
+        wmma::fragment<wmma::accumulator, 16, 16, 16, int> acc_gate[M_TILES];
+        #pragma unroll
+        for (int mt = 0; mt < M_TILES; ++mt) {
+            wmma::fill_fragment(acc_up[mt], 0);
+            wmma::fill_fragment(acc_gate[mt], 0);
+        }
+        #pragma unroll
+        for (int ks = 0; ks < 128; ks += 16) {
+            wmma::fragment<wmma::matrix_b, 16, 16, 16, signed char, wmma::col_major> bf_up;
+            wmma::fragment<wmma::matrix_b, 16, 16, 16, signed char, wmma::col_major> bf_gate;
+            wmma::load_matrix_sync(bf_up, b_up_sh + (warp * 16) * kStride + ks, kStride);
+            wmma::load_matrix_sync(bf_gate, b_gate_sh + (warp * 16) * kStride + ks, kStride);
+            #pragma unroll
+            for (int mt = 0; mt < M_TILES; ++mt) {
+                wmma::fragment<wmma::matrix_a, 16, 16, 16, signed char, wmma::row_major> af;
+                wmma::load_matrix_sync(af, a_sh + (mt * 16) * kStride + ks, kStride);
+                wmma::mma_sync(acc_up[mt], af, bf_up, acc_up[mt]);
+                wmma::mma_sync(acc_gate[mt], af, bf_gate, acc_gate[mt]);
+            }
+        }
+        #pragma unroll
+        for (int mt = 0; mt < M_TILES; ++mt) {
+            wmma::store_matrix_sync(dots_sh[warp], acc_up[mt], 16, wmma::mem_row_major);
+            __syncwarp();
+            #pragma unroll
+            for (int p = 0; p < 8; ++p) {
+                const int idx = lane + p * 32;
+                const int tok_local = mt * 16 + idx / 16;
+                const int row_in_warp = idx % 16;
+                const int dot = dots_sh[warp][idx];
+                const float scale_prod = __fmul_rn(a_scales_sh[tok_local], w_up_scales_sh[warp * 16 + row_in_warp]);
+                sums_up[mt][p] = __fadd_rn(sums_up[mt][p], __fmul_rn(float(dot), scale_prod));
+            }
+            __syncwarp();
+            wmma::store_matrix_sync(dots_sh[warp], acc_gate[mt], 16, wmma::mem_row_major);
+            __syncwarp();
+            #pragma unroll
+            for (int p = 0; p < 8; ++p) {
+                const int idx = lane + p * 32;
+                const int tok_local = mt * 16 + idx / 16;
+                const int row_in_warp = idx % 16;
+                const int dot = dots_sh[warp][idx];
+                const float scale_prod = __fmul_rn(a_scales_sh[tok_local], w_gate_scales_sh[warp * 16 + row_in_warp]);
+                sums_gate[mt][p] = __fadd_rn(sums_gate[mt][p], __fmul_rn(float(dot), scale_prod));
+            }
+            __syncwarp();
+        }
+        __syncthreads();
+    }
+
+    #pragma unroll
+    for (int mt = 0; mt < M_TILES; ++mt) {
+        #pragma unroll
+        for (int p = 0; p < 8; ++p) {
+            const int idx = lane + p * 32;
+            const int tok = first_token + mt * 16 + idx / 16;
+            const int row = first_row + warp * 16 + idx % 16;
+            if (tok < tokens && row < n) {
+                const float u = s11_bf16(sums_up[mt][p]);
+                const float g = s11_bf16(sums_gate[mt][p]);
+                const float silu_g = g / (1.0f + expf(-g));
+                *reinterpret_cast<float *>(output + size_t(tok) * output_token + size_t(row) * sizeof(float)) = __fmul_rn(silu_g, u);
+            }
         }
     }
 #endif
@@ -1071,25 +1676,26 @@ static __global__ void __launch_bounds__(128) s11_routed_wmma_k128_kernel(
                 ? s11_scale(reinterpret_cast<const unsigned char *>(expert_weights + size_t(r) * weight_row + group * 36), GGML_TYPE_S11_W2)
                 : 0.0f;
         }
+        const int sub = t % 8;
+        const int row_sub = t / 8;
+        *reinterpret_cast<int4 *>(&a_sh[row_sub * kStride + sub * 16]) = (row_sub < count)
+            ? *reinterpret_cast<const int4 *>(q + size_t(source_sh[row_sub]) * k + group * 128 + sub * 16)
+            : make_int4(0, 0, 0, 0);
         #pragma unroll
-        for (int idx = t; idx < 16 * 32; idx += 128) {
-            const int tok_local = idx / 32;
-            const int col4 = idx % 32;
-            *reinterpret_cast<int *>(&a_sh[tok_local * kStride + col4 * 4]) = (tok_local < count)
-                ? *reinterpret_cast<const int *>(q + size_t(source_sh[tok_local]) * k + group * 128 + col4 * 4)
-                : 0;
-        }
-        #pragma unroll
-        for (int idx = t; idx < 64 * 32; idx += 128) {
-            const int r_local = idx / 32;
-            const int col4 = idx % 32;
+        for (int r_base = 0; r_base < 64; r_base += 16) {
+            const int r_local = r_base + row_sub;
             const int r = first_row + r_local;
-            int packed = 0;
+            int4 packed4 = make_int4(0, 0, 0, 0);
             if (r < n) {
                 const auto * block = reinterpret_cast<const unsigned char *>(expert_weights + size_t(r) * weight_row + group * 36);
-                packed = s11_unpack4_w2(block, col4);
+                const uint32_t w32 = *reinterpret_cast<const uint32_t *>(block + sub * 4);
+                packed4 = make_int4(
+                    s11_unpack4_w2_byte(w32 & 0xffu),
+                    s11_unpack4_w2_byte((w32 >> 8) & 0xffu),
+                    s11_unpack4_w2_byte((w32 >> 16) & 0xffu),
+                    s11_unpack4_w2_byte(w32 >> 24));
             }
-            *reinterpret_cast<int *>(&b_sh[r_local * kStride + col4 * 4]) = packed;
+            *reinterpret_cast<int4 *>(&b_sh[r_local * kStride + sub * 16]) = packed4;
         }
         __syncthreads();
 
@@ -1116,6 +1722,240 @@ static __global__ void __launch_bounds__(128) s11_routed_wmma_k128_kernel(
             const float scale_prod = __fmul_rn(a_scales_sh[tok_local], w_scales_sh[warp * 16 + row_in_warp]);
             sums[p] = __fadd_rn(sums[p], __fmul_rn(float(dot), scale_prod));
         }
+        __syncthreads();
+    }
+
+    #pragma unroll
+    for (int p = 0; p < 8; ++p) {
+        const int idx = lane + p * 32;
+        const int tok_local = idx / 16;
+        const int row = first_row + warp * 16 + idx % 16;
+        if (tok_local < count && row < n) {
+            const int a = assign_sh[tok_local];
+            const int slot = a % slots;
+            const int token = a / slots;
+            *reinterpret_cast<float *>(output + size_t(row) * sizeof(float) + size_t(slot) * output_slot + size_t(token) * output_token) = s11_bf16(sums[p]);
+        }
+    }
+#endif
+}
+
+static __device__ __forceinline__ void s11_cp_async16(void * smem_dst, const void * gmem_src) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+    const unsigned int dst = static_cast<unsigned int>(__cvta_generic_to_shared(smem_dst));
+    asm volatile("cp.async.cg.shared.global [%0], [%1], 16;" :: "r"(dst), "l"(gmem_src) : "memory");
+#else
+    (void) smem_dst;
+    (void) gmem_src;
+#endif
+}
+
+static __device__ __forceinline__ void s11_cp_async_commit_wait_all() {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+    asm volatile("cp.async.commit_group;" ::: "memory");
+    asm volatile("cp.async.wait_all;" ::: "memory");
+#endif
+}
+
+// One K128 group of the routed down projection. Same WMMA sequence (ks = 0..112, ldm 144),
+// same store_matrix_sync and same __fmul_rn/__fadd_rn accumulation as the group body of
+// s11_routed_wmma_k128_kernel.
+static __device__ __forceinline__ void s11_routed_k128_group_accum(
+        const signed char * a_tile, const signed char * b_warp, int * dots_warp,
+        const float * a_scales, const float * w_scales_warp, int lane, float * sums) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+    constexpr int kStride = 144;
+    namespace wmma = nvcuda::wmma;
+    wmma::fragment<wmma::accumulator, 16, 16, 16, int> acc;
+    wmma::fill_fragment(acc, 0);
+    #pragma unroll
+    for (int ks = 0; ks < 128; ks += 16) {
+        wmma::fragment<wmma::matrix_a, 16, 16, 16, signed char, wmma::row_major> af;
+        wmma::fragment<wmma::matrix_b, 16, 16, 16, signed char, wmma::col_major> bf;
+        wmma::load_matrix_sync(af, a_tile + ks, kStride);
+        wmma::load_matrix_sync(bf, b_warp + ks, kStride);
+        wmma::mma_sync(acc, af, bf, acc);
+    }
+    wmma::store_matrix_sync(dots_warp, acc, 16, wmma::mem_row_major);
+    __syncwarp();
+
+    #pragma unroll
+    for (int p = 0; p < 8; ++p) {
+        const int idx = lane + p * 32;
+        const int tok_local = idx / 16;
+        const int row_in_warp = idx % 16;
+        const int dot = dots_warp[idx];
+        const float scale_prod = __fmul_rn(a_scales[tok_local], w_scales_warp[row_in_warp]);
+        sums[p] = __fadd_rn(sums[p], __fmul_rn(float(dot), scale_prod));
+    }
+#else
+    (void) a_tile; (void) b_warp; (void) dots_warp; (void) a_scales; (void) w_scales_warp; (void) lane; (void) sums;
+#endif
+}
+
+// Load-restructured variant of s11_routed_wmma_k128_kernel for the routed down projection.
+// Dispatch enforces k == 512, weight_row == 144, n % 64 == 0 and device-resident weights.
+// Weight loads are issued before the assignment gather. STAGE_SMEM=false preloads all four
+// K128 groups into registers; STAGE_SMEM=true stages the 64x144 B weight panel and the
+// activations with 16-B cp.async. It is bit-exact because, per (tile, group), the smem operand
+// bytes and layout (ldm 144), the WMMA sequence, the scale product, the group-ordered
+// accumulation, the BF16 output rounding and the accounting atomic are all unchanged.
+template <bool STAGE_SMEM>
+static __global__ void __launch_bounds__(128) s11_routed_wmma_k128_pipe_kernel(
+        const char * __restrict__ weights, const signed char * __restrict__ q,
+        const float * __restrict__ activation_scales,
+        const int32_t * __restrict__ tile_experts, const int32_t * __restrict__ tile_starts,
+        const int32_t * __restrict__ tile_counts, const int32_t * __restrict__ sorted_assignments,
+        const int32_t * __restrict__ num_tiles_in, char * __restrict__ output,
+        int k, int n, int slots, int input_slots,
+        size_t weight_row, size_t weight_expert, size_t output_slot, size_t output_token) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+    constexpr int kGroups = 4;
+    constexpr int kStride = 144;
+    constexpr int kChunksPerRow = kStride / 16;
+    const int tile = blockIdx.y;
+    // tile < max_tiles <= 4096, so these independent plan reads stay in bounds for idle tiles too.
+    const int num_tiles = num_tiles_in[0];
+    const int expert = tile_experts[tile];
+    const int start = tile_starts[tile];
+    const int count = tile_counts[tile];
+    if (tile >= num_tiles) {
+        return;
+    }
+    const int t = threadIdx.x;
+    const int warp = t / 32;
+    const int lane = t % 32;
+    const int first_row = blockIdx.x * 64;
+    if (first_row >= n || count <= 0) {
+        return;
+    }
+    if (first_row == 0 && t == 0 && k == 512 && n == 2048) {
+        atomicAdd(&s11_completed_assignments, static_cast<unsigned long long>(count));
+    }
+
+    __shared__ __align__(128) unsigned char w_raw[STAGE_SMEM ? 64 * kStride : 16];
+    __shared__ __align__(32) signed char a_sh[(STAGE_SMEM ? kGroups : 1) * 16 * kStride];
+    __shared__ __align__(32) signed char b_sh[64 * kStride];
+    __shared__ __align__(32) int dots_sh[4][16 * 16];
+    __shared__ int assign_sh[16];
+    __shared__ int source_sh[16];
+    __shared__ float a_scales_sh[16];
+    __shared__ float w_scales_sh[64];
+
+    const char * expert_weights = weights + size_t(expert) * weight_expert;
+    const int sub = t % 8;
+    const int row_sub = t / 8;
+
+    uint32_t wc[kGroups][4] = {};
+    float ws[kGroups] = {};
+    if constexpr (STAGE_SMEM) {
+        for (int c = t; c < 64 * kChunksPerRow; c += 128) {
+            const int r_local = c / kChunksPerRow;
+            const int col = c % kChunksPerRow;
+            if (first_row + r_local < n) {
+                s11_cp_async16(w_raw + c * 16, expert_weights + size_t(first_row + r_local) * weight_row + col * 16);
+            }
+        }
+    } else {
+        #pragma unroll
+        for (int g = 0; g < kGroups; ++g) {
+            #pragma unroll
+            for (int rb = 0; rb < 4; ++rb) {
+                const int r = first_row + rb * 16 + row_sub;
+                if (r < n) {
+                    wc[g][rb] = *reinterpret_cast<const uint32_t *>(expert_weights + size_t(r) * weight_row + g * 36 + sub * 4);
+                }
+            }
+            if (t < 64 && first_row + t < n) {
+                ws[g] = s11_scale(reinterpret_cast<const unsigned char *>(expert_weights + size_t(first_row + t) * weight_row + g * 36), GGML_TYPE_S11_W2);
+            }
+        }
+    }
+
+    float asc[kGroups] = {};
+    if (t < 16) {
+        const int a = (t < count) ? sorted_assignments[start + t] : 0;
+        assign_sh[t] = a;
+        const int slot = a % slots;
+        const int token = a / slots;
+        const int source = token * input_slots + (input_slots == 1 ? 0 : slot);
+        source_sh[t] = source;
+        if (t < count) {
+            #pragma unroll
+            for (int g = 0; g < kGroups; ++g) {
+                asc[g] = activation_scales[size_t(source) * (k / 128) + g];
+            }
+        }
+    }
+    __syncthreads();
+
+    int4 aq[kGroups];
+    if constexpr (STAGE_SMEM) {
+        #pragma unroll
+        for (int i = 0; i < 4; ++i) {
+            const int c = t + i * 128;
+            const int row = c / 32;
+            const int g = (c % 32) / 8;
+            const int s = c % 8;
+            signed char * dst_sh = a_sh + g * (16 * kStride) + row * kStride + s * 16;
+            if (row < count) {
+                s11_cp_async16(dst_sh, q + size_t(source_sh[row]) * k + g * 128 + s * 16);
+            } else {
+                *reinterpret_cast<int4 *>(dst_sh) = make_int4(0, 0, 0, 0);
+            }
+        }
+        s11_cp_async_commit_wait_all();
+        __syncthreads();
+    } else {
+        const bool a_valid = row_sub < count;
+        const signed char * q_row = q + size_t(source_sh[row_sub]) * k + sub * 16;
+        #pragma unroll
+        for (int g = 0; g < kGroups; ++g) {
+            aq[g] = a_valid ? *reinterpret_cast<const int4 *>(q_row + g * 128) : make_int4(0, 0, 0, 0);
+        }
+    }
+
+    float sums[8] = {};
+    #pragma unroll
+    for (int g = 0; g < kGroups; ++g) {
+        if (t < 16) {
+            a_scales_sh[t] = asc[g];
+        }
+        if constexpr (STAGE_SMEM) {
+            if (t < 64) {
+                w_scales_sh[t] = (first_row + t < n)
+                    ? *reinterpret_cast<const float *>(w_raw + t * kStride + g * 36 + 32)
+                    : 0.0f;
+            }
+        } else {
+            if (t < 64) {
+                w_scales_sh[t] = ws[g];
+            }
+            *reinterpret_cast<int4 *>(&a_sh[row_sub * kStride + sub * 16]) = aq[g];
+        }
+        #pragma unroll
+        for (int rb = 0; rb < 4; ++rb) {
+            const int r_local = rb * 16 + row_sub;
+            uint32_t w32 = 0;
+            if constexpr (STAGE_SMEM) {
+                w32 = *reinterpret_cast<const uint32_t *>(w_raw + r_local * kStride + g * 36 + sub * 4);
+            } else {
+                w32 = wc[g][rb];
+            }
+            int4 packed4 = make_int4(0, 0, 0, 0);
+            if (first_row + r_local < n) {
+                packed4 = make_int4(
+                    s11_unpack4_w2_byte(w32 & 0xffu),
+                    s11_unpack4_w2_byte((w32 >> 8) & 0xffu),
+                    s11_unpack4_w2_byte((w32 >> 16) & 0xffu),
+                    s11_unpack4_w2_byte(w32 >> 24));
+            }
+            *reinterpret_cast<int4 *>(&b_sh[r_local * kStride + sub * 16]) = packed4;
+        }
+        __syncthreads();
+
+        s11_routed_k128_group_accum(a_sh + (STAGE_SMEM ? g * 16 * kStride : 0), b_sh + (warp * 16) * kStride,
+                                    dots_sh[warp], a_scales_sh, w_scales_sh + warp * 16, lane, sums);
         __syncthreads();
     }
 
@@ -1195,6 +2035,7 @@ void ggml_cuda_s11_reset_graph_state() {
 }
 
 void ggml_cuda_s11_begin_split(const ggml_cgraph * cgraph) {
+    g_s11_state.last_x_data[0] = nullptr;
     g_s11_state.last_x_data[1] = nullptr;
     g_s11_state.last_ids_data = nullptr;
     s11_ensure_persistent_buffers();
@@ -1276,6 +2117,28 @@ static bool s11_is_hybrid_mode() {
     return hybrid;
 }
 
+// S11_ROUTED_PIPE=0 restores the exact O9.3 routed-MoE kernel dispatch.
+static bool s11_routed_pipe() {
+    static const bool enabled = [] {
+        const char * value = std::getenv("S11_ROUTED_PIPE");
+        return !(value && std::strcmp(value, "0") == 0);
+    }();
+    return enabled;
+}
+
+// S11_ROUTED_PIPE_DOWN=reg (default) | smem selects the down-projection pipe variant.
+static bool s11_routed_pipe_down_smem() {
+    static const bool smem = [] {
+        const char * value = std::getenv("S11_ROUTED_PIPE_DOWN");
+        return value && std::strcmp(value, "smem") == 0;
+    }();
+    return smem;
+}
+
+static bool s11_routed_pipe_device_weights(const ggml_tensor * t) {
+    return t != nullptr && t->data != nullptr && t->buffer != nullptr && !ggml_backend_buffer_is_host(t->buffer);
+}
+
 static int s11_optimization() {
     static const int mode = [] {
         const char * value = std::getenv("S11_CUDA_OPT");
@@ -1285,6 +2148,231 @@ static int s11_optimization() {
         GGML_ABORT("Invalid S11_CUDA_OPT: %s", value);
     }();
     return mode;
+}
+
+// K128 WMMA prefill dispatch (dense W2_BF16/W4 at tokens >= 64, shared-expert up/gate at tokens >= 32).
+// Env knobs, read once:
+//   S11_K128_MT       auto|1|2|4: forced M_TILES, capped per kind (shexp max 2). 4 with S11_K128_PF=0 gives the O9.3 grids.
+//   S11_K128_MIN_CTAS fallback CTA target for shapes absent from s11_k128_shape_table (default 108).
+//   S11_K128_PF       0|1: use the register-prefetch kernels (default 0).
+//   S11_K128_PF_MINK  minimum K for prefetch (default 2048).
+//   S11_K128_PF_MT    bitmask of M_TILES allowed to prefetch (bits 1|2|4 = mt 1|2|4, default 7).
+// M_TILES only changes which CTA owns an output element; per-element group order and rounding are unchanged.
+enum s11_k128_kind {
+    S11_K128_KIND_W2_BF16 = 0,
+    S11_K128_KIND_W4      = 1,
+    S11_K128_KIND_SHEXP   = 2,
+};
+
+struct s11_k128_shape_entry {
+    int kind;
+    int n;
+    int k;
+    int mt;
+};
+
+// Measured per-shape overrides (kind, n, k) -> M_TILES. No sweep recorded yet; the sentinel entry never matches.
+static constexpr s11_k128_shape_entry s11_k128_shape_table[] = {
+    { -1, 0, 0, 4 },
+};
+
+static int s11_k128_env_int(const char * name, int def, int lo, int hi) {
+    const char * value = std::getenv(name);
+    if (!value || !*value) { return def; }
+    char * end = nullptr;
+    const long parsed = std::strtol(value, &end, 10);
+    if (end == value || *end != 0) {
+        GGML_ABORT("Invalid %s: %s", name, value);
+    }
+    return parsed < lo ? lo : parsed > hi ? hi : int(parsed);
+}
+
+static int s11_k128_forced_mt() {
+    static const int mt = [] {
+        const char * value = std::getenv("S11_K128_MT");
+        if (!value || !*value || std::strcmp(value, "auto") == 0) { return 0; }
+        if (std::strcmp(value, "1") == 0) { return 1; }
+        if (std::strcmp(value, "2") == 0) { return 2; }
+        if (std::strcmp(value, "4") == 0) { return 4; }
+        GGML_ABORT("Invalid S11_K128_MT: %s", value);
+    }();
+    return mt;
+}
+
+static int s11_k128_cap_mt(int mt, int max_mt) {
+    const int v = mt >= 4 ? 4 : mt >= 2 ? 2 : 1;
+    return v < max_mt ? v : max_mt;
+}
+
+static int s11_k128_mt_for(int kind, int n_rows, int k, int tokens, int max_mt) {
+    const int forced = s11_k128_forced_mt();
+    if (forced > 0) {
+        return s11_k128_cap_mt(forced, max_mt);
+    }
+    for (const s11_k128_shape_entry & e : s11_k128_shape_table) {
+        if (e.kind == kind && e.n == n_rows && e.k == k) {
+            return s11_k128_cap_mt(e.mt, max_mt);
+        }
+    }
+    static const int min_ctas = s11_k128_env_int("S11_K128_MIN_CTAS", 108, 1, 4096);
+    const long long tiles_x = (n_rows + 63) / 64;
+    for (int mt = max_mt; mt >= 1; mt /= 2) {
+        const long long tiles_y = (tokens + 16 * mt - 1) / (16 * mt);
+        if (tiles_x * tiles_y >= min_ctas) {
+            return mt;
+        }
+    }
+    return 1;
+}
+
+static bool s11_k128_pf_for(int k, int mt) {
+    static const int enabled = s11_k128_env_int("S11_K128_PF", 1, 0, 1);
+    static const int min_k = s11_k128_env_int("S11_K128_PF_MINK", 2048, 0, 1 << 30);
+    static const int mt_mask = s11_k128_env_int("S11_K128_PF_MT", 7, 0, 7);
+    return enabled != 0 && k >= min_k && (mt_mask & mt) != 0;
+}
+
+#ifdef S11_K128_SELFTEST_BUILD
+#include <cstdio>
+
+// Test-only (separately compiled binary, CUDA graphs disabled): each K128 prefill dispatch also runs the O9.3
+// instantiation into scratch, compares bitwise and prints cudaEvent timings. Never part of the production build.
+struct s11_k128_selftest_state {
+    char * ref = nullptr;
+    cudaEvent_t e0 = nullptr;
+    cudaEvent_t e1 = nullptr;
+    cudaEvent_t e2 = nullptr;
+};
+
+static __global__ void s11_k128_selftest_cmp_kernel(
+        const char * a, const char * b, int n, int tokens, size_t stride, unsigned long long * mismatches) {
+    const int row = blockIdx.x * blockDim.x + threadIdx.x;
+    const int tok = blockIdx.y;
+    if (row < n && tok < tokens) {
+        const size_t off = size_t(tok) * stride + size_t(row) * sizeof(float);
+        if (*reinterpret_cast<const uint32_t *>(a + off) != *reinterpret_cast<const uint32_t *>(b + off)) {
+            atomicAdd(mismatches, 1ull);
+        }
+    }
+}
+
+static void s11_k128_selftest_begin(s11_k128_selftest_state & st, size_t bytes, cudaStream_t stream) {
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+    CUDA_CHECK(cudaMalloc(reinterpret_cast<void **>(&st.ref), bytes));
+    CUDA_CHECK(cudaEventCreate(&st.e0));
+    CUDA_CHECK(cudaEventCreate(&st.e1));
+    CUDA_CHECK(cudaEventCreate(&st.e2));
+    CUDA_CHECK(cudaEventRecord(st.e0, stream));
+}
+
+static void s11_k128_selftest_end(s11_k128_selftest_state & st, int kind, int n, int k, int tokens, int mt, bool pf,
+        const char * output, size_t output_token, cudaStream_t stream) {
+    CUDA_CHECK(cudaGetLastError());
+    CUDA_CHECK(cudaEventRecord(st.e2, stream));
+    unsigned long long * d_mismatches = nullptr;
+    CUDA_CHECK(cudaMalloc(reinterpret_cast<void **>(&d_mismatches), sizeof(unsigned long long)));
+    CUDA_CHECK(cudaMemsetAsync(d_mismatches, 0, sizeof(unsigned long long), stream));
+    s11_k128_selftest_cmp_kernel<<<dim3((n + 127) / 128, tokens), 128, 0, stream>>>(
+        st.ref, output, n, tokens, output_token, d_mismatches);
+    CUDA_CHECK(cudaGetLastError());
+    unsigned long long mismatches = 0;
+    CUDA_CHECK(cudaMemcpyAsync(&mismatches, d_mismatches, sizeof(mismatches), cudaMemcpyDeviceToHost, stream));
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+    float ref_ms = 0.0f;
+    float cand_ms = 0.0f;
+    CUDA_CHECK(cudaEventElapsedTime(&ref_ms, st.e0, st.e1));
+    CUDA_CHECK(cudaEventElapsedTime(&cand_ms, st.e1, st.e2));
+    fprintf(stderr, "s11_k128_selftest kind=%d n=%d k=%d tokens=%d mt=%d pf=%d mismatches=%llu ref_us=%.2f cand_us=%.2f\n",
+        kind, n, k, tokens, mt, pf ? 1 : 0, mismatches, 1000.0f * ref_ms, 1000.0f * cand_ms);
+    CUDA_CHECK(cudaFree(d_mismatches));
+    CUDA_CHECK(cudaFree(st.ref));
+    CUDA_CHECK(cudaEventDestroy(st.e0));
+    CUDA_CHECK(cudaEventDestroy(st.e1));
+    CUDA_CHECK(cudaEventDestroy(st.e2));
+    if (mismatches != 0) {
+        GGML_ABORT("s11_k128_selftest: %llu mismatches", mismatches);
+    }
+}
+#endif
+
+template <int TYPE>
+static void s11_launch_wmma_k128_prefill(
+        const char * weights, const signed char * q, const float * scales, char * output,
+        int k, int n, int tokens, size_t weight_row, size_t output_token, cudaStream_t stream) {
+    const int kind = TYPE == GGML_TYPE_S11_W4 ? S11_K128_KIND_W4 : S11_K128_KIND_W2_BF16;
+    const int mt = s11_k128_mt_for(kind, n, k, tokens, 4);
+    const bool pf = s11_k128_pf_for(k, mt);
+    const dim3 grid((n + 63) / 64, (tokens + 16 * mt - 1) / (16 * mt));
+#ifdef S11_K128_SELFTEST_BUILD
+    s11_k128_selftest_state st;
+    s11_k128_selftest_begin(st, size_t(tokens) * output_token, stream);
+    s11_wmma_k128_kernel<TYPE, 4><<<dim3((n + 63) / 64, (tokens + 63) / 64), 128, 0, stream>>>(
+        weights, q, scales, st.ref, k, n, tokens, weight_row, output_token);
+    CUDA_CHECK(cudaEventRecord(st.e1, stream));
+#endif
+    if (mt == 4) {
+        if (pf) {
+            s11_wmma_k128_pf_kernel<TYPE, 4><<<grid, 128, 0, stream>>>(
+                weights, q, scales, output, k, n, tokens, weight_row, output_token);
+        } else {
+            s11_wmma_k128_kernel<TYPE, 4><<<grid, 128, 0, stream>>>(
+                weights, q, scales, output, k, n, tokens, weight_row, output_token);
+        }
+    } else if (mt == 2) {
+        if (pf) {
+            s11_wmma_k128_pf_kernel<TYPE, 2><<<grid, 128, 0, stream>>>(
+                weights, q, scales, output, k, n, tokens, weight_row, output_token);
+        } else {
+            s11_wmma_k128_kernel<TYPE, 2><<<grid, 128, 0, stream>>>(
+                weights, q, scales, output, k, n, tokens, weight_row, output_token);
+        }
+    } else {
+        if (pf) {
+            s11_wmma_k128_pf_kernel<TYPE, 1><<<grid, 128, 0, stream>>>(
+                weights, q, scales, output, k, n, tokens, weight_row, output_token);
+        } else {
+            s11_wmma_k128_kernel<TYPE, 1><<<grid, 128, 0, stream>>>(
+                weights, q, scales, output, k, n, tokens, weight_row, output_token);
+        }
+    }
+#ifdef S11_K128_SELFTEST_BUILD
+    s11_k128_selftest_end(st, kind, n, k, tokens, mt, pf, output, output_token, stream);
+#endif
+}
+
+static void s11_launch_shexp_up_gate_k128_prefill(
+        const char * up_weights, const char * gate_weights, const signed char * q, const float * scales,
+        char * output, int k, int n, int tokens, size_t weight_row, size_t output_token, cudaStream_t stream) {
+    const int mt = s11_k128_mt_for(S11_K128_KIND_SHEXP, n, k, tokens, 2);
+    const bool pf = s11_k128_pf_for(k, mt);
+    const dim3 grid((n + 63) / 64, (tokens + 16 * mt - 1) / (16 * mt));
+#ifdef S11_K128_SELFTEST_BUILD
+    s11_k128_selftest_state st;
+    s11_k128_selftest_begin(st, size_t(tokens) * output_token, stream);
+    s11_shexp_up_gate_swiglu_wmma_k128_kernel<2><<<dim3((n + 63) / 64, (tokens + 31) / 32), 128, 0, stream>>>(
+        up_weights, gate_weights, q, scales, st.ref, k, n, tokens, weight_row, output_token);
+    CUDA_CHECK(cudaEventRecord(st.e1, stream));
+#endif
+    if (mt == 2) {
+        if (pf) {
+            s11_shexp_up_gate_swiglu_wmma_k128_pf_kernel<2><<<grid, 128, 0, stream>>>(
+                up_weights, gate_weights, q, scales, output, k, n, tokens, weight_row, output_token);
+        } else {
+            s11_shexp_up_gate_swiglu_wmma_k128_kernel<2><<<grid, 128, 0, stream>>>(
+                up_weights, gate_weights, q, scales, output, k, n, tokens, weight_row, output_token);
+        }
+    } else {
+        if (pf) {
+            s11_shexp_up_gate_swiglu_wmma_k128_pf_kernel<1><<<grid, 128, 0, stream>>>(
+                up_weights, gate_weights, q, scales, output, k, n, tokens, weight_row, output_token);
+        } else {
+            s11_shexp_up_gate_swiglu_wmma_k128_kernel<1><<<grid, 128, 0, stream>>>(
+                up_weights, gate_weights, q, scales, output, k, n, tokens, weight_row, output_token);
+        }
+    }
+#ifdef S11_K128_SELFTEST_BUILD
+    s11_k128_selftest_end(st, S11_K128_KIND_SHEXP, n, k, tokens, mt, pf, output, output_token, stream);
+#endif
 }
 
 bool ggml_cuda_s11_bf16_head(const ggml_tensor * tensor) {
@@ -1376,9 +2464,17 @@ static __global__ void s11_head_bf16(const nv_bfloat16 * weights, const char * i
 
 static __global__ void __launch_bounds__(256) s11_head_bf16_m1(
         const nv_bfloat16 * __restrict__ weights, const char * __restrict__ input,
-        char * __restrict__ output, int n) {
+        char * __restrict__ output, int n, int n_active) {
     __shared__ __align__(16) float x_sh[2048];
     const int t = threadIdx.x;
+    const int lane = t % 32;
+    const int row = blockIdx.x * 8 + t / 32;
+    if (blockIdx.x * 8 >= n_active) {
+        if (row < n && !lane) {
+            *reinterpret_cast<float *>(output + size_t(row) * sizeof(float)) = -1e30f;
+        }
+        return;
+    }
     const float4 * x_in4 = reinterpret_cast<const float4 *>(input);
     float4 * x_sh4 = reinterpret_cast<float4 *>(x_sh);
     #pragma unroll
@@ -1393,9 +2489,10 @@ static __global__ void __launch_bounds__(256) s11_head_bf16_m1(
     }
     __syncthreads();
 
-    const int lane = t % 32;
-    const int row = blockIdx.x * 8 + t / 32;
-    if (row >= n) {
+    if (row >= n_active) {
+        if (row < n && !lane) {
+            *reinterpret_cast<float *>(output + size_t(row) * sizeof(float)) = -1e30f;
+        }
         return;
     }
     const nv_bfloat16 * w_row = weights + size_t(row) * 2048;
@@ -1428,6 +2525,85 @@ static __global__ void __launch_bounds__(256) s11_head_bf16_m1(
     }
 }
 
+template <int COLS>
+static __global__ void __launch_bounds__(256) s11_head_bf16_multi(
+        const nv_bfloat16 * __restrict__ weights, const char * __restrict__ input,
+        char * __restrict__ output, int n, int tokens,
+        size_t input_stride, size_t output_stride) {
+    __shared__ __align__(16) float x_sh[COLS][1024];
+    const int t = threadIdx.x;
+    const int lane = t % 32;
+    const int row = blockIdx.x * 8 + t / 32;
+    const nv_bfloat16 * w_row = (row < n) ? (weights + size_t(row) * 2048) : nullptr;
+    float sums[COLS] = {};
+
+    for (int half_k = 0; half_k < 2048; half_k += 1024) {
+        #pragma unroll
+        for (int c = 0; c < COLS; ++c) {
+            float4 * x_sh4 = reinterpret_cast<float4 *>(x_sh[c]);
+            if (c < tokens) {
+                const float4 * x_in4 = reinterpret_cast<const float4 *>(
+                    reinterpret_cast<const float *>(input + size_t(c) * input_stride) + half_k);
+                float4 v = x_in4[t];
+                v.x = s11_bf16(v.x);
+                v.y = s11_bf16(v.y);
+                v.z = s11_bf16(v.z);
+                v.w = s11_bf16(v.w);
+                x_sh4[t] = v;
+            } else {
+                x_sh4[t] = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+            }
+        }
+        __syncthreads();
+
+        if (row < n) {
+            #pragma unroll 4
+            for (int base = 0; base < 1024; base += 256) {
+                const int col = base + lane * 8;
+                const uint4 w8 = *reinterpret_cast<const uint4 *>(w_row + half_k + col);
+                const nv_bfloat162 * w2 = reinterpret_cast<const nv_bfloat162 *>(&w8);
+                const float2 f0 = __bfloat1622float2(w2[0]);
+                const float2 f1 = __bfloat1622float2(w2[1]);
+                const float2 f2 = __bfloat1622float2(w2[2]);
+                const float2 f3 = __bfloat1622float2(w2[3]);
+                #pragma unroll
+                for (int c = 0; c < COLS; ++c) {
+                    const float4 x_lo = *reinterpret_cast<const float4 *>(x_sh[c] + col);
+                    const float4 x_hi = *reinterpret_cast<const float4 *>(x_sh[c] + col + 4);
+                    sums[c] = __fadd_rn(sums[c], __fmul_rn(x_lo.x, f0.x));
+                    sums[c] = __fadd_rn(sums[c], __fmul_rn(x_lo.y, f0.y));
+                    sums[c] = __fadd_rn(sums[c], __fmul_rn(x_lo.z, f1.x));
+                    sums[c] = __fadd_rn(sums[c], __fmul_rn(x_lo.w, f1.y));
+                    sums[c] = __fadd_rn(sums[c], __fmul_rn(x_hi.x, f2.x));
+                    sums[c] = __fadd_rn(sums[c], __fmul_rn(x_hi.y, f2.y));
+                    sums[c] = __fadd_rn(sums[c], __fmul_rn(x_hi.z, f3.x));
+                    sums[c] = __fadd_rn(sums[c], __fmul_rn(x_hi.w, f3.y));
+                }
+            }
+        }
+        __syncthreads();
+    }
+    if (row >= n) {
+        return;
+    }
+    for (int offset = 16; offset > 0; offset /= 2) {
+        #pragma unroll
+        for (int c = 0; c < COLS; ++c) {
+            sums[c] = __fadd_rn(sums[c], __shfl_down_sync(0xffffffff, sums[c], offset));
+        }
+    }
+    if (!lane) {
+        #pragma unroll
+        for (int c = 0; c < COLS; ++c) {
+            if (c < tokens) {
+                *reinterpret_cast<float *>(output + size_t(c) * output_stride + size_t(row) * sizeof(float)) = s11_bf16(sums[c]);
+            }
+        }
+    }
+}
+
+static bool s11_tensors_overlap(const ggml_tensor * a, const ggml_tensor * b);
+
 void ggml_cuda_s11_mul_mat(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const ggml_tensor * w = dst->src[0];
     const ggml_tensor * x = dst->src[1];
@@ -1442,10 +2618,29 @@ void ggml_cuda_s11_mul_mat(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const int optimization = s11_optimization();
     if (ggml_cuda_s11_bf16_head(w)) {
         GGML_ASSERT(!ids && !w->view_src);
+        // op_params[14] shortlists the head rows (MTP draft heads only); the multi-token paths leave the rows past it unwritten
+        const int n_active = (dst->op_params[14] > 0 && dst->op_params[14] < w->ne[1])
+            ? dst->op_params[14] : int(w->ne[1]);
         if (tokens == 1 && optimization >= 2 && k == 2048) {
             s11_head_bf16_m1<<<dim3((w->ne[1] + 7) / 8, 1), 256, 0, ctx.stream()>>>(
                 static_cast<const nv_bfloat16 *>(w->data), static_cast<const char *>(x->data),
-                static_cast<char *>(dst->data), w->ne[1]);
+                static_cast<char *>(dst->data), w->ne[1], n_active);
+        } else if (tokens == 2 && optimization >= 2 && k == 2048) {
+            s11_head_bf16_multi<2><<<dim3((n_active + 7) / 8, 1), 256, 0, ctx.stream()>>>(
+                static_cast<const nv_bfloat16 *>(w->data), static_cast<const char *>(x->data),
+                static_cast<char *>(dst->data), n_active, tokens, x->nb[1], dst->nb[1]);
+        } else if (tokens > 2 && tokens <= 4 && optimization >= 2 && k == 2048) {
+            s11_head_bf16_multi<4><<<dim3((n_active + 7) / 8, 1), 256, 0, ctx.stream()>>>(
+                static_cast<const nv_bfloat16 *>(w->data), static_cast<const char *>(x->data),
+                static_cast<char *>(dst->data), n_active, tokens, x->nb[1], dst->nb[1]);
+        } else if (tokens > 4 && tokens <= 6 && optimization >= 2 && k == 2048) {
+            s11_head_bf16_multi<6><<<dim3((n_active + 7) / 8, 1), 256, 0, ctx.stream()>>>(
+                static_cast<const nv_bfloat16 *>(w->data), static_cast<const char *>(x->data),
+                static_cast<char *>(dst->data), n_active, tokens, x->nb[1], dst->nb[1]);
+        } else if (tokens > 6 && tokens <= 8 && optimization >= 2 && k == 2048) {
+            s11_head_bf16_multi<8><<<dim3((n_active + 7) / 8, 1), 256, 0, ctx.stream()>>>(
+                static_cast<const nv_bfloat16 *>(w->data), static_cast<const char *>(x->data),
+                static_cast<char *>(dst->data), n_active, tokens, x->nb[1], dst->nb[1]);
         } else {
             s11_head_bf16<<<dim3((w->ne[1] + 3) / 4, tokens), 128, 0, ctx.stream()>>>(
                 static_cast<const nv_bfloat16 *>(w->data), static_cast<const char *>(x->data), static_cast<char *>(dst->data),
@@ -1459,6 +2654,7 @@ void ggml_cuda_s11_mul_mat(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
 
     signed char * q_ptr = nullptr;
     float * scales_ptr = nullptr;
+    const float * inline_x_f32 = nullptr;
     ggml_cuda_pool_alloc<signed char> q_fallback(ctx.pool());
     ggml_cuda_pool_alloc<float> scales_fallback(ctx.pool());
 
@@ -1486,7 +2682,14 @@ void ggml_cuda_s11_mul_mat(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
                                    (g_s11_state.last_k[buf_idx] == k) &&
                                    (g_s11_state.last_tokens[buf_idx] == tokens) &&
                                    (g_s11_state.last_input_slots[buf_idx] == input_slots);
-            if (!can_reuse) {
+            const bool inline_quant_m1 = !can_reuse &&
+                                         w->type == GGML_TYPE_S11_W2_BF16 &&
+                                         !ids && tokens >= 1 && tokens <= 8 && input_slots == 1 && k == 512 &&
+                                         ggml_is_contiguous(x) && !s11_tensors_overlap(dst, x);
+            if (inline_quant_m1) {
+                inline_x_f32 = static_cast<const float *>(x->data);
+                g_s11_state.last_x_data[buf_idx] = nullptr;
+            } else if (!can_reuse) {
                 s11_quantize<<<dim3(k / 128, tokens * input_slots), 32, 0, ctx.stream()>>>(
                     static_cast<const char *>(x->data), q_ptr, scales_ptr, nullptr, k,
                     input_slots, tokens, ids ? x->nb[1] : 0, ids ? x->nb[2] : x->nb[1]);
@@ -1549,17 +2752,50 @@ void ggml_cuda_s11_mul_mat(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
                     }
                     const int m = tokens * slots;
                     const int max_tiles = std::min(m, (m + 15) / 16 + std::min(m, 256));
-                    s11_routed_wmma_k128_kernel<<<dim3((w->ne[1] + 63) / 64, max_tiles), 128, 0, ctx.stream()>>>(
-                        static_cast<const char *>(w->data), q_ptr, scales_ptr,
-                        tile_experts, tile_starts, tile_counts, sorted_assn, num_tiles,
-                        static_cast<char *>(dst->data), k, w->ne[1], slots, input_slots,
-                        w->nb[1], w->nb[2], dst->nb[1], dst->nb[2]);
+                    const bool pipe_down = s11_routed_pipe() && k == 512 && w->nb[1] == 144 && w->ne[1] % 64 == 0 &&
+                                           s11_routed_pipe_device_weights(w);
+                    if (pipe_down) {
+                        const bool want_smem = s11_routed_pipe_down_smem();
+                        const bool aligned16 = reinterpret_cast<uintptr_t>(w->data) % 16 == 0 &&
+                                               reinterpret_cast<uintptr_t>(q_ptr) % 16 == 0 &&
+                                               w->nb[1] % 16 == 0 && w->nb[2] % 16 == 0;
+                        if (want_smem && !aligned16) {
+                            static bool logged = false;
+                            if (!logged) {
+                                logged = true;
+                                fprintf(stderr, "s11: S11_ROUTED_PIPE_DOWN=smem requires 16-B aligned operands; using the register variant\n");
+                            }
+                        }
+                        if (want_smem && aligned16) {
+                            s11_routed_wmma_k128_pipe_kernel<true><<<dim3((w->ne[1] + 63) / 64, max_tiles), 128, 0, ctx.stream()>>>(
+                                static_cast<const char *>(w->data), q_ptr, scales_ptr,
+                                tile_experts, tile_starts, tile_counts, sorted_assn, num_tiles,
+                                static_cast<char *>(dst->data), k, w->ne[1], slots, input_slots,
+                                w->nb[1], w->nb[2], dst->nb[1], dst->nb[2]);
+                        } else {
+                            s11_routed_wmma_k128_pipe_kernel<false><<<dim3((w->ne[1] + 63) / 64, max_tiles), 128, 0, ctx.stream()>>>(
+                                static_cast<const char *>(w->data), q_ptr, scales_ptr,
+                                tile_experts, tile_starts, tile_counts, sorted_assn, num_tiles,
+                                static_cast<char *>(dst->data), k, w->ne[1], slots, input_slots,
+                                w->nb[1], w->nb[2], dst->nb[1], dst->nb[2]);
+                        }
+                    } else {
+                        s11_routed_wmma_k128_kernel<<<dim3((w->ne[1] + 63) / 64, max_tiles), 128, 0, ctx.stream()>>>(
+                            static_cast<const char *>(w->data), q_ptr, scales_ptr,
+                            tile_experts, tile_starts, tile_counts, sorted_assn, num_tiles,
+                            static_cast<char *>(dst->data), k, w->ne[1], slots, input_slots,
+                            w->nb[1], w->nb[2], dst->nb[1], dst->nb[2]);
+                    }
                 } else {
                     S11_PACKED_LAUNCH(GGML_TYPE_S11_W2, 1);
                 }
                 break;
             case GGML_TYPE_S11_W2_BF16:
-                if (optimization == 2 && !ids && tokens >= 32) {
+                if (optimization == 2 && !ids && tokens >= 64) {
+                    s11_launch_wmma_k128_prefill<GGML_TYPE_S11_W2_BF16>(
+                        static_cast<const char *>(w->data), q_ptr, scales_ptr, static_cast<char *>(dst->data),
+                        k, int(w->ne[1]), tokens, w->nb[1], dst->nb[1], ctx.stream());
+                } else if (optimization == 2 && !ids && tokens >= 32) {
                     s11_wmma_k128_kernel<GGML_TYPE_S11_W2_BF16, 2><<<dim3((w->ne[1] + 63) / 64, (tokens + 31) / 32), 128, 0, ctx.stream()>>>(
                         static_cast<const char *>(w->data), q_ptr, scales_ptr, static_cast<char *>(dst->data),
                         k, w->ne[1], tokens, w->nb[1], dst->nb[1]);
@@ -1567,16 +2803,36 @@ void ggml_cuda_s11_mul_mat(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
                     s11_wmma_k128_kernel<GGML_TYPE_S11_W2_BF16, 1><<<dim3((w->ne[1] + 63) / 64, (tokens + 15) / 16), 128, 0, ctx.stream()>>>(
                         static_cast<const char *>(w->data), q_ptr, scales_ptr, static_cast<char *>(dst->data),
                         k, w->ne[1], tokens, w->nb[1], dst->nb[1]);
-                } else if (optimization == 2 && !ids && tokens >= 8) { S11_PACKED_LAUNCH(GGML_TYPE_S11_W2_BF16, 8); }
-                else if (optimization == 2 && !ids && tokens >= 4) { S11_PACKED_LAUNCH(GGML_TYPE_S11_W2_BF16, 4); }
-                else if (optimization == 2 && !ids && tokens == 1 && (k % 512 == 0) && k <= 4096) {
+                } else if (optimization == 2 && !ids && tokens == 1 && (k % 512 == 0) && k <= 2048) {
                     s11_projection_packed_m1<GGML_TYPE_S11_W2_BF16><<<dim3((w->ne[1] + 7) / 8, 1), 256, 0, ctx.stream()>>>(
                         static_cast<const char *>(w->data), q_ptr, scales_ptr, static_cast<char *>(dst->data),
-                        k, w->ne[1], w->nb[1]);
-                } else { S11_PACKED_LAUNCH(GGML_TYPE_S11_W2_BF16, 1); }
+                        k, w->ne[1], w->nb[1], inline_x_f32);
+                } else if (optimization == 2 && !ids && tokens == 2 && (k % 512 == 0) && k <= 2048) {
+                    s11_projection_packed_multi<GGML_TYPE_S11_W2_BF16, 2><<<dim3((w->ne[1] + 7) / 8, 1), 256, 0, ctx.stream()>>>(
+                        static_cast<const char *>(w->data), q_ptr, scales_ptr, static_cast<char *>(dst->data),
+                        k, w->ne[1], tokens, w->nb[1], dst->nb[1], inline_x_f32, x->nb[1]);
+                } else if (optimization == 2 && !ids && tokens > 2 && tokens <= 4 && (k % 512 == 0) && k <= 2048) {
+                    s11_projection_packed_multi<GGML_TYPE_S11_W2_BF16, 4><<<dim3((w->ne[1] + 7) / 8, 1), 256, 0, ctx.stream()>>>(
+                        static_cast<const char *>(w->data), q_ptr, scales_ptr, static_cast<char *>(dst->data),
+                        k, w->ne[1], tokens, w->nb[1], dst->nb[1], inline_x_f32, x->nb[1]);
+                } else if (optimization == 2 && !ids && tokens > 4 && tokens <= 6 && (k % 512 == 0) && k <= 2048) {
+                    s11_projection_packed_multi<GGML_TYPE_S11_W2_BF16, 6><<<dim3((w->ne[1] + 7) / 8, 1), 256, 0, ctx.stream()>>>(
+                        static_cast<const char *>(w->data), q_ptr, scales_ptr, static_cast<char *>(dst->data),
+                        k, w->ne[1], tokens, w->nb[1], dst->nb[1], inline_x_f32, x->nb[1]);
+                } else if (optimization == 2 && !ids && tokens > 6 && tokens <= 8 && (k % 512 == 0) && k <= 2048) {
+                    s11_projection_packed_multi<GGML_TYPE_S11_W2_BF16, 8><<<dim3((w->ne[1] + 7) / 8, 1), 256, 0, ctx.stream()>>>(
+                        static_cast<const char *>(w->data), q_ptr, scales_ptr, static_cast<char *>(dst->data),
+                        k, w->ne[1], tokens, w->nb[1], dst->nb[1], inline_x_f32, x->nb[1]);
+                } else if (optimization == 2 && !ids && tokens >= 8) { S11_PACKED_LAUNCH(GGML_TYPE_S11_W2_BF16, 8); }
+                else if (optimization == 2 && !ids && tokens >= 4) { S11_PACKED_LAUNCH(GGML_TYPE_S11_W2_BF16, 4); }
+                else { S11_PACKED_LAUNCH(GGML_TYPE_S11_W2_BF16, 1); }
                 break;
             case GGML_TYPE_S11_W4:
-                if (optimization == 2 && !ids && tokens >= 32) {
+                if (optimization == 2 && !ids && tokens >= 64) {
+                    s11_launch_wmma_k128_prefill<GGML_TYPE_S11_W4>(
+                        static_cast<const char *>(w->data), q_ptr, scales_ptr, static_cast<char *>(dst->data),
+                        k, int(w->ne[1]), tokens, w->nb[1], dst->nb[1], ctx.stream());
+                } else if (optimization == 2 && !ids && tokens >= 32) {
                     s11_wmma_k128_kernel<GGML_TYPE_S11_W4, 2><<<dim3((w->ne[1] + 63) / 64, (tokens + 31) / 32), 128, 0, ctx.stream()>>>(
                         static_cast<const char *>(w->data), q_ptr, scales_ptr, static_cast<char *>(dst->data),
                         k, w->ne[1], tokens, w->nb[1], dst->nb[1]);
@@ -1584,13 +2840,29 @@ void ggml_cuda_s11_mul_mat(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
                     s11_wmma_k128_kernel<GGML_TYPE_S11_W4, 1><<<dim3((w->ne[1] + 63) / 64, (tokens + 15) / 16), 128, 0, ctx.stream()>>>(
                         static_cast<const char *>(w->data), q_ptr, scales_ptr, static_cast<char *>(dst->data),
                         k, w->ne[1], tokens, w->nb[1], dst->nb[1]);
-                } else if (optimization == 2 && !ids && tokens >= 8) { S11_PACKED_LAUNCH(GGML_TYPE_S11_W4, 8); }
-                else if (optimization == 2 && !ids && tokens >= 4) { S11_PACKED_LAUNCH(GGML_TYPE_S11_W4, 4); }
-                else if (optimization == 2 && !ids && tokens == 1 && (k % 512 == 0) && k <= 4096) {
+                } else if (optimization == 2 && !ids && tokens == 1 && (k % 512 == 0) && k <= 4096) {
                     s11_projection_packed_m1<GGML_TYPE_S11_W4><<<dim3((w->ne[1] + 7) / 8, 1), 256, 0, ctx.stream()>>>(
                         static_cast<const char *>(w->data), q_ptr, scales_ptr, static_cast<char *>(dst->data),
                         k, w->ne[1], w->nb[1]);
-                } else { S11_PACKED_LAUNCH(GGML_TYPE_S11_W4, 1); }
+                } else if (optimization == 2 && !ids && tokens == 2 && (k % 512 == 0) && k <= 4096) {
+                    s11_projection_packed_multi<GGML_TYPE_S11_W4, 2><<<dim3((w->ne[1] + 7) / 8, 1), 256, 0, ctx.stream()>>>(
+                        static_cast<const char *>(w->data), q_ptr, scales_ptr, static_cast<char *>(dst->data),
+                        k, w->ne[1], tokens, w->nb[1], dst->nb[1]);
+                } else if (optimization == 2 && !ids && tokens > 2 && tokens <= 4 && (k % 512 == 0) && k <= 4096) {
+                    s11_projection_packed_multi<GGML_TYPE_S11_W4, 4><<<dim3((w->ne[1] + 7) / 8, 1), 256, 0, ctx.stream()>>>(
+                        static_cast<const char *>(w->data), q_ptr, scales_ptr, static_cast<char *>(dst->data),
+                        k, w->ne[1], tokens, w->nb[1], dst->nb[1]);
+                } else if (optimization == 2 && !ids && tokens > 4 && tokens <= 6 && (k % 512 == 0) && k <= 4096) {
+                    s11_projection_packed_multi<GGML_TYPE_S11_W4, 6><<<dim3((w->ne[1] + 7) / 8, 1), 256, 0, ctx.stream()>>>(
+                        static_cast<const char *>(w->data), q_ptr, scales_ptr, static_cast<char *>(dst->data),
+                        k, w->ne[1], tokens, w->nb[1], dst->nb[1]);
+                } else if (optimization == 2 && !ids && tokens > 6 && tokens <= 8 && (k % 512 == 0) && k <= 4096) {
+                    s11_projection_packed_multi<GGML_TYPE_S11_W4, 8><<<dim3((w->ne[1] + 7) / 8, 1), 256, 0, ctx.stream()>>>(
+                        static_cast<const char *>(w->data), q_ptr, scales_ptr, static_cast<char *>(dst->data),
+                        k, w->ne[1], tokens, w->nb[1], dst->nb[1]);
+                } else if (optimization == 2 && !ids && tokens >= 8) { S11_PACKED_LAUNCH(GGML_TYPE_S11_W4, 8); }
+                else if (optimization == 2 && !ids && tokens >= 4) { S11_PACKED_LAUNCH(GGML_TYPE_S11_W4, 4); }
+                else { S11_PACKED_LAUNCH(GGML_TYPE_S11_W4, 1); }
                 break;
             case GGML_TYPE_S11_I8: S11_PACKED_LAUNCH(GGML_TYPE_S11_I8, 1); break;
             default: GGML_ABORT("Unsupported S11 packed type");
@@ -1606,6 +2878,43 @@ void ggml_cuda_s11_mul_mat(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
         ids ? dst->nb[1] : 0, ids ? dst->nb[2] : dst->nb[1]);
     }
     CUDA_CHECK(cudaGetLastError());
+}
+
+static __global__ void __launch_bounds__(256) s11_rms_norm_k256_offset_bf16_kernel(
+        const char * __restrict__ x, const nv_bfloat16 * __restrict__ mw, float * __restrict__ dst,
+        int ne1, int ne2, size_t nb1, size_t nb2, size_t nb3,
+        float eps, float scale, float bias) {
+    const int row = blockIdx.x;
+    const int i1 = row % ne1;
+    const int i2 = (row / ne1) % ne2;
+    const int i3 = row / (ne1 * ne2);
+    const float * x_row = reinterpret_cast<const float *>(x + size_t(i1) * nb1 + size_t(i2) * nb2 + size_t(i3) * nb3);
+    float * y_row = dst + size_t(row) * 256;
+
+    __shared__ float warp_sums[8];
+
+    const float v_reg = x_row[threadIdx.x];
+    float sum_sq = __fadd_rn(0.0f, __fmul_rn(v_reg, v_reg));
+    for (int offset = 16; offset > 0; offset /= 2) {
+        sum_sq = __fadd_rn(sum_sq, __shfl_down_sync(0xffffffff, sum_sq, offset));
+    }
+    if ((threadIdx.x & 31) == 0) {
+        warp_sums[threadIdx.x / 32] = sum_sq;
+    }
+    __syncthreads();
+    if (threadIdx.x < 32) {
+        float total = (threadIdx.x < 8) ? warp_sums[threadIdx.x] : 0.0f;
+        for (int offset = 4; offset > 0; offset /= 2) {
+            total = __fadd_rn(total, __shfl_down_sync(0xffffffff, total, offset));
+        }
+        if (threadIdx.x == 0) {
+            warp_sums[0] = rsqrtf(total / 256.0f + eps);
+        }
+    }
+    __syncthreads();
+    const float inv_rms = warp_sums[0];
+    const float w = __fadd_rn(__fmul_rn(__bfloat162float(mw[threadIdx.x]), scale), bias);
+    y_row[threadIdx.x] = s11_bf16(__fmul_rn(__fmul_rn(v_reg, inv_rms), w));
 }
 
 static __global__ void __launch_bounds__(256) s11_rms_norm_offset_bf16_kernel(
@@ -1775,6 +3084,56 @@ static __global__ void __launch_bounds__(256) s11_rms_norm_offset_bf16_kernel(
         const float val = __fmul_rn(__fmul_rn(x_row[col], inv_rms), w);
         y_row[col] = s11_bf16(val);
     }
+}
+
+static __global__ void __launch_bounds__(256) s11_fa_qk_rms_norm_k256_kernel(
+        const char * __restrict__ q_full, size_t q_nb1, size_t q_nb2,
+        const float * __restrict__ k_src,
+        const nv_bfloat16 * __restrict__ q_mw,
+        const nv_bfloat16 * __restrict__ k_mw,
+        float * __restrict__ q_dst,
+        float * __restrict__ k_dst,
+        float eps_q, float q_scale, float q_bias,
+        float eps_k, float k_scale, float k_bias) {
+    const int head_idx = blockIdx.x; // 0..15: Q heads, 16..17: K heads
+    const int token    = blockIdx.y;
+    const int t        = threadIdx.x; // 0..255
+
+    const bool is_q = (head_idx < 16);
+    const float * x_row = is_q
+        ? reinterpret_cast<const float *>(q_full + size_t(token) * q_nb2 + size_t(head_idx) * q_nb1)
+        : (k_src + (size_t(token) * 2 + size_t(head_idx - 16)) * 256);
+    float * y_row = is_q
+        ? (q_dst + (size_t(token) * 16 + size_t(head_idx)) * 256)
+        : (k_dst + (size_t(token) * 2 + size_t(head_idx - 16)) * 256);
+    const nv_bfloat16 * mw = is_q ? q_mw : k_mw;
+    const float eps   = is_q ? eps_q   : eps_k;
+    const float scale = is_q ? q_scale : k_scale;
+    const float bias  = is_q ? q_bias  : k_bias;
+
+    __shared__ float warp_sums[8];
+    const float v_reg = x_row[t];
+    float sum_sq = __fadd_rn(0.0f, __fmul_rn(v_reg, v_reg));
+    for (int offset = 16; offset > 0; offset /= 2) {
+        sum_sq = __fadd_rn(sum_sq, __shfl_down_sync(0xffffffff, sum_sq, offset));
+    }
+    if ((t & 31) == 0) {
+        warp_sums[t / 32] = sum_sq;
+    }
+    __syncthreads();
+    if (t < 32) {
+        float total = (t < 8) ? warp_sums[t] : 0.0f;
+        for (int offset = 4; offset > 0; offset /= 2) {
+            total = __fadd_rn(total, __shfl_down_sync(0xffffffff, total, offset));
+        }
+        if (t == 0) {
+            warp_sums[0] = rsqrtf(total / 256.0f + eps);
+        }
+    }
+    __syncthreads();
+    const float inv_rms = warp_sums[0];
+    const float w = __fadd_rn(__fmul_rn(__bfloat162float(mw[t]), scale), bias);
+    y_row[t] = s11_bf16(__fmul_rn(__fmul_rn(v_reg, inv_rms), w));
 }
 
 static __global__ void __launch_bounds__(256) s11_residual_rms_norm_quant_fused_kernel(
@@ -2466,6 +3825,149 @@ static __global__ void __launch_bounds__(128) s11_gdn_alpha_beta_gate_fused_kern
     }
 }
 
+static __global__ void __launch_bounds__(128) s11_gdn_state_conv_silu_l2norm_fused_kernel(
+        const float * __restrict__ conv_states,
+        const float * __restrict__ qkv_mixed,
+        const nv_bfloat16 * __restrict__ w_bf16,
+        float * __restrict__ state_dst,
+        float * __restrict__ conv_mix_dst,
+        float * __restrict__ q_dst,
+        float * __restrict__ k_dst,
+        float eps, float q_scale, float k_scale, int64_t n_t) {
+    const int tid  = threadIdx.x; // 0..127
+    const int bidx = blockIdx.x;  // sequence 0..n_s-1
+    const int bidy = blockIdx.y;  // 0..63 (128 channels each)
+    const int bidz = blockIdx.z;  // token chunk of 32
+    const int c    = bidy * 128 + tid;
+    const int64_t t_start   = int64_t(bidz) * 32;
+    const int64_t local_n_t = min(int64_t(32), n_t - t_start);
+
+    __shared__ float state_sh[384];
+    __shared__ float warp_sums[4];
+
+    const nv_bfloat16 * w_block = w_bf16 + size_t(c) * 4;
+    float w[4];
+    #pragma unroll
+    for (int j = 0; j < 4; ++j) {
+        w[j] = __bfloat162float(w_block[j]);
+    }
+
+    float x[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    if (bidz == 0) {
+        const float * cs_block = conv_states + (size_t(bidx) * 8192 + size_t(bidy) * 128) * 3;
+        state_sh[tid]       = cs_block[tid];
+        state_sh[tid + 128] = cs_block[tid + 128];
+        state_sh[tid + 256] = cs_block[tid + 256];
+        __syncthreads();
+        x[0] = state_sh[tid * 3 + 0];
+        x[1] = state_sh[tid * 3 + 1];
+        x[2] = state_sh[tid * 3 + 2];
+    } else {
+        #pragma unroll
+        for (int k = 0; k < 3; ++k) {
+            const int64_t pos = t_start - 3 + k;
+            x[k] = qkv_mixed[(size_t(bidx) * size_t(n_t) + size_t(pos)) * 8192 + c];
+        }
+    }
+
+    for (int64_t i = 0; i < local_n_t; ++i) {
+        const int64_t cur_t = t_start + i;
+        const size_t token  = size_t(bidx) * size_t(n_t) + size_t(cur_t);
+        x[(i + 3) & 3] = qkv_mixed[token * 8192 + c];
+
+        float sumf = 0.0f;
+        #pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            sumf = __fadd_rn(sumf, __fmul_rn(x[(i + j) & 3], w[j]));
+        }
+        const float silu_v = sumf / (1.0f + expf(-sumf));
+        const float v = s11_bf16(silu_v);
+        conv_mix_dst[token * 8192 + c] = v;
+        if (bidy < 32) {
+            float sum_sq = __fmul_rn(v, v);
+            for (int offset = 16; offset > 0; offset /= 2) {
+                sum_sq = __fadd_rn(sum_sq, __shfl_down_sync(0xffffffff, sum_sq, offset));
+            }
+            if ((tid & 31) == 0) {
+                warp_sums[tid / 32] = sum_sq;
+            }
+            __syncthreads();
+            if (tid < 32) {
+                float total = (tid < 4) ? warp_sums[tid] : 0.0f;
+                for (int offset = 16; offset > 0; offset /= 2) {
+                    total = __fadd_rn(total, __shfl_down_sync(0xffffffff, total, offset));
+                }
+                if (tid == 0) {
+                    warp_sums[0] = rsqrtf(total / 128.0f + eps);
+                }
+            }
+            __syncthreads();
+            const float inv_rms = warp_sums[0];
+            const float sc = (bidy < 16) ? q_scale : k_scale;
+            const float out_val = s11_bf16(__fmul_rn(__fmul_rn(v, inv_rms), sc));
+            if (bidy < 16) {
+                q_dst[token * 2048 + size_t(bidy) * 128 + tid] = out_val;
+            } else {
+                k_dst[token * 2048 + size_t(bidy - 16) * 128 + tid] = out_val;
+            }
+            __syncthreads();
+        }
+    }
+
+    if (bidz == int(gridDim.z) - 1 && state_dst) {
+        __syncthreads();
+        #pragma unroll
+        for (int k = 0; k < 3; ++k) {
+            state_sh[tid * 3 + k] = x[(local_n_t + k) & 3];
+        }
+        __syncthreads();
+        float * dst_block = state_dst + (size_t(bidx) * 8192 + size_t(bidy) * 128) * 3;
+        dst_block[tid]       = state_sh[tid];
+        dst_block[tid + 128] = state_sh[tid + 128];
+        dst_block[tid + 256] = state_sh[tid + 256];
+    }
+}
+
+static __global__ void __launch_bounds__(256) s11_fa_qkv_round_set_rows_f16_kernel(
+        const float * __restrict__ q_src,
+        const float * __restrict__ k_src,
+        const float * __restrict__ v_src,
+        float * __restrict__ q_dst,
+        float * __restrict__ k_round_dst,
+        char * __restrict__ k_cache,
+        char * __restrict__ v_cache,
+        const int64_t * __restrict__ k_idxs,
+        const int64_t * __restrict__ v_idxs,
+        size_t k_cache_nb1, size_t v_cache_nb1) {
+    const int bidx  = blockIdx.x; // 0..7: Q round (4096 floats), 8: K round + cache, 9: V cache
+    const int token = blockIdx.y;
+    const int t     = threadIdx.x; // 0..255, 2 elements per thread = 512 elements per block
+    const int c0    = t * 2;
+    if (bidx < 8) {
+        const size_t idx = size_t(token) * 4096 + size_t(bidx) * 512 + c0;
+        q_dst[idx + 0] = s11_bf16(q_src[idx + 0]);
+        q_dst[idx + 1] = s11_bf16(q_src[idx + 1]);
+    } else if (bidx == 8) {
+        const size_t src_idx = size_t(token) * 512 + c0;
+        const float x0 = s11_bf16(k_src[src_idx + 0]);
+        const float x1 = s11_bf16(k_src[src_idx + 1]);
+        if (k_round_dst) {
+            k_round_dst[src_idx + 0] = x0;
+            k_round_dst[src_idx + 1] = x1;
+        }
+        const int64_t dst_row = k_idxs[token];
+        half2 * dst_h2 = reinterpret_cast<half2 *>(k_cache + size_t(dst_row) * k_cache_nb1 + size_t(c0) * sizeof(half));
+        *dst_h2 = __floats2half2_rn(x0, x1);
+    } else {
+        const size_t src_idx = size_t(token) * 512 + c0;
+        const float x0 = v_src[src_idx + 0];
+        const float x1 = v_src[src_idx + 1];
+        const int64_t dst_row = v_idxs[token];
+        half2 * dst_h2 = reinterpret_cast<half2 *>(v_cache + size_t(dst_row) * v_cache_nb1 + size_t(c0) * sizeof(half));
+        *dst_h2 = __floats2half2_rn(x0, x1);
+    }
+}
+
 static __global__ void __launch_bounds__(256) s11_fa_kv_round_set_rows_f16_kernel(
         const float * __restrict__ k_cur, const float * __restrict__ v_cur,
         float * __restrict__ k_round_dst,
@@ -2514,8 +4016,9 @@ static __global__ void __launch_bounds__(128) s11_fa_gate_strided_quant_fused_ke
     const float out_val = __fmul_rn(c, sig_g);
     dst[idx] = out_val;
     if (q_out && s_out) {
+        const float q_val = s11_bf16(out_val);
         __shared__ float warp_max[4];
-        float maximum = fmaxf(1e-5f, fabsf(out_val));
+        float maximum = fmaxf(1e-5f, fabsf(q_val));
         for (int offset = 16; offset > 0; offset /= 2) {
             maximum = fmaxf(maximum, __shfl_xor_sync(0xffffffff, maximum, offset));
         }
@@ -2536,7 +4039,7 @@ static __global__ void __launch_bounds__(128) s11_fa_gate_strided_quant_fused_ke
         if (t == 0) {
             s_out[group_row] = __fdiv_rn(1.0f, inverse);
         }
-        const int quant = max(-128, min(127, __float2int_rn(__fmul_rn(out_val, inverse))));
+        const int quant = max(-128, min(127, __float2int_rn(__fmul_rn(q_val, inverse))));
         q_out[idx] = static_cast<signed char>(quant);
     }
 }
@@ -2577,6 +4080,103 @@ static __global__ void __launch_bounds__(128) s11_fa_gate_quant_fused_kernel(
         }
         const int quant = max(-128, min(127, __float2int_rn(__fmul_rn(out_val, inverse))));
         q_out[idx] = static_cast<signed char>(quant);
+    }
+}
+
+static __global__ void __launch_bounds__(256) s11_dual_rms_norm_concat_quant_kernel(
+        const char * __restrict__ e_src, const nv_bfloat16 * __restrict__ e_mw,
+        const char * __restrict__ h_src, const nv_bfloat16 * __restrict__ h_mw,
+        float * __restrict__ concat_dst,
+        signed char * __restrict__ q_out, float * __restrict__ s_out,
+        int ne1, int ne2,
+        size_t e_nb1, size_t e_nb2, size_t e_nb3,
+        size_t h_nb1, size_t h_nb2, size_t h_nb3,
+        float eps_e, float scale_e, float bias_e,
+        float eps_h, float scale_h, float bias_h) {
+    const int row     = blockIdx.x;
+    const int is_h    = blockIdx.y; // 0: e (cols 0..2047), 1: h (cols 2048..4095)
+    const int i1      = row % ne1;
+    const int i2      = (row / ne1) % ne2;
+    const int i3      = row / (ne1 * ne2);
+    const char * src  = is_h ? h_src : e_src;
+    const size_t nb1  = is_h ? h_nb1 : e_nb1;
+    const size_t nb2  = is_h ? h_nb2 : e_nb2;
+    const size_t nb3  = is_h ? h_nb3 : e_nb3;
+    const nv_bfloat16 * mw = is_h ? h_mw : e_mw;
+    const float eps   = is_h ? eps_h   : eps_e;
+    const float scale = is_h ? scale_h : scale_e;
+    const float bias  = is_h ? bias_h  : bias_e;
+
+    const float * x_row = reinterpret_cast<const float *>(src + size_t(i1) * nb1 + size_t(i2) * nb2 + size_t(i3) * nb3);
+    float * y_row = concat_dst + size_t(row) * 4096 + size_t(is_h) * 2048;
+
+    __shared__ float x_sh[2048];
+    __shared__ float warp_sums[8];
+
+    float sum_sq = 0.0f;
+    #pragma unroll
+    for (int m = 0; m < 8; ++m) {
+        const int col = threadIdx.x + 256 * m;
+        const float v = x_row[col];
+        x_sh[col] = v;
+        sum_sq = __fadd_rn(sum_sq, __fmul_rn(v, v));
+    }
+    for (int offset = 16; offset > 0; offset /= 2) {
+        sum_sq = __fadd_rn(sum_sq, __shfl_down_sync(0xffffffff, sum_sq, offset));
+    }
+    if ((threadIdx.x & 31) == 0) {
+        warp_sums[threadIdx.x / 32] = sum_sq;
+    }
+    __syncthreads();
+    if (threadIdx.x < 32) {
+        float total = (threadIdx.x < 8) ? warp_sums[threadIdx.x] : 0.0f;
+        for (int offset = 4; offset > 0; offset /= 2) {
+            total = __fadd_rn(total, __shfl_down_sync(0xffffffff, total, offset));
+        }
+        if (threadIdx.x == 0) {
+            warp_sums[0] = rsqrtf(total / 2048.0f + eps);
+        }
+    }
+    __syncthreads();
+    const float inv_rms = warp_sums[0];
+    if (q_out && s_out) {
+        const int warp = threadIdx.x / 32;
+        const int lane = threadIdx.x % 32;
+        #pragma unroll
+        for (int g_sub = 0; g_sub < 2; ++g_sub) {
+            const int group = warp * 2 + g_sub;
+            float values[4];
+            float maximum = 1e-5f;
+            #pragma unroll
+            for (int i = 0; i < 4; ++i) {
+                const int col = group * 128 + lane + 32 * i;
+                const float w = __fadd_rn(__fmul_rn(__bfloat162float(mw[col]), scale), bias);
+                const float val = s11_bf16(__fmul_rn(__fmul_rn(x_sh[col], inv_rms), w));
+                y_row[col] = val;
+                values[i] = val;
+                maximum = fmaxf(maximum, fabsf(val));
+            }
+            for (int offset = 16; offset > 0; offset /= 2) {
+                maximum = fmaxf(maximum, __shfl_xor_sync(0xffffffff, maximum, offset));
+            }
+            const float inverse = __fmul_rn(__fdiv_rn(1.0f, maximum), 127.0f);
+            if (lane == 0) {
+                s_out[size_t(row) * 32 + size_t(is_h) * 16 + group] = __fdiv_rn(1.0f, inverse);
+            }
+            #pragma unroll
+            for (int i = 0; i < 4; ++i) {
+                const int col = group * 128 + lane + 32 * i;
+                const int quant = max(-128, min(127, __float2int_rn(__fmul_rn(values[i], inverse))));
+                q_out[size_t(row) * 4096 + size_t(is_h) * 2048 + col] = static_cast<signed char>(quant);
+            }
+        }
+    } else {
+        #pragma unroll
+        for (int m = 0; m < 8; ++m) {
+            const int col = threadIdx.x + 256 * m;
+            const float w = __fadd_rn(__fmul_rn(__bfloat162float(mw[col]), scale), bias);
+            y_row[col] = s11_bf16(__fmul_rn(__fmul_rn(x_sh[col], inv_rms), w));
+        }
     }
 }
 
@@ -2673,14 +4273,11 @@ static __global__ void __launch_bounds__(128) s11_routed_up_gate_swiglu_wmma_k12
         if (t < 16) {
             a_scales_sh[t] = (t < count) ? activation_scales[size_t(source_sh[t]) * (k / 128) + group] : 0.0f;
         }
-        #pragma unroll
-        for (int idx = t; idx < 16 * 32; idx += 128) {
-            const int tok_local = idx / 32;
-            const int col4 = idx % 32;
-            *reinterpret_cast<int *>(&a_sh[tok_local * kStride + col4 * 4]) = (tok_local < count)
-                ? *reinterpret_cast<const int *>(q + size_t(source_sh[tok_local]) * k + group * 128 + col4 * 4)
-                : 0;
-        }
+        const int sub = t % 8;
+        const int row_sub = t / 8;
+        *reinterpret_cast<int4 *>(&a_sh[row_sub * kStride + sub * 16]) = (row_sub < count)
+            ? *reinterpret_cast<const int4 *>(q + size_t(source_sh[row_sub]) * k + group * 128 + sub * 16)
+            : make_int4(0, 0, 0, 0);
         if (t < 64) {
             const int r = first_row + t;
             if (r < n) {
@@ -2692,18 +4289,29 @@ static __global__ void __launch_bounds__(128) s11_routed_up_gate_swiglu_wmma_k12
             }
         }
         #pragma unroll
-        for (int idx = t; idx < 64 * 32; idx += 128) {
-            const int r_local = idx / 32;
-            const int col4 = idx % 32;
+        for (int r_base = 0; r_base < 64; r_base += 16) {
+            const int r_local = r_base + row_sub;
             const int r = first_row + r_local;
-            int packed_up = 0;
-            int packed_gate = 0;
+            int4 packed_up4 = make_int4(0, 0, 0, 0);
+            int4 packed_gate4 = make_int4(0, 0, 0, 0);
             if (r < n) {
-                packed_up = s11_unpack4_w2(reinterpret_cast<const unsigned char *>(exp_up + size_t(r) * weight_row + group * 36), col4);
-                packed_gate = s11_unpack4_w2(reinterpret_cast<const unsigned char *>(exp_gate + size_t(r) * weight_row + group * 36), col4);
+                const auto * up_block = reinterpret_cast<const unsigned char *>(exp_up + size_t(r) * weight_row + group * 36);
+                const auto * gate_block = reinterpret_cast<const unsigned char *>(exp_gate + size_t(r) * weight_row + group * 36);
+                const uint32_t u32 = *reinterpret_cast<const uint32_t *>(up_block + sub * 4);
+                const uint32_t g32 = *reinterpret_cast<const uint32_t *>(gate_block + sub * 4);
+                packed_up4 = make_int4(
+                    s11_unpack4_w2_byte(u32 & 0xffu),
+                    s11_unpack4_w2_byte((u32 >> 8) & 0xffu),
+                    s11_unpack4_w2_byte((u32 >> 16) & 0xffu),
+                    s11_unpack4_w2_byte(u32 >> 24));
+                packed_gate4 = make_int4(
+                    s11_unpack4_w2_byte(g32 & 0xffu),
+                    s11_unpack4_w2_byte((g32 >> 8) & 0xffu),
+                    s11_unpack4_w2_byte((g32 >> 16) & 0xffu),
+                    s11_unpack4_w2_byte(g32 >> 24));
             }
-            *reinterpret_cast<int *>(&b_up_sh[r_local * kStride + col4 * 4]) = packed_up;
-            *reinterpret_cast<int *>(&b_gate_sh[r_local * kStride + col4 * 4]) = packed_gate;
+            *reinterpret_cast<int4 *>(&b_up_sh[r_local * kStride + sub * 16]) = packed_up4;
+            *reinterpret_cast<int4 *>(&b_gate_sh[r_local * kStride + sub * 16]) = packed_gate4;
         }
         __syncthreads();
 
@@ -2775,7 +4383,315 @@ static __global__ void __launch_bounds__(128) s11_routed_up_gate_swiglu_wmma_k12
 #endif
 }
 
-template <int TYPE>
+// Load-restructured variant of s11_routed_up_gate_swiglu_wmma_k128_kernel. Dispatch enforces
+// k % 128 == 0, n % 64 == 0, weight_row == (k / 128) * 36, equal up/gate strides and device
+// weights. Group-0 weight loads are issued before the assignment gather, and group g + 1 is
+// loaded into registers while group g runs WMMA and the epilogue from smem. It is bit-exact
+// because the smem layout, the WMMA sequence, the group-ordered __fmul_rn/__fadd_rn
+// accumulation and the SwiGLU/prob/BF16 epilogue are unchanged.
+static __global__ void __launch_bounds__(128) s11_routed_up_gate_swiglu_wmma_k128_pipe_kernel(
+        const char * __restrict__ up_weights, const char * __restrict__ gate_weights,
+        const signed char * __restrict__ q, const float * __restrict__ activation_scales,
+        const int32_t * __restrict__ tile_experts, const int32_t * __restrict__ tile_starts,
+        const int32_t * __restrict__ tile_counts, const int32_t * __restrict__ sorted_assignments,
+        const int32_t * __restrict__ num_tiles_in, const char * __restrict__ prob_weights,
+        char * __restrict__ output,
+        int k, int n, int slots, int input_slots,
+        size_t weight_row, size_t weight_expert,
+        size_t prob_slot, size_t prob_token,
+        size_t output_slot, size_t output_token) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+    const int tile = blockIdx.y;
+    // tile < max_tiles <= 4096, so these independent plan reads stay in bounds for idle tiles too.
+    const int num_tiles = num_tiles_in[0];
+    const int expert = tile_experts[tile];
+    const int start = tile_starts[tile];
+    const int count = tile_counts[tile];
+    if (tile >= num_tiles) {
+        return;
+    }
+    const int t = threadIdx.x;
+    const int warp = t / 32;
+    const int lane = t % 32;
+    const int first_row = blockIdx.x * 64;
+    if (first_row >= n || count <= 0) {
+        return;
+    }
+
+    constexpr int kStride = 144;
+    __shared__ __align__(32) signed char a_sh[16 * kStride];
+    __shared__ __align__(32) signed char b_up_sh[64 * kStride];
+    __shared__ __align__(32) signed char b_gate_sh[64 * kStride];
+    __shared__ __align__(32) int dots_sh[4][16 * 16];
+    __shared__ int assign_sh[16];
+    __shared__ int source_sh[16];
+    __shared__ float a_scales_sh[16];
+    __shared__ float w_up_scales_sh[64];
+    __shared__ float w_gate_scales_sh[64];
+
+    const int groups = k / 128;
+    const char * exp_up   = up_weights   + size_t(expert) * weight_expert;
+    const char * exp_gate = gate_weights + size_t(expert) * weight_expert;
+    const int sub = t % 8;
+    const int row_sub = t / 8;
+    const bool w_scale_valid = t < 64 && first_row + t < n;
+    const char * up_scale_row   = exp_up   + size_t(first_row + t) * weight_row;
+    const char * gate_scale_row = exp_gate + size_t(first_row + t) * weight_row;
+
+    uint32_t up32[4] = {};
+    uint32_t gate32[4] = {};
+    float up_scale = 0.0f;
+    float gate_scale = 0.0f;
+    float a_scale = 0.0f;
+    #pragma unroll
+    for (int rb = 0; rb < 4; ++rb) {
+        const int r = first_row + rb * 16 + row_sub;
+        if (r < n) {
+            up32[rb]   = *reinterpret_cast<const uint32_t *>(exp_up   + size_t(r) * weight_row + sub * 4);
+            gate32[rb] = *reinterpret_cast<const uint32_t *>(exp_gate + size_t(r) * weight_row + sub * 4);
+        }
+    }
+    if (w_scale_valid) {
+        up_scale   = s11_scale(reinterpret_cast<const unsigned char *>(up_scale_row), GGML_TYPE_S11_W2);
+        gate_scale = s11_scale(reinterpret_cast<const unsigned char *>(gate_scale_row), GGML_TYPE_S11_W2);
+    }
+
+    if (t < 16) {
+        const int a = (t < count) ? sorted_assignments[start + t] : 0;
+        assign_sh[t] = a;
+        const int slot = a % slots;
+        const int token = a / slots;
+        const int source = token * input_slots + (input_slots == 1 ? 0 : slot);
+        source_sh[t] = source;
+        if (t < count) {
+            a_scale = activation_scales[size_t(source) * (k / 128)];
+        }
+    }
+    __syncthreads();
+
+    const bool a_valid = row_sub < count;
+    const bool a_scale_valid = t < 16 && t < count;
+    const signed char * q_row = q + size_t(source_sh[row_sub]) * k + sub * 16;
+    const float * a_scale_row = activation_scales + size_t(source_sh[t < 16 ? t : 0]) * (k / 128);
+    int4 a4 = a_valid ? *reinterpret_cast<const int4 *>(q_row) : make_int4(0, 0, 0, 0);
+
+    float sums_up[8]   = {};
+    float sums_gate[8] = {};
+
+    for (int group = 0; group < groups; ++group) {
+        if (t < 16) {
+            a_scales_sh[t] = a_scale;
+        }
+        *reinterpret_cast<int4 *>(&a_sh[row_sub * kStride + sub * 16]) = a4;
+        if (t < 64) {
+            w_up_scales_sh[t] = up_scale;
+            w_gate_scales_sh[t] = gate_scale;
+        }
+        #pragma unroll
+        for (int rb = 0; rb < 4; ++rb) {
+            const int r_local = rb * 16 + row_sub;
+            const int r = first_row + r_local;
+            int4 packed_up4 = make_int4(0, 0, 0, 0);
+            int4 packed_gate4 = make_int4(0, 0, 0, 0);
+            if (r < n) {
+                const uint32_t u32 = up32[rb];
+                const uint32_t g32 = gate32[rb];
+                packed_up4 = make_int4(
+                    s11_unpack4_w2_byte(u32 & 0xffu),
+                    s11_unpack4_w2_byte((u32 >> 8) & 0xffu),
+                    s11_unpack4_w2_byte((u32 >> 16) & 0xffu),
+                    s11_unpack4_w2_byte(u32 >> 24));
+                packed_gate4 = make_int4(
+                    s11_unpack4_w2_byte(g32 & 0xffu),
+                    s11_unpack4_w2_byte((g32 >> 8) & 0xffu),
+                    s11_unpack4_w2_byte((g32 >> 16) & 0xffu),
+                    s11_unpack4_w2_byte(g32 >> 24));
+            }
+            *reinterpret_cast<int4 *>(&b_up_sh[r_local * kStride + sub * 16]) = packed_up4;
+            *reinterpret_cast<int4 *>(&b_gate_sh[r_local * kStride + sub * 16]) = packed_gate4;
+        }
+        __syncthreads();
+
+        // Group g is now in smem; prefetch group g + 1 into the same registers.
+        if (group + 1 < groups) {
+            const int next = group + 1;
+            #pragma unroll
+            for (int rb = 0; rb < 4; ++rb) {
+                const int r = first_row + rb * 16 + row_sub;
+                if (r < n) {
+                    up32[rb]   = *reinterpret_cast<const uint32_t *>(exp_up   + size_t(r) * weight_row + next * 36 + sub * 4);
+                    gate32[rb] = *reinterpret_cast<const uint32_t *>(exp_gate + size_t(r) * weight_row + next * 36 + sub * 4);
+                }
+            }
+            if (w_scale_valid) {
+                up_scale   = s11_scale(reinterpret_cast<const unsigned char *>(up_scale_row + next * 36), GGML_TYPE_S11_W2);
+                gate_scale = s11_scale(reinterpret_cast<const unsigned char *>(gate_scale_row + next * 36), GGML_TYPE_S11_W2);
+            }
+            if (a_scale_valid) {
+                a_scale = a_scale_row[next];
+            }
+            a4 = a_valid ? *reinterpret_cast<const int4 *>(q_row + next * 128) : make_int4(0, 0, 0, 0);
+        }
+
+        namespace wmma = nvcuda::wmma;
+        wmma::fragment<wmma::accumulator, 16, 16, 16, int> acc_up;
+        wmma::fragment<wmma::accumulator, 16, 16, 16, int> acc_gate;
+        wmma::fill_fragment(acc_up, 0);
+        wmma::fill_fragment(acc_gate, 0);
+        #pragma unroll
+        for (int ks = 0; ks < 128; ks += 16) {
+            wmma::fragment<wmma::matrix_a, 16, 16, 16, signed char, wmma::row_major> af;
+            wmma::fragment<wmma::matrix_b, 16, 16, 16, signed char, wmma::col_major> bf_up;
+            wmma::fragment<wmma::matrix_b, 16, 16, 16, signed char, wmma::col_major> bf_gate;
+            wmma::load_matrix_sync(af, a_sh + ks, kStride);
+            wmma::load_matrix_sync(bf_up, b_up_sh + (warp * 16) * kStride + ks, kStride);
+            wmma::load_matrix_sync(bf_gate, b_gate_sh + (warp * 16) * kStride + ks, kStride);
+            wmma::mma_sync(acc_up, af, bf_up, acc_up);
+            wmma::mma_sync(acc_gate, af, bf_gate, acc_gate);
+        }
+        wmma::store_matrix_sync(dots_sh[warp], acc_up, 16, wmma::mem_row_major);
+        __syncwarp();
+
+        #pragma unroll
+        for (int p = 0; p < 8; ++p) {
+            const int idx = lane + p * 32;
+            const int tok_local = idx / 16;
+            const int row_in_warp = idx % 16;
+            const int dot = dots_sh[warp][idx];
+            const float scale_prod = __fmul_rn(a_scales_sh[tok_local], w_up_scales_sh[warp * 16 + row_in_warp]);
+            sums_up[p] = __fadd_rn(sums_up[p], __fmul_rn(float(dot), scale_prod));
+        }
+        __syncwarp();
+
+        wmma::store_matrix_sync(dots_sh[warp], acc_gate, 16, wmma::mem_row_major);
+        __syncwarp();
+
+        #pragma unroll
+        for (int p = 0; p < 8; ++p) {
+            const int idx = lane + p * 32;
+            const int tok_local = idx / 16;
+            const int row_in_warp = idx % 16;
+            const int dot = dots_sh[warp][idx];
+            const float scale_prod = __fmul_rn(a_scales_sh[tok_local], w_gate_scales_sh[warp * 16 + row_in_warp]);
+            sums_gate[p] = __fadd_rn(sums_gate[p], __fmul_rn(float(dot), scale_prod));
+        }
+        __syncthreads();
+    }
+
+    #pragma unroll
+    for (int p = 0; p < 8; ++p) {
+        const int idx = lane + p * 32;
+        const int tok_local = idx / 16;
+        const int row = first_row + warp * 16 + idx % 16;
+        if (tok_local < count && row < n) {
+            const int a = assign_sh[tok_local];
+            const int slot = a % slots;
+            const int token = a / slots;
+            const float u = s11_bf16(sums_up[p]);
+            const float g = s11_bf16(sums_gate[p]);
+            const float silu_g = g / (1.0f + expf(-g));
+            float val = silu_g * u;
+            if (prob_weights) {
+                const float prob = *reinterpret_cast<const float *>(prob_weights + size_t(slot) * prob_slot + size_t(token) * prob_token);
+                val = s11_bf16(val * prob);
+            }
+            *reinterpret_cast<float *>(output + size_t(row) * sizeof(float) + size_t(slot) * output_slot + size_t(token) * output_token) = val;
+        }
+    }
+#endif
+}
+
+template <int COLS>
+static __global__ void __launch_bounds__(256) s11_shexp_up_gate_swiglu_multi(
+        const char * __restrict__ up_weights, const char * __restrict__ gate_weights,
+        const signed char * __restrict__ q, const float * __restrict__ activation_scales,
+        char * __restrict__ output, int n, int tokens,
+        size_t weight_row, size_t output_token) {
+    __shared__ __align__(16) signed char q_sh[COLS][2048];
+    __shared__ float scales_sh[COLS][16];
+    const int t = threadIdx.x;
+    const int first = int(blockIdx.y) * COLS;
+    #pragma unroll
+    for (int c = 0; c < COLS; ++c) {
+        const int tok = first + c;
+        int4 * q4_sh = reinterpret_cast<int4 *>(q_sh[c]);
+        if (tok < tokens) {
+            if (t < 16) scales_sh[c][t] = activation_scales[size_t(tok) * 16 + t];
+            const int4 * q4_in = reinterpret_cast<const int4 *>(q + size_t(tok) * 2048);
+            if (t < 128) q4_sh[t] = q4_in[t];
+        } else {
+            if (t < 16) scales_sh[c][t] = 0.0f;
+            if (t < 128) q4_sh[t] = make_int4(0, 0, 0, 0);
+        }
+    }
+    __syncthreads();
+
+    const int lane = t % 32;
+    const int row = blockIdx.x * 8 + t / 32;
+    if (row >= n) {
+        return;
+    }
+    const char * w_up = up_weights + size_t(row) * weight_row;
+    const char * w_gate = gate_weights + size_t(row) * weight_row;
+    float sums_up[COLS] = {};
+    float sums_gate[COLS] = {};
+    const int quarter = lane / 8;
+    const int sub = lane % 8;
+    #pragma unroll
+    for (int g4 = 0; g4 < 4; ++g4) {
+        const int group = g4 * 4 + quarter;
+        const auto * block_up = reinterpret_cast<const unsigned char *>(w_up + group * 36);
+        const auto * block_gate = reinterpret_cast<const unsigned char *>(w_gate + group * 36);
+        const float scale_up = s11_scale(block_up, GGML_TYPE_S11_W2_BF16);
+        const float scale_gate = s11_scale(block_gate, GGML_TYPE_S11_W2_BF16);
+        const uint32_t u32 = *reinterpret_cast<const uint32_t *>(block_up + sub * 4);
+        const uint32_t g32 = *reinterpret_cast<const uint32_t *>(block_gate + sub * 4);
+        const int pu0 = s11_unpack4_w2_byte(u32 & 0xffu);
+        const int pu1 = s11_unpack4_w2_byte((u32 >> 8) & 0xffu);
+        const int pu2 = s11_unpack4_w2_byte((u32 >> 16) & 0xffu);
+        const int pu3 = s11_unpack4_w2_byte(u32 >> 24);
+        const int pg0 = s11_unpack4_w2_byte(g32 & 0xffu);
+        const int pg1 = s11_unpack4_w2_byte((g32 >> 8) & 0xffu);
+        const int pg2 = s11_unpack4_w2_byte((g32 >> 16) & 0xffu);
+        const int pg3 = s11_unpack4_w2_byte(g32 >> 24);
+        #pragma unroll
+        for (int c = 0; c < COLS; ++c) {
+            const int4 act4 = *reinterpret_cast<const int4 *>(&q_sh[c][group * 128 + sub * 16]);
+            int dot_up = __dp4a(pu0, act4.x, 0);
+            dot_up = __dp4a(pu1, act4.y, dot_up);
+            dot_up = __dp4a(pu2, act4.z, dot_up);
+            dot_up = __dp4a(pu3, act4.w, dot_up);
+            int dot_gate = __dp4a(pg0, act4.x, 0);
+            dot_gate = __dp4a(pg1, act4.y, dot_gate);
+            dot_gate = __dp4a(pg2, act4.z, dot_gate);
+            dot_gate = __dp4a(pg3, act4.w, dot_gate);
+            const float act_s = scales_sh[c][group];
+            sums_up[c] = __fadd_rn(sums_up[c], __fmul_rn(float(dot_up), __fmul_rn(act_s, scale_up)));
+            sums_gate[c] = __fadd_rn(sums_gate[c], __fmul_rn(float(dot_gate), __fmul_rn(act_s, scale_gate)));
+        }
+    }
+    for (int offset = 16; offset > 0; offset /= 2) {
+        #pragma unroll
+        for (int c = 0; c < COLS; ++c) {
+            sums_up[c] = __fadd_rn(sums_up[c], __shfl_down_sync(0xffffffff, sums_up[c], offset));
+            sums_gate[c] = __fadd_rn(sums_gate[c], __shfl_down_sync(0xffffffff, sums_gate[c], offset));
+        }
+    }
+    if (!lane) {
+        #pragma unroll
+        for (int c = 0; c < COLS; ++c) {
+            const int tok = first + c;
+            if (tok < tokens) {
+                const float u = s11_bf16(sums_up[c]);
+                const float g = s11_bf16(sums_gate[c]);
+                const float silu_g = g / (1.0f + expf(-g));
+                *reinterpret_cast<float *>(output + size_t(tok) * output_token + size_t(row) * sizeof(float)) = silu_g * u;
+            }
+        }
+    }
+}
+
+template <int TYPE, bool MULTI_TOKEN = false>
 static __global__ void __launch_bounds__(256) s11_fused_up_gate_swiglu_kernel_m1(
         const char * __restrict__ up_weights, const char * __restrict__ gate_weights,
         const signed char * __restrict__ q, const float * __restrict__ activation_scales,
@@ -2783,17 +4699,27 @@ static __global__ void __launch_bounds__(256) s11_fused_up_gate_swiglu_kernel_m1
         char * __restrict__ output,
         int k, int n, int slots, int input_slots,
         size_t weight_row, size_t weight_expert,
-        size_t ids_slot, size_t prob_slot, size_t output_slot) {
+        size_t ids_slot, size_t prob_slot, size_t output_slot,
+        size_t ids_token = 0, size_t prob_token = 0, size_t output_token = 0) {
     __shared__ __align__(16) signed char q_sh[2048];
     __shared__ float scales_sh[16];
     __shared__ int expert_sh;
     __shared__ float prob_sh;
     const int t = threadIdx.x;
-    const int slot = (TYPE == GGML_TYPE_S11_W2) ? int(blockIdx.y) : 0;
-    const int source = (TYPE == GGML_TYPE_S11_W2 && input_slots > 1) ? slot : 0;
+    const int assignment = int(blockIdx.y);
+    const int slot = (TYPE == GGML_TYPE_S11_W2) ? (MULTI_TOKEN ? (assignment % slots) : assignment) : 0;
+    const int token = (TYPE == GGML_TYPE_S11_W2) ? (MULTI_TOKEN ? (assignment / slots) : 0) : (MULTI_TOKEN ? assignment : 0);
+    const int source = (TYPE == GGML_TYPE_S11_W2)
+        ? ((MULTI_TOKEN ? token * input_slots : 0) + (input_slots > 1 ? slot : 0))
+        : token;
     if (t == 0) {
-        expert_sh = ids ? *reinterpret_cast<const int *>(ids + size_t(slot) * ids_slot) : 0;
-        prob_sh = prob_weights ? *reinterpret_cast<const float *>(prob_weights + size_t(slot) * prob_slot) : 1.0f;
+        if constexpr (MULTI_TOKEN) {
+            expert_sh = ids ? *reinterpret_cast<const int *>(ids + size_t(slot) * ids_slot + size_t(token) * ids_token) : 0;
+            prob_sh = prob_weights ? *reinterpret_cast<const float *>(prob_weights + size_t(slot) * prob_slot + size_t(token) * prob_token) : 1.0f;
+        } else {
+            expert_sh = ids ? *reinterpret_cast<const int *>(ids + size_t(slot) * ids_slot) : 0;
+            prob_sh = prob_weights ? *reinterpret_cast<const float *>(prob_weights + size_t(slot) * prob_slot) : 1.0f;
+        }
     }
     if (t < 16) {
         scales_sh[t] = activation_scales[size_t(source) * 16 + t];
@@ -2813,7 +4739,8 @@ static __global__ void __launch_bounds__(256) s11_fused_up_gate_swiglu_kernel_m1
     const int expert = expert_sh;
     if (expert < 0) {
         if (!lane) {
-            *reinterpret_cast<float *>(output + size_t(row) * sizeof(float) + size_t(slot) * output_slot) = 0.0f;
+            const size_t tok_off = MULTI_TOKEN ? size_t(token) * output_token : 0;
+            *reinterpret_cast<float *>(output + size_t(row) * sizeof(float) + size_t(slot) * output_slot + tok_off) = 0.0f;
         }
         return;
     }
@@ -2858,28 +4785,52 @@ static __global__ void __launch_bounds__(256) s11_fused_up_gate_swiglu_kernel_m1
         if (prob_weights) {
             val = s11_bf16(val * prob_sh);
         }
-        *reinterpret_cast<float *>(output + size_t(row) * sizeof(float) + size_t(slot) * output_slot) = val;
+        const size_t tok_off = MULTI_TOKEN ? size_t(token) * output_token : 0;
+        *reinterpret_cast<float *>(output + size_t(row) * sizeof(float) + size_t(slot) * output_slot + tok_off) = val;
     }
 }
 
+template <bool MULTI_TOKEN = false>
 static __global__ void __launch_bounds__(256) s11_fused_down_exps_reduce_kernel_m1(
         const char * __restrict__ down_weights, const signed char * __restrict__ q,
         const float * __restrict__ activation_scales, const char * __restrict__ ids,
         char * __restrict__ output, int n, int slots,
-        size_t weight_row, size_t weight_expert, size_t ids_slot) {
+        size_t weight_row, size_t weight_expert, size_t ids_slot,
+        const float * __restrict__ x_f32 = nullptr,
+        size_t ids_token = 0, size_t output_token = 0, size_t x_token_stride = 0) {
     __shared__ __align__(16) signed char q_sh[4096];
     __shared__ float scales_sh[32];
     __shared__ int ids_sh[8];
     const int t = threadIdx.x;
+    const int token = MULTI_TOKEN ? int(blockIdx.y) : 0;
     if (t < 8) {
-        ids_sh[t] = *reinterpret_cast<const int *>(ids + size_t(t) * ids_slot);
+        const size_t tok_off = MULTI_TOKEN ? size_t(token) * ids_token : 0;
+        ids_sh[t] = *reinterpret_cast<const int *>(ids + size_t(t) * ids_slot + tok_off);
     }
-    if (t < 32) {
-        scales_sh[t] = activation_scales[t];
+    if (x_f32 != nullptr) {
+        const float * x_tok = MULTI_TOKEN
+            ? reinterpret_cast<const float *>(reinterpret_cast<const char *>(x_f32) + size_t(token) * x_token_stride)
+            : x_f32;
+        const int w = t / 32;
+        const int lane = t % 32;
+        #pragma unroll
+        for (int g = 0; g < 4; ++g) {
+            s11_quantize_k128_warp_to_sh(
+                x_tok + size_t(w) * 512 + g * 128,
+                q_sh + (w * 4 + g) * 128,
+                &scales_sh[w * 4 + g],
+                lane);
+        }
+    } else {
+        const signed char * q_tok = MULTI_TOKEN ? (q + size_t(token) * 4096) : q;
+        const float * s_tok = MULTI_TOKEN ? (activation_scales + size_t(token) * 32) : activation_scales;
+        if (t < 32) {
+            scales_sh[t] = s_tok[t];
+        }
+        const int4 * q4_in = reinterpret_cast<const int4 *>(q_tok);
+        int4 * q4_sh = reinterpret_cast<int4 *>(q_sh);
+        q4_sh[t] = q4_in[t];
     }
-    const int4 * q4_in = reinterpret_cast<const int4 *>(q);
-    int4 * q4_sh = reinterpret_cast<int4 *>(q_sh);
-    q4_sh[t] = q4_in[t];
     __syncthreads();
 
     const int lane = t % 32;
@@ -2916,7 +4867,8 @@ static __global__ void __launch_bounds__(256) s11_fused_down_exps_reduce_kernel_
         }
     }
     if (!lane) {
-        *reinterpret_cast<float *>(output + size_t(row) * sizeof(float)) = s11_bf16(total_sum);
+        const size_t tok_off = MULTI_TOKEN ? size_t(token) * output_token : 0;
+        *reinterpret_cast<float *>(output + tok_off + size_t(row) * sizeof(float)) = s11_bf16(total_sum);
     }
 }
 
@@ -3109,6 +5061,95 @@ int ggml_cuda_s11_try_fuse(ggml_backend_cuda_context & ctx, ggml_cgraph * cgraph
     }
     ggml_tensor * n0 = cgraph->nodes[i];
 
+    // Pattern MTP-Prologue: 13-node dual RMSNorm (h_norm + e_norm) + CONCAT(e_norm, h_norm) + A128 quantize (k=4096)
+    if (false && n0->op == GGML_OP_RMS_NORM && i + 12 < cgraph->n_nodes && n0->ne[0] == 2048) {
+        ggml_tensor * n1  = cgraph->nodes[i + 1];
+        ggml_tensor * n2  = cgraph->nodes[i + 2];
+        ggml_tensor * n3  = cgraph->nodes[i + 3];
+        ggml_tensor * n4  = cgraph->nodes[i + 4];
+        ggml_tensor * n5  = cgraph->nodes[i + 5];
+        ggml_tensor * n6  = cgraph->nodes[i + 6];
+        ggml_tensor * n7  = cgraph->nodes[i + 7];
+        ggml_tensor * n8  = cgraph->nodes[i + 8];
+        ggml_tensor * n9  = cgraph->nodes[i + 9];
+        ggml_tensor * n10 = cgraph->nodes[i + 10];
+        ggml_tensor * n11 = cgraph->nodes[i + 11];
+        ggml_tensor * n12 = cgraph->nodes[i + 12];
+        if (n1->op == GGML_OP_CPY && n2->op == GGML_OP_SCALE && n3->op == GGML_OP_MUL &&
+            n4->op == GGML_OP_CPY && n5->op == GGML_OP_CPY &&
+            n1->src[0] && n1->src[0]->type == GGML_TYPE_BF16 && n1->type == GGML_TYPE_F32 &&
+            n2->src[0] == n1 && n3->src[0] == n0 && n3->src[1] == n2 &&
+            n4->src[0] == n3 && n4->type == GGML_TYPE_BF16 &&
+            n5->src[0] == n4 && n5->type == GGML_TYPE_F32 &&
+            n6->op == GGML_OP_RMS_NORM && n6->ne[0] == 2048 &&
+            n7->op == GGML_OP_CPY && n8->op == GGML_OP_SCALE && n9->op == GGML_OP_MUL &&
+            n10->op == GGML_OP_CPY && n11->op == GGML_OP_CPY &&
+            n7->src[0] && n7->src[0]->type == GGML_TYPE_BF16 && n7->type == GGML_TYPE_F32 &&
+            n8->src[0] == n7 && n9->src[0] == n6 && n9->src[1] == n8 &&
+            n10->src[0] == n9 && n10->type == GGML_TYPE_BF16 &&
+            n11->src[0] == n10 && n11->type == GGML_TYPE_F32 &&
+            n12->op == GGML_OP_CONCAT && ggml_get_op_params_i32(n12, 0) == 0 &&
+            ((n12->src[0] == n11 && n12->src[1] == n5) || (n12->src[0] == n5 && n12->src[1] == n11)) &&
+            n12->ne[0] == 4096 &&
+            n0->src[0] && n0->src[0]->type == GGML_TYPE_F32 && n0->src[0]->nb[0] == sizeof(float) &&
+            n6->src[0] && n6->src[0]->type == GGML_TYPE_F32 && n6->src[0]->nb[0] == sizeof(float) &&
+            ggml_are_same_shape(n0, n6) &&
+            ggml_is_contiguous(n1->src[0]) && ggml_is_contiguous(n7->src[0]) && ggml_is_contiguous(n12) &&
+            ggml_nelements(n1->src[0]) == 2048 && ggml_nelements(n7->src[0]) == 2048 &&
+            !s11_tensors_overlap(n12, n0->src[0]) && !s11_tensors_overlap(n12, n6->src[0]) &&
+            !s11_tensors_overlap(n12, n1->src[0]) && !s11_tensors_overlap(n12, n7->src[0])) {
+            bool external = false;
+            for (int m = 0; m < 12; ++m) {
+                if (s11_has_external_consumer(cgraph, i + 13, cgraph->nodes[i + m])) {
+                    external = true;
+                    break;
+                }
+            }
+            if (!external) {
+                const bool first_is_e = (n12->src[0] == n5);
+                const ggml_tensor * e_norm_node = first_is_e ? n0 : n6;
+                const ggml_tensor * e_cpy_node  = first_is_e ? n1 : n7;
+                const ggml_tensor * e_sc_node   = first_is_e ? n2 : n8;
+                const ggml_tensor * h_norm_node = first_is_e ? n6 : n0;
+                const ggml_tensor * h_cpy_node  = first_is_e ? n7 : n1;
+                const ggml_tensor * h_sc_node   = first_is_e ? n8 : n2;
+                float eps_h = 1e-6f, scale_h = 1.0f, bias_h = 1.0f;
+                float eps_e = 1e-6f, scale_e = 1.0f, bias_e = 1.0f;
+                std::memcpy(&eps_h, h_norm_node->op_params, sizeof(float));
+                std::memcpy(&scale_h, reinterpret_cast<const char *>(h_sc_node->op_params) + 0, sizeof(float));
+                std::memcpy(&bias_h,  reinterpret_cast<const char *>(h_sc_node->op_params) + 4, sizeof(float));
+                std::memcpy(&eps_e, e_norm_node->op_params, sizeof(float));
+                std::memcpy(&scale_e, reinterpret_cast<const char *>(e_sc_node->op_params) + 0, sizeof(float));
+                std::memcpy(&bias_e,  reinterpret_cast<const char *>(e_sc_node->op_params) + 4, sizeof(float));
+                const ggml_tensor * h_in = h_norm_node->src[0];
+                const ggml_tensor * e_in = e_norm_node->src[0];
+                const int nrows = int(ggml_nrows(n0));
+                ggml_cuda_s11_invalidate_if_written(n12->data);
+                const bool fuse_quant = (size_t(nrows) * 4096 <= g_s11_state.q_cap[0]) &&
+                                        (size_t(nrows) * 32   <= g_s11_state.s_cap[0]);
+                s11_dual_rms_norm_concat_quant_kernel<<<dim3(nrows, 2), 256, 0, ctx.stream()>>>(
+                    static_cast<const char *>(e_in->data), static_cast<const nv_bfloat16 *>(e_cpy_node->src[0]->data),
+                    static_cast<const char *>(h_in->data), static_cast<const nv_bfloat16 *>(h_cpy_node->src[0]->data),
+                    static_cast<float *>(n12->data),
+                    fuse_quant ? g_s11_state.q_buf[0] : nullptr,
+                    fuse_quant ? g_s11_state.s_buf[0] : nullptr,
+                    int(e_in->ne[1]), int(e_in->ne[2]),
+                    e_in->nb[1], e_in->nb[2], e_in->nb[3],
+                    h_in->nb[1], h_in->nb[2], h_in->nb[3],
+                    eps_e, scale_e, bias_e,
+                    eps_h, scale_h, bias_h);
+                CUDA_CHECK(cudaGetLastError());
+                if (fuse_quant) {
+                    g_s11_state.last_x_data[0]      = n12->data;
+                    g_s11_state.last_k[0]           = 4096;
+                    g_s11_state.last_tokens[0]      = nrows;
+                    g_s11_state.last_input_slots[0] = 1;
+                }
+                return 12;
+            }
+        }
+    }
+
     // Pattern A: 6-node S11 RMSNorm: RMS_NORM -> CPY(mw, F32) -> SCALE(1,1) -> MUL -> CPY(BF16) -> CPY(F32)
     if (n0->op == GGML_OP_RMS_NORM && i + 5 < cgraph->n_nodes) {
         ggml_tensor * n1 = cgraph->nodes[i + 1];
@@ -3142,14 +5183,23 @@ int ggml_cuda_s11_try_fuse(ggml_backend_cuda_context & ctx, ggml_cgraph * cgraph
                 const bool fuse_quant = (k == 2048) &&
                                         (size_t(nrows) * 2048 <= g_s11_state.q_cap[0]) &&
                                         (size_t(nrows) * 16   <= g_s11_state.s_cap[0]);
-                s11_rms_norm_offset_bf16_kernel<<<nrows, 256, 0, ctx.stream()>>>(
-                    static_cast<const char *>(x->data),
-                    static_cast<const nv_bfloat16 *>(n1->src[0]->data),
-                    static_cast<float *>(n5->data),
-                    fuse_quant ? g_s11_state.q_buf[0] : nullptr,
-                    fuse_quant ? g_s11_state.s_buf[0] : nullptr,
-                    k, int(x->ne[1]), int(x->ne[2]), x->nb[1], x->nb[2], x->nb[3],
-                    eps, scale, bias);
+                if (k == 256 && !fuse_quant) {
+                    s11_rms_norm_k256_offset_bf16_kernel<<<nrows, 256, 0, ctx.stream()>>>(
+                        static_cast<const char *>(x->data),
+                        static_cast<const nv_bfloat16 *>(n1->src[0]->data),
+                        static_cast<float *>(n5->data),
+                        int(x->ne[1]), int(x->ne[2]), x->nb[1], x->nb[2], x->nb[3],
+                        eps, scale, bias);
+                } else {
+                    s11_rms_norm_offset_bf16_kernel<<<nrows, 256, 0, ctx.stream()>>>(
+                        static_cast<const char *>(x->data),
+                        static_cast<const nv_bfloat16 *>(n1->src[0]->data),
+                        static_cast<float *>(n5->data),
+                        fuse_quant ? g_s11_state.q_buf[0] : nullptr,
+                        fuse_quant ? g_s11_state.s_buf[0] : nullptr,
+                        k, int(x->ne[1]), int(x->ne[2]), x->nb[1], x->nb[2], x->nb[3],
+                        eps, scale, bias);
+                }
                 CUDA_CHECK(cudaGetLastError());
                 if (fuse_quant) {
                     g_s11_state.last_x_data[0]      = n5->data;
@@ -3162,13 +5212,87 @@ int ggml_cuda_s11_try_fuse(ggml_backend_cuda_context & ctx, ggml_cgraph * cgraph
         }
     }
 
+    // Pattern FA-QK-Norm-14: 14-node Full-Attention Qcur (strided view) + Kcur (reshaped) k=256 head RMSNorms
+    if (n0->op == GGML_OP_VIEW && i + 13 < cgraph->n_nodes &&
+        n0->src[0] && n0->src[0]->type == GGML_TYPE_F32 &&
+        n0->ne[0] == 256 && n0->ne[1] == 16 && n0->ne[3] == 1 &&
+        n0->view_offs == 0 && n0->nb[0] == sizeof(float) &&
+        n0->nb[1] == 512 * sizeof(float) && n0->nb[2] == 8192 * sizeof(float)) {
+        ggml_tensor * n1  = cgraph->nodes[i + 1];
+        ggml_tensor * n2  = cgraph->nodes[i + 2];
+        ggml_tensor * n3  = cgraph->nodes[i + 3];
+        ggml_tensor * n4  = cgraph->nodes[i + 4];
+        ggml_tensor * n5  = cgraph->nodes[i + 5];
+        ggml_tensor * n6  = cgraph->nodes[i + 6];
+        ggml_tensor * n7  = cgraph->nodes[i + 7];
+        ggml_tensor * n8  = cgraph->nodes[i + 8];
+        ggml_tensor * n9  = cgraph->nodes[i + 9];
+        ggml_tensor * n10 = cgraph->nodes[i + 10];
+        ggml_tensor * n11 = cgraph->nodes[i + 11];
+        ggml_tensor * n12 = cgraph->nodes[i + 12];
+        ggml_tensor * n13 = cgraph->nodes[i + 13];
+        if (n1->op == GGML_OP_RMS_NORM && n1->src[0] == n0 &&
+            n2->op == GGML_OP_CPY && n2->src[0] && n2->src[0]->type == GGML_TYPE_BF16 && n2->type == GGML_TYPE_F32 &&
+            n3->op == GGML_OP_SCALE && n3->src[0] == n2 &&
+            n4->op == GGML_OP_MUL && n4->src[0] == n1 && n4->src[1] == n3 &&
+            n5->op == GGML_OP_CPY && n5->src[0] == n4 && n5->type == GGML_TYPE_BF16 &&
+            n6->op == GGML_OP_CPY && n6->src[0] == n5 && n6->type == GGML_TYPE_F32 &&
+            n7->op == GGML_OP_RESHAPE && n7->src[0] && n7->src[0]->type == GGML_TYPE_F32 &&
+            n7->ne[0] == 256 && n7->ne[1] == 2 && n7->ne[2] == n0->ne[2] && n7->ne[3] == 1 &&
+            n8->op == GGML_OP_RMS_NORM && n8->src[0] == n7 &&
+            n9->op == GGML_OP_CPY && n9->src[0] && n9->src[0]->type == GGML_TYPE_BF16 && n9->type == GGML_TYPE_F32 &&
+            n10->op == GGML_OP_SCALE && n10->src[0] == n9 &&
+            n11->op == GGML_OP_MUL && n11->src[0] == n8 && n11->src[1] == n10 &&
+            n12->op == GGML_OP_CPY && n12->src[0] == n11 && n12->type == GGML_TYPE_BF16 &&
+            n13->op == GGML_OP_CPY && n13->src[0] == n12 && n13->type == GGML_TYPE_F32 &&
+            ggml_is_contiguous(n2->src[0]) && ggml_nelements(n2->src[0]) == 256 &&
+            ggml_is_contiguous(n9->src[0]) && ggml_nelements(n9->src[0]) == 256 &&
+            ggml_is_contiguous(n6) && ggml_is_contiguous(n7->src[0]) && ggml_is_contiguous(n13) &&
+            !s11_tensors_overlap(n6, n0->src[0]) && !s11_tensors_overlap(n6, n7->src[0]) &&
+            !s11_tensors_overlap(n13, n0->src[0]) &&
+            (!s11_tensors_overlap(n13, n7->src[0]) || n13->data == n7->src[0]->data) &&
+            !s11_tensors_overlap(n6, n13)) {
+            bool external = false;
+            for (int m = 0; m < 13; ++m) {
+                if (m == 6) continue;
+                if (s11_has_external_consumer(cgraph, i + 14, cgraph->nodes[i + m])) {
+                    external = true;
+                    break;
+                }
+            }
+            if (!external) {
+                float eps_q = 1e-6f, q_scale = 1.0f, q_bias = 1.0f;
+                float eps_k = 1e-6f, k_scale = 1.0f, k_bias = 1.0f;
+                std::memcpy(&eps_q, n1->op_params, sizeof(float));
+                std::memcpy(&q_scale, reinterpret_cast<const char *>(n3->op_params) + 0, sizeof(float));
+                std::memcpy(&q_bias,  reinterpret_cast<const char *>(n3->op_params) + 4, sizeof(float));
+                std::memcpy(&eps_k, n8->op_params, sizeof(float));
+                std::memcpy(&k_scale, reinterpret_cast<const char *>(n10->op_params) + 0, sizeof(float));
+                std::memcpy(&k_bias,  reinterpret_cast<const char *>(n10->op_params) + 4, sizeof(float));
+                const int tokens = int(n0->ne[2]);
+                ggml_cuda_s11_invalidate_if_written(n6->data);
+                ggml_cuda_s11_invalidate_if_written(n13->data);
+                s11_fa_qk_rms_norm_k256_kernel<<<dim3(18, tokens), 256, 0, ctx.stream()>>>(
+                    static_cast<const char *>(n0->src[0]->data), n0->nb[1], n0->nb[2],
+                    static_cast<const float *>(n7->src[0]->data),
+                    static_cast<const nv_bfloat16 *>(n2->src[0]->data),
+                    static_cast<const nv_bfloat16 *>(n9->src[0]->data),
+                    static_cast<float *>(n6->data),
+                    static_cast<float *>(n13->data),
+                    eps_q, q_scale, q_bias, eps_k, k_scale, k_bias);
+                CUDA_CHECK(cudaGetLastError());
+                return 13;
+            }
+        }
+    }
+
     // Pattern B-Prologue: 12-node GDN beta + sigmoid + alpha + gate prologue sharing input cur
     if (n0->op == GGML_OP_MUL_MAT && i + 11 < cgraph->n_nodes &&
         n0->src[0] && n0->src[0]->type == GGML_TYPE_BF16 &&
         n0->src[0]->ne[0] == 2048 && n0->src[0]->ne[1] == 32 &&
         n0->src[1] && n0->src[1]->type == GGML_TYPE_F32 &&
         ggml_is_contiguous(n0->src[0]) && ggml_is_contiguous(n0->src[1]) &&
-        n0->ne[1] * n0->ne[2] * n0->ne[3] == 1) {
+        n0->ne[1] * n0->ne[2] * n0->ne[3] <= 8) {
         ggml_tensor * b_res  = cgraph->nodes[i + 1];
         ggml_tensor * b_sig  = cgraph->nodes[i + 2];
         ggml_tensor * b_c1   = cgraph->nodes[i + 3];
@@ -4302,6 +6426,73 @@ int ggml_cuda_s11_try_fuse(ggml_backend_cuda_context & ctx, ggml_cgraph * cgraph
         }
     }
 
+    // Pattern FA-QKV-SetRows-9: 9-node Full-Attention post-RoPE Q/K BF16 round + K/V FP16 cache SET_ROWS
+    if (n0->op == GGML_OP_CPY && i + 8 < cgraph->n_nodes) {
+        ggml_tensor * n1 = cgraph->nodes[i + 1];
+        ggml_tensor * n5 = cgraph->nodes[i + 5];
+        ggml_tensor * n6 = cgraph->nodes[i + 6];
+        ggml_tensor * n7 = cgraph->nodes[i + 7];
+        ggml_tensor * n8 = cgraph->nodes[i + 8];
+        const bool v_at_2 = (cgraph->nodes[i + 2]->op == GGML_OP_RESHAPE);
+        ggml_tensor * k_c0  = v_at_2 ? cgraph->nodes[i + 3] : cgraph->nodes[i + 2];
+        ggml_tensor * k_cur = v_at_2 ? cgraph->nodes[i + 4] : cgraph->nodes[i + 3];
+        ggml_tensor * v_res = v_at_2 ? cgraph->nodes[i + 2] : cgraph->nodes[i + 4];
+        const int k_cur_idx = v_at_2 ? 4 : 3;
+        if (n0->src[0] && n0->src[0]->type == GGML_TYPE_F32 && n0->type == GGML_TYPE_BF16 &&
+            n1->op == GGML_OP_CPY && n1->src[0] == n0 && n1->type == GGML_TYPE_F32 &&
+            k_c0->op == GGML_OP_CPY && k_c0->src[0] && k_c0->src[0]->type == GGML_TYPE_F32 && k_c0->type == GGML_TYPE_BF16 &&
+            k_cur->op == GGML_OP_CPY && k_cur->src[0] == k_c0 && k_cur->type == GGML_TYPE_F32 &&
+            v_res->op == GGML_OP_RESHAPE && v_res->src[0] && v_res->src[0]->type == GGML_TYPE_F32 &&
+            n5->op == GGML_OP_VIEW && n5->src[0] == k_cur && n5->view_offs == 0 &&
+            n6->op == GGML_OP_SET_ROWS && n6->src[0] == n5 && n6->src[1] && n6->src[2] &&
+            n6->type == GGML_TYPE_F16 && n6->src[1]->type == GGML_TYPE_I64 &&
+            n7->op == GGML_OP_VIEW && n7->src[0] == v_res && n7->view_offs == 0 &&
+            n8->op == GGML_OP_SET_ROWS && n8->src[0] == n7 && n8->src[1] && n8->src[2] &&
+            n8->type == GGML_TYPE_F16 && n8->src[1]->type == GGML_TYPE_I64 &&
+            n5->ne[0] == 512 && n5->ne[2] == 1 && n5->ne[3] == 1 &&
+            n7->ne[0] == 512 && n7->ne[1] == n5->ne[1] && n7->ne[2] == 1 && n7->ne[3] == 1 &&
+            ggml_nelements(n1) == 4096 * n5->ne[1] &&
+            ggml_is_contiguous(n0->src[0]) && ggml_is_contiguous(n1) &&
+            ggml_is_contiguous(k_c0->src[0]) && ggml_is_contiguous(k_cur) && ggml_is_contiguous(v_res->src[0]) &&
+            (!s11_tensors_overlap(n1, n0->src[0]) || n1->data == n0->src[0]->data) &&
+            !s11_tensors_overlap(n1, k_c0->src[0]) && !s11_tensors_overlap(n1, v_res->src[0]) &&
+            (!s11_tensors_overlap(k_cur, k_c0->src[0]) || k_cur->data == k_c0->src[0]->data) &&
+            !s11_tensors_overlap(k_cur, n0->src[0]) && !s11_tensors_overlap(k_cur, v_res->src[0]) &&
+            !s11_tensors_overlap(n1, k_cur)) {
+            bool external = false;
+            for (int m = 0; m < 8; ++m) {
+                if (m == 1 || m == 6 || m == k_cur_idx) continue;
+                if (s11_has_external_consumer(cgraph, i + 9, cgraph->nodes[i + m])) {
+                    external = true;
+                    break;
+                }
+            }
+            if (!external) {
+                const int tokens = int(n5->ne[1]);
+                const bool write_k_round = s11_has_external_consumer(cgraph, i + 9, k_cur);
+                ggml_cuda_s11_invalidate_if_written(n1->data);
+                if (write_k_round) {
+                    ggml_cuda_s11_invalidate_if_written(k_cur->data);
+                }
+                ggml_cuda_s11_invalidate_if_written(n6->data);
+                ggml_cuda_s11_invalidate_if_written(n8->data);
+                s11_fa_qkv_round_set_rows_f16_kernel<<<dim3(10, tokens), 256, 0, ctx.stream()>>>(
+                    static_cast<const float *>(n0->src[0]->data),
+                    static_cast<const float *>(k_c0->src[0]->data),
+                    static_cast<const float *>(v_res->src[0]->data),
+                    static_cast<float *>(n1->data),
+                    write_k_round ? static_cast<float *>(k_cur->data) : nullptr,
+                    static_cast<char *>(n6->data),
+                    static_cast<char *>(n8->data),
+                    static_cast<const int64_t *>(n6->src[1]->data),
+                    static_cast<const int64_t *>(n8->src[1]->data),
+                    n6->nb[1], n8->nb[1]);
+                CUDA_CHECK(cudaGetLastError());
+                return 8;
+            }
+        }
+    }
+
     // Pattern FA-KV-SetRows: 6-node Kcur BF16 round + K/V FP16 cache SET_ROWS
     if (n0->op == GGML_OP_CPY && i + 5 < cgraph->n_nodes) {
         ggml_tensor * n1 = cgraph->nodes[i + 1];
@@ -4424,10 +6615,10 @@ int ggml_cuda_s11_try_fuse(ggml_backend_cuda_context & ctx, ggml_cgraph * cgraph
         }
     }
 
-    // Pattern E: 18-node Down-Exps + 8 Views + 7 Adds + BF16 round in Decode (tokens < 8)
+    // Pattern E: 18-node Down-Exps + 8 Views + 7 Adds + BF16 round in Decode (tokens <= 8)
     if (n0->op == GGML_OP_MUL_MAT_ID && n0->src[0]->type == GGML_TYPE_S11_W2 &&
         n0->src[0]->ne[0] == 512 && n0->src[0]->ne[1] == 2048 &&
-        n0->ne[1] == 8 && n0->ne[2] < 8 && !s11_is_hybrid_mode() &&
+        n0->ne[1] == 8 && n0->ne[2] <= 8 && !s11_is_hybrid_mode() &&
         i + 17 < cgraph->n_nodes) {
         bool match_down = true;
         for (int v = 0; v < 8; ++v) {
@@ -4461,9 +6652,13 @@ int ggml_cuda_s11_try_fuse(ggml_backend_cuda_context & ctx, ggml_cgraph * cgraph
                 signed char * q_ptr = g_s11_state.q_buf[1];
                 float * scales_ptr = g_s11_state.s_buf[1];
                 int32_t * safe_ids = g_s11_state.plan_buf;
-                s11_quantize<<<dim3(k / 128, tokens * slots), 32, 0, ctx.stream()>>>(
-                    static_cast<const char *>(x->data), q_ptr, scales_ptr, nullptr, k,
-                    slots, tokens, x->nb[1], x->nb[2]);
+                const bool inline_quant_m1 = (tokens >= 1 && tokens <= 8) && (x->nb[1] == size_t(k) * sizeof(float)) &&
+                                             ggml_is_contiguous(x) && !s11_tensors_overlap(c2, x);
+                if (!inline_quant_m1) {
+                    s11_quantize<<<dim3(k / 128, tokens * slots), 32, 0, ctx.stream()>>>(
+                        static_cast<const char *>(x->data), q_ptr, scales_ptr, nullptr, k,
+                        slots, tokens, x->nb[1], x->nb[2]);
+                }
                 const char * ids_ptr = static_cast<const char *>(ids->data);
                 size_t ids_nb0 = ids->nb[0];
                 size_t ids_nb1 = ids->nb[1];
@@ -4475,17 +6670,29 @@ int ggml_cuda_s11_try_fuse(ggml_backend_cuda_context & ctx, ggml_cgraph * cgraph
                     ids_nb1 = size_t(slots) * sizeof(int32_t);
                 }
                 CUDA_CHECK(cudaGetLastError());
-                g_s11_state.last_x_data[1] = x->data;
-                g_s11_state.last_k[1] = k;
-                g_s11_state.last_tokens[1] = tokens;
-                g_s11_state.last_input_slots[1] = slots;
+                if (inline_quant_m1) {
+                    g_s11_state.last_x_data[1] = nullptr;
+                } else {
+                    g_s11_state.last_x_data[1] = x->data;
+                    g_s11_state.last_k[1] = k;
+                    g_s11_state.last_tokens[1] = tokens;
+                    g_s11_state.last_input_slots[1] = slots;
+                }
                 g_s11_state.last_ids_data = nullptr;
                 ggml_cuda_s11_invalidate_if_written(c2->data);
                 if (tokens == 1) {
-                    s11_fused_down_exps_reduce_kernel_m1<<<dim3((n + 7) / 8, 1), 256, 0, ctx.stream()>>>(
+                    s11_fused_down_exps_reduce_kernel_m1<false><<<dim3((n + 7) / 8, 1), 256, 0, ctx.stream()>>>(
                         static_cast<const char *>(w->data), q_ptr, scales_ptr,
                         ids_ptr, static_cast<char *>(c2->data),
-                        n, slots, w->nb[1], w->nb[2], ids_nb0);
+                        n, slots, w->nb[1], w->nb[2], ids_nb0,
+                        inline_quant_m1 ? static_cast<const float *>(x->data) : nullptr);
+                } else if (tokens >= 2 && tokens <= 8) {
+                    s11_fused_down_exps_reduce_kernel_m1<true><<<dim3((n + 7) / 8, tokens), 256, 0, ctx.stream()>>>(
+                        static_cast<const char *>(w->data), q_ptr, scales_ptr,
+                        ids_ptr, static_cast<char *>(c2->data),
+                        n, slots, w->nb[1], w->nb[2], ids_nb0,
+                        inline_quant_m1 ? static_cast<const float *>(x->data) : nullptr,
+                        ids_nb1, c2->nb[1], x->nb[2]);
                 } else {
                     s11_fused_down_exps_reduce_kernel<<<dim3((n + 3) / 4, tokens), 128, 0, ctx.stream()>>>(
                         static_cast<const char *>(w->data), q_ptr, scales_ptr,
@@ -4568,7 +6775,13 @@ int ggml_cuda_s11_try_fuse(ggml_backend_cuda_context & ctx, ggml_cgraph * cgraph
             const size_t ot1 = m1->nb[1];
             const size_t ot2 = m2 ? m2->nb[1] : 0;
 
-            if (tokens >= 32) {
+            if (tokens >= 64) {
+                const int total_b = (n0_rows + n1_rows + n2_rows) / 64;
+                s11_w4_multi_wmma_k128_kernel<4><<<dim3(total_b, (tokens + 63) / 64), 128, 0, ctx.stream()>>>(
+                    w0_ptr, w1_ptr, w2_ptr, out0_ptr, out1_ptr, out2_ptr,
+                    q_ptr, scales_ptr, n0_rows, n1_rows, n2_rows, tokens,
+                    wr0, wr1, wr2, ot0, ot1, ot2);
+            } else if (tokens >= 32) {
                 const int total_b = (n0_rows + n1_rows + n2_rows) / 64;
                 s11_w4_multi_wmma_k128_kernel<2><<<dim3(total_b, (tokens + 31) / 32), 128, 0, ctx.stream()>>>(
                     w0_ptr, w1_ptr, w2_ptr, out0_ptr, out1_ptr, out2_ptr,
@@ -4585,21 +6798,33 @@ int ggml_cuda_s11_try_fuse(ggml_backend_cuda_context & ctx, ggml_cgraph * cgraph
                 s11_w4_multi_projection_packed_m1<<<dim3(total_b8, 1), 256, 0, ctx.stream()>>>(
                     w0_ptr, w1_ptr, w2_ptr, out0_ptr, out1_ptr, out2_ptr,
                     q_ptr, scales_ptr, n0_rows, n1_rows, n2_rows, wr0, wr1, wr2);
-            } else if (tokens >= 8) {
-                const int total_b4 = (n0_rows + n1_rows + n2_rows) / 4;
-                s11_w4_multi_projection_packed<8><<<dim3(total_b4, (tokens + 7) / 8), 128, 0, ctx.stream()>>>(
+            } else if (tokens == 2) {
+                const int total_b8 = (n0_rows + n1_rows + n2_rows) / 8;
+                s11_w4_multi_projection_packed<2><<<dim3(total_b8, 1), 256, 0, ctx.stream()>>>(
                     w0_ptr, w1_ptr, w2_ptr, out0_ptr, out1_ptr, out2_ptr,
                     q_ptr, scales_ptr, n0_rows, n1_rows, n2_rows, tokens,
                     wr0, wr1, wr2, ot0, ot1, ot2);
-            } else if (tokens >= 4) {
-                const int total_b4 = (n0_rows + n1_rows + n2_rows) / 4;
-                s11_w4_multi_projection_packed<4><<<dim3(total_b4, (tokens + 3) / 4), 128, 0, ctx.stream()>>>(
+            } else if (tokens <= 4) {
+                const int total_b8 = (n0_rows + n1_rows + n2_rows) / 8;
+                s11_w4_multi_projection_packed<4><<<dim3(total_b8, 1), 256, 0, ctx.stream()>>>(
+                    w0_ptr, w1_ptr, w2_ptr, out0_ptr, out1_ptr, out2_ptr,
+                    q_ptr, scales_ptr, n0_rows, n1_rows, n2_rows, tokens,
+                    wr0, wr1, wr2, ot0, ot1, ot2);
+            } else if (tokens <= 6) {
+                const int total_b8 = (n0_rows + n1_rows + n2_rows) / 8;
+                s11_w4_multi_projection_packed<6><<<dim3(total_b8, 1), 256, 0, ctx.stream()>>>(
+                    w0_ptr, w1_ptr, w2_ptr, out0_ptr, out1_ptr, out2_ptr,
+                    q_ptr, scales_ptr, n0_rows, n1_rows, n2_rows, tokens,
+                    wr0, wr1, wr2, ot0, ot1, ot2);
+            } else if (tokens >= 8) {
+                const int total_b8 = (n0_rows + n1_rows + n2_rows) / 8;
+                s11_w4_multi_projection_packed<8><<<dim3(total_b8, (tokens + 7) / 8), 256, 0, ctx.stream()>>>(
                     w0_ptr, w1_ptr, w2_ptr, out0_ptr, out1_ptr, out2_ptr,
                     q_ptr, scales_ptr, n0_rows, n1_rows, n2_rows, tokens,
                     wr0, wr1, wr2, ot0, ot1, ot2);
             } else {
-                const int total_b4 = (n0_rows + n1_rows + n2_rows) / 4;
-                s11_w4_multi_projection_packed<1><<<dim3(total_b4, tokens), 128, 0, ctx.stream()>>>(
+                const int total_b8 = (n0_rows + n1_rows + n2_rows) / 8;
+                s11_w4_multi_projection_packed<8><<<dim3(total_b8, 1), 256, 0, ctx.stream()>>>(
                     w0_ptr, w1_ptr, w2_ptr, out0_ptr, out1_ptr, out2_ptr,
                     q_ptr, scales_ptr, n0_rows, n1_rows, n2_rows, tokens,
                     wr0, wr1, wr2, ot0, ot1, ot2);
@@ -4746,14 +6971,29 @@ int ggml_cuda_s11_try_fuse(ggml_backend_cuda_context & ctx, ggml_cgraph * cgraph
             }
             const int m = tokens * slots;
             const int max_tiles = std::min(m, (m + 15) / 16 + std::min(m, 256));
-            s11_routed_up_gate_swiglu_wmma_k128_kernel<<<dim3((n + 63) / 64, max_tiles), 128, 0, ctx.stream()>>>(
-                static_cast<const char *>(w_up->data), static_cast<const char *>(w_gate->data),
-                q_ptr, scales_ptr, tile_experts, tile_starts, tile_counts, sorted_assn, num_tiles,
-                prob_weights ? static_cast<const char *>(prob_weights->data) : nullptr,
-                static_cast<char *>(out_node->data), k, n, slots, input_slots,
-                w_up->nb[1], w_up->nb[2],
-                prob_weights ? prob_weights->nb[1] : 0, prob_weights ? prob_weights->nb[2] : 0,
-                out_node->nb[1], out_node->nb[2]);
+            const bool pipe_up_gate = s11_routed_pipe() && k % 128 == 0 && n % 64 == 0 &&
+                                      w_up->nb[1] == size_t(k / 128) * 36 &&
+                                      w_gate->nb[1] == w_up->nb[1] && w_gate->nb[2] == w_up->nb[2] &&
+                                      s11_routed_pipe_device_weights(w_up) && s11_routed_pipe_device_weights(w_gate);
+            if (pipe_up_gate) {
+                s11_routed_up_gate_swiglu_wmma_k128_pipe_kernel<<<dim3((n + 63) / 64, max_tiles), 128, 0, ctx.stream()>>>(
+                    static_cast<const char *>(w_up->data), static_cast<const char *>(w_gate->data),
+                    q_ptr, scales_ptr, tile_experts, tile_starts, tile_counts, sorted_assn, num_tiles,
+                    prob_weights ? static_cast<const char *>(prob_weights->data) : nullptr,
+                    static_cast<char *>(out_node->data), k, n, slots, input_slots,
+                    w_up->nb[1], w_up->nb[2],
+                    prob_weights ? prob_weights->nb[1] : 0, prob_weights ? prob_weights->nb[2] : 0,
+                    out_node->nb[1], out_node->nb[2]);
+            } else {
+                s11_routed_up_gate_swiglu_wmma_k128_kernel<<<dim3((n + 63) / 64, max_tiles), 128, 0, ctx.stream()>>>(
+                    static_cast<const char *>(w_up->data), static_cast<const char *>(w_gate->data),
+                    q_ptr, scales_ptr, tile_experts, tile_starts, tile_counts, sorted_assn, num_tiles,
+                    prob_weights ? static_cast<const char *>(prob_weights->data) : nullptr,
+                    static_cast<char *>(out_node->data), k, n, slots, input_slots,
+                    w_up->nb[1], w_up->nb[2],
+                    prob_weights ? prob_weights->nb[1] : 0, prob_weights ? prob_weights->nb[2] : 0,
+                    out_node->nb[1], out_node->nb[2]);
+            }
         } else {
             if (prob_weights) {
                 g_s11_state.last_ids_data = ids->data;
@@ -4763,13 +7003,22 @@ int ggml_cuda_s11_try_fuse(ggml_backend_cuda_context & ctx, ggml_cgraph * cgraph
                 g_s11_state.last_ids_nb1 = ids->nb[1];
             }
             if (tokens == 1 && k == 2048) {
-                s11_fused_up_gate_swiglu_kernel_m1<GGML_TYPE_S11_W2><<<dim3((n + 7) / 8, slots), 256, 0, ctx.stream()>>>(
+                s11_fused_up_gate_swiglu_kernel_m1<GGML_TYPE_S11_W2, false><<<dim3((n + 7) / 8, slots), 256, 0, ctx.stream()>>>(
                     static_cast<const char *>(w_up->data), static_cast<const char *>(w_gate->data),
                     q_ptr, scales_ptr, ids ? static_cast<const char *>(ids->data) : nullptr,
                     prob_weights ? static_cast<const char *>(prob_weights->data) : nullptr,
                     static_cast<char *>(out_node->data), k, n, slots, input_slots,
                     w_up->nb[1], w_up->nb[2], ids ? ids->nb[0] : 0,
                     prob_weights ? prob_weights->nb[1] : 0, out_node->nb[1]);
+            } else if (tokens >= 2 && tokens <= 7 && k == 2048) {
+                s11_fused_up_gate_swiglu_kernel_m1<GGML_TYPE_S11_W2, true><<<dim3((n + 7) / 8, tokens * slots), 256, 0, ctx.stream()>>>(
+                    static_cast<const char *>(w_up->data), static_cast<const char *>(w_gate->data),
+                    q_ptr, scales_ptr, ids ? static_cast<const char *>(ids->data) : nullptr,
+                    prob_weights ? static_cast<const char *>(prob_weights->data) : nullptr,
+                    static_cast<char *>(out_node->data), k, n, slots, input_slots,
+                    w_up->nb[1], w_up->nb[2], ids ? ids->nb[0] : 0,
+                    prob_weights ? prob_weights->nb[1] : 0, out_node->nb[1],
+                    ids ? ids->nb[1] : 0, prob_weights ? prob_weights->nb[2] : 0, out_node->nb[2]);
             } else {
                 s11_fused_up_gate_swiglu_kernel<GGML_TYPE_S11_W2><<<dim3((n + 3) / 4, tokens * slots), 128, 0, ctx.stream()>>>(
                     static_cast<const char *>(w_up->data), static_cast<const char *>(w_gate->data),
@@ -4782,8 +7031,13 @@ int ggml_cuda_s11_try_fuse(ggml_backend_cuda_context & ctx, ggml_cgraph * cgraph
             }
         }
     } else {
-        if (tokens >= 16) {
-            s11_shexp_up_gate_swiglu_wmma_k128_kernel<<<dim3((n + 63) / 64, (tokens + 15) / 16), 128, 0, ctx.stream()>>>(
+        if (tokens >= 32) {
+            s11_launch_shexp_up_gate_k128_prefill(
+                static_cast<const char *>(w_up->data), static_cast<const char *>(w_gate->data),
+                q_ptr, scales_ptr, static_cast<char *>(out_node->data),
+                k, n, tokens, w_up->nb[1], out_node->nb[1], ctx.stream());
+        } else if (tokens >= 16) {
+            s11_shexp_up_gate_swiglu_wmma_k128_kernel<1><<<dim3((n + 63) / 64, (tokens + 15) / 16), 128, 0, ctx.stream()>>>(
                 static_cast<const char *>(w_up->data), static_cast<const char *>(w_gate->data),
                 q_ptr, scales_ptr, static_cast<char *>(out_node->data),
                 k, n, tokens, w_up->nb[1], out_node->nb[1]);
@@ -4792,7 +7046,28 @@ int ggml_cuda_s11_try_fuse(ggml_backend_cuda_context & ctx, ggml_cgraph * cgraph
                 static_cast<const char *>(w_up->data), static_cast<const char *>(w_gate->data),
                 q_ptr, scales_ptr, nullptr, nullptr,
                 static_cast<char *>(out_node->data), k, n, 1, 1,
-                w_up->nb[1], w_up->nb[2], 0, 0, 0);
+                w_up->nb[1], w_up->nb[2], 0, 0, 0,
+                0, 0, out_node->nb[1]);
+        } else if (tokens == 2 && k == 2048) {
+            s11_shexp_up_gate_swiglu_multi<2><<<dim3((n + 7) / 8, 1), 256, 0, ctx.stream()>>>(
+                static_cast<const char *>(w_up->data), static_cast<const char *>(w_gate->data),
+                q_ptr, scales_ptr, static_cast<char *>(out_node->data),
+                n, tokens, w_up->nb[1], out_node->nb[1]);
+        } else if (tokens > 2 && tokens <= 4 && k == 2048) {
+            s11_shexp_up_gate_swiglu_multi<4><<<dim3((n + 7) / 8, 1), 256, 0, ctx.stream()>>>(
+                static_cast<const char *>(w_up->data), static_cast<const char *>(w_gate->data),
+                q_ptr, scales_ptr, static_cast<char *>(out_node->data),
+                n, tokens, w_up->nb[1], out_node->nb[1]);
+        } else if (tokens > 4 && tokens <= 6 && k == 2048) {
+            s11_shexp_up_gate_swiglu_multi<6><<<dim3((n + 7) / 8, 1), 256, 0, ctx.stream()>>>(
+                static_cast<const char *>(w_up->data), static_cast<const char *>(w_gate->data),
+                q_ptr, scales_ptr, static_cast<char *>(out_node->data),
+                n, tokens, w_up->nb[1], out_node->nb[1]);
+        } else if (tokens > 6 && tokens <= 15 && k == 2048) {
+            s11_shexp_up_gate_swiglu_multi<8><<<dim3((n + 7) / 8, (tokens + 7) / 8), 256, 0, ctx.stream()>>>(
+                static_cast<const char *>(w_up->data), static_cast<const char *>(w_gate->data),
+                q_ptr, scales_ptr, static_cast<char *>(out_node->data),
+                n, tokens, w_up->nb[1], out_node->nb[1]);
         } else {
             s11_fused_up_gate_swiglu_kernel<GGML_TYPE_S11_W2_BF16><<<dim3((n + 3) / 4, tokens * slots), 128, 0, ctx.stream()>>>(
                 static_cast<const char *>(w_up->data), static_cast<const char *>(w_gate->data),
@@ -4842,14 +7117,15 @@ static __device__ float s11_read_float(const char * pointer, int type) {
         : *reinterpret_cast<const float *>(pointer);
 }
 
-static __global__ void __launch_bounds__(128) s11_dense_kernel(
+template <int ROWS_PER_BLOCK = 4>
+static __global__ void __launch_bounds__(ROWS_PER_BLOCK * 32) s11_dense_kernel(
         const char * a, const char * b, char * output,
         int atype, int btype, int k, int n, int m, int heads, int a_heads, int a_sequences,
         size_t a0, size_t a1, size_t a2, size_t a3,
         size_t b0, size_t b1, size_t b2, size_t b3,
         size_t d1, size_t d2, size_t d3) {
     const int lane = threadIdx.x % 32;
-    const int row = blockIdx.x * 4 + threadIdx.x / 32;
+    const int row = blockIdx.x * ROWS_PER_BLOCK + threadIdx.x / 32;
     const int column = blockIdx.y % m;
     const int head = (blockIdx.y / m) % heads;
     const int sequence = blockIdx.y / (m * heads);
@@ -4860,7 +7136,7 @@ static __global__ void __launch_bounds__(128) s11_dense_kernel(
         const float4 * x4 = reinterpret_cast<const float4 *>(x);
         float4 * x_sh4 = reinterpret_cast<float4 *>(x_sh);
         #pragma unroll
-        for (int i = threadIdx.x; i < 512; i += 128) {
+        for (int i = threadIdx.x; i < 512; i += ROWS_PER_BLOCK * 32) {
             x_sh4[i] = x4[i];
         }
         __syncthreads();
@@ -5025,10 +7301,55 @@ void ggml_cuda_s11_dense(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
             CUDA_CHECK(cudaGetLastError());
             return;
         }
+    } else if (s11_optimization() >= 2 && m > 4 && m <= 6) {
+        const int y_blocks = heads * seqs;
+        if (y_blocks <= 65535) {
+            s11_dense_tiled_kernel<6><<<dim3((dst->ne[0] + 3) / 4, y_blocks), 128, 0, ctx.stream()>>>(
+                static_cast<const char *>(a->data), static_cast<const char *>(b->data), static_cast<char *>(dst->data),
+                a->type, b->type, a->ne[0], dst->ne[0], m, heads, a->ne[2], b->ne[3] / a->ne[3],
+                a->nb[0], a->nb[1], a->nb[2], a->nb[3], b->nb[0], b->nb[1], b->nb[2], b->nb[3],
+                dst->nb[1], dst->nb[2], dst->nb[3]);
+            CUDA_CHECK(cudaGetLastError());
+            return;
+        }
+    } else if (s11_optimization() >= 2 && m >= 4) {
+        const int m_tiles = (m + 3) / 4;
+        const int y_blocks = m_tiles * heads * seqs;
+        if (y_blocks <= 65535) {
+            s11_dense_tiled_kernel<4><<<dim3((dst->ne[0] + 3) / 4, y_blocks), 128, 0, ctx.stream()>>>(
+                static_cast<const char *>(a->data), static_cast<const char *>(b->data), static_cast<char *>(dst->data),
+                a->type, b->type, a->ne[0], dst->ne[0], m, heads, a->ne[2], b->ne[3] / a->ne[3],
+                a->nb[0], a->nb[1], a->nb[2], a->nb[3], b->nb[0], b->nb[1], b->nb[2], b->nb[3],
+                dst->nb[1], dst->nb[2], dst->nb[3]);
+            CUDA_CHECK(cudaGetLastError());
+            return;
+        }
+    } else if (s11_optimization() >= 2 && m >= 2) {
+        const int m_tiles = (m + 1) / 2;
+        const int y_blocks = m_tiles * heads * seqs;
+        if (y_blocks <= 65535) {
+            s11_dense_tiled_kernel<2><<<dim3((dst->ne[0] + 3) / 4, y_blocks), 128, 0, ctx.stream()>>>(
+                static_cast<const char *>(a->data), static_cast<const char *>(b->data), static_cast<char *>(dst->data),
+                a->type, b->type, a->ne[0], dst->ne[0], m, heads, a->ne[2], b->ne[3] / a->ne[3],
+                a->nb[0], a->nb[1], a->nb[2], a->nb[3], b->nb[0], b->nb[1], b->nb[2], b->nb[3],
+                dst->nb[1], dst->nb[2], dst->nb[3]);
+            CUDA_CHECK(cudaGetLastError());
+            return;
+        }
     }
     const int columns = dst->ne[1] * dst->ne[2] * dst->ne[3];
     GGML_ASSERT(columns <= 65535);
-    s11_dense_kernel<<<dim3((dst->ne[0] + 3) / 4, columns), 128, 0, ctx.stream()>>>(
+    if (s11_optimization() >= 2 && a->ne[0] == 2048 && columns == 1 && dst->ne[0] >= 64 &&
+        b->type == GGML_TYPE_F32 && b->nb[0] == sizeof(float)) {
+        s11_dense_kernel<8><<<dim3((dst->ne[0] + 7) / 8, columns), 256, 0, ctx.stream()>>>(
+            static_cast<const char *>(a->data), static_cast<const char *>(b->data), static_cast<char *>(dst->data),
+            a->type, b->type, a->ne[0], dst->ne[0], dst->ne[1], dst->ne[2], a->ne[2], b->ne[3] / a->ne[3],
+            a->nb[0], a->nb[1], a->nb[2], a->nb[3], b->nb[0], b->nb[1], b->nb[2], b->nb[3],
+            dst->nb[1], dst->nb[2], dst->nb[3]);
+        CUDA_CHECK(cudaGetLastError());
+        return;
+    }
+    s11_dense_kernel<4><<<dim3((dst->ne[0] + 3) / 4, columns), 128, 0, ctx.stream()>>>(
         static_cast<const char *>(a->data), static_cast<const char *>(b->data), static_cast<char *>(dst->data),
         a->type, b->type, a->ne[0], dst->ne[0], dst->ne[1], dst->ne[2], a->ne[2], b->ne[3] / a->ne[3],
         a->nb[0], a->nb[1], a->nb[2], a->nb[3], b->nb[0], b->nb[1], b->nb[2], b->nb[3],

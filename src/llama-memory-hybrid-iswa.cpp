@@ -84,8 +84,9 @@ llama_memory_context_ptr llama_memory_hybrid_iswa::init_batch(llama_batch_allocr
                 // the trailing (1 + n_rs_seq) tokens of each seq must stay in the same ubatch
                 //   so that the rollback snapshots remain valid
                 const uint32_t n_rs_seq = mem_recr->n_rs_seq;
+                const uint32_t n_keep_tail = (n_rs_seq > 0 && balloc.get_n_outputs() > 1) ? n_rs_seq + 1 : 0;
 
-                ubatch = balloc.split_equal(n_ubatch, !unified, n_rs_seq > 0 ? n_rs_seq + 1 : 0);
+                ubatch = balloc.split_equal(n_ubatch, !unified, n_keep_tail);
             }
 
             if (ubatch.n_tokens == 0) {

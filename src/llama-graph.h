@@ -291,6 +291,9 @@ public:
     // used in view offsets, need to match for valid graph reuse
     uint32_t head;
     int32_t rs_z;
+
+    // base+tip recurrent rollback control (llama_memory_recurrent::rs_replay_set_input), null when disabled
+    ggml_tensor * rs_ctl = nullptr; // I32 [LLAMA_RS_REPLAY_N_CTL]
 };
 
 class llm_graph_input_cross_embd : public llm_graph_input_i {
@@ -367,6 +370,33 @@ public:
     const llama_cparams cparams;
 
     const llama_kv_cache_context * mctx;
+
+    // S11_NKV_REUSE: elastic n_kv for the prefill graphs of the hybrid trunk input, see llama-graph.cpp
+    struct nkv_entry {
+        ggml_tensor * view = nullptr; // K/V cache VIEW, n_kv on axis 2
+        ggml_tensor * perm = nullptr; // its PERMUTE(0,2,1,3), n_kv on axis 1
+        ggml_tensor * fa   = nullptr; // the FLASH_ATTN_EXT reading perm
+        int           il   = -1;
+        bool          is_k = false;
+    };
+
+    bool    nkv_eligible = false; // build-time conditions hold, build_attn registers the K/V views
+    bool    nkv_dyn      = false; // audit passed: allocated at nkv_cap, n_kv patched in place before every compute
+    int64_t nkv_cap      = 0;
+    int64_t nkv_built    = 0;
+    int64_t nkv_cur      = 0;
+
+    std::vector<nkv_entry>     nkv_views;
+    std::vector<ggml_tensor *> nkv_fa;       // distinct FLASH_ATTN_EXT nodes
+    std::vector<size_t>        nkv_fa_alloc; // their allocated size (at nkv_cap)
+    std::vector<ggml_tensor *> nkv_mask_dev; // scheduler copies of self_kq_mask
+
+    void nkv_register(ggml_tensor * k, ggml_tensor * v, int il);
+    bool nkv_audit(ggml_cgraph * gf, const std::vector<ggml_backend_buffer_type_t> & bufts);
+    void nkv_bind();
+    void nkv_fit(int64_t n);
+    bool nkv_fits(int64_t n);
+    void nkv_check(const llama_kv_cache_context * kv, const llama_ubatch * ubatch) const;
 };
 
 // V-less input for the KV cache
@@ -695,6 +725,10 @@ public:
     const llama_cparams cparams;
 
     const llama_memory_hybrid_context * mctx;
+
+    // S11_NKV_REUSE counters: n_kv seen by the last can_reuse, and whether it was accepted elastically
+    int64_t nkv_probe   = -1;
+    bool    nkv_relaxed = false;
 };
 
 class llm_graph_input_mem_hybrid_k : public llm_graph_input_i {
@@ -824,6 +858,9 @@ struct llm_graph_params {
 
     llm_graph_result * res;
 
+    // QWEN35MOE: append the nextn (MTP) block to the target graph, see llm_graph_context::build_mtp_fused
+    bool mtp_fused = false;
+
     // return true if the "other" params would result in a graph with the same topology as with the current params
     //   having the same topology allows us to reuse the graph in some cases
     bool allow_reuse(const llm_graph_params & other) const {
@@ -891,6 +928,7 @@ struct llm_graph_params {
             cparams.embeddings_nextn        == other.cparams.embeddings_nextn        &&
             cparams.embeddings_nextn_masked == other.cparams.embeddings_nextn_masked &&
             cparams.causal_attn             == other.cparams.causal_attn             &&
+            mtp_fused == other.mtp_fused &&
             arch  == other.arch  &&
             gtype == other.gtype &&
             cvec  == other.cvec  &&
@@ -944,6 +982,15 @@ public:
 
     void set_params(const llm_graph_params & params);
 
+    // S11_NKV_REUSE hooks around the scheduler allocation of a newly built graph, see llama-graph.cpp
+    //   nkv_prepare: before ggml_backend_sched_alloc_graph, returns 1 elastic, 0 strict (audit failed), -1 not eligible
+    //   nkv_bind:    after  ggml_backend_sched_alloc_graph
+    int     nkv_prepare(ggml_cgraph * gf, const std::vector<ggml_backend_buffer_type_t> & bufts);
+    void    nkv_bind();
+    bool    nkv_relaxed() const;
+    int64_t nkv_probe()   const;
+    int64_t nkv_current() const;
+
     // important graph nodes
     ggml_tensor * t_inp_tokens  = nullptr;
     ggml_tensor * t_inp_embd    = nullptr; // [n_embd_inp, n_tokens]
@@ -951,6 +998,7 @@ public:
     ggml_tensor * t_embd        = nullptr;
     ggml_tensor * t_embd_pooled = nullptr;
     ggml_tensor * t_h_nextn     = nullptr; // [n_embd, n_outputs] hidden state before final output norm
+    ggml_tensor * t_mtp_draft   = nullptr; // I32 [n_outputs] fused MTP draft of each output row
 
     std::vector<ggml_tensor *> t_layer_inp;
 
@@ -1383,6 +1431,14 @@ struct llm_graph_context {
                 int32_t   n_seqs,
             const llm_graph_get_rows_fn & get_state_rows = nullptr) const;
 
+    // base+tip recurrent rollback: zeroes a fresh state in place and returns a view of the cache with the state
+    // shape - the gated delta net kernel loads the selected state row itself, without a gather
+    ggml_tensor * build_rs_inplace(
+            llm_graph_input_rs * inp,
+            ggml_tensor * s,
+                int32_t   state_size,
+                int32_t   n_seqs) const;
+
     ggml_tensor * build_rwkv_token_shift_load(
         llm_graph_input_rs * inp,
         const llama_ubatch & ubatch,
@@ -1417,6 +1473,15 @@ struct llm_graph_context {
     //
 
     void build_sampling() const;
+
+    //
+    // fused MTP-in-verify (QWEN35MOE, defined in models/qwen35moe.cpp)
+    //
+
+    // runs the nextn block on the rows of the target ubatch after the backend samplers:
+    // row i writes the MTP KV entry of (h_i, t_{i+1}) into the target attention cell of row i,
+    // output rows also return the argmax of the shortlisted MTP head in res->t_mtp_draft
+    void build_mtp_fused(const llama_model & model) const;
 
     //
     // dense (out)

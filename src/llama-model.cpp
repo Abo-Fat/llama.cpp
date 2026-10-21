@@ -2738,8 +2738,10 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                             return hparams.is_recr(il) && hparams.n_ff(il) == 0;
                         };
                     } else if (arch == LLM_ARCH_QWEN3NEXT || arch == LLM_ARCH_QWEN35 || arch == LLM_ARCH_QWEN35MOE || arch == LLM_ARCH_QWEN4EXP || arch == LLM_ARCH_MINIMAX_01) {
-                        filter_attn = [&](uint32_t il) {
-                            return il < hparams.n_layer() && !hparams.is_recr(il);
+                        // fused MTP-in-verify: the target attention cache also holds the nextn layer, written by the same ubatches
+                        const bool attn_nextn = mtp_fused_kv(cparams);
+                        filter_attn = [&, attn_nextn](uint32_t il) {
+                            return il < hparams.n_layer() ? !hparams.is_recr(il) : (attn_nextn && il == hparams.n_layer());
                         };
                         filter_recr = [&](uint32_t il) {
                             return il < hparams.n_layer() && hparams.is_recr(il);
@@ -2932,6 +2934,25 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
     return res;
 }
 
+bool llama_model::mtp_fused_kv(const llama_cparams & cparams) const {
+    // LLAMA_MTP_FUSED=0 keeps the separate MTP draft context (A/B switch, also read by common/speculative.cpp)
+    static const bool enabled = [] {
+        const char * env = std::getenv("LLAMA_MTP_FUSED");
+        return env == nullptr || std::atoi(env) != 0;
+    }();
+
+    const uint32_t il = hparams.n_layer();
+
+    return enabled &&
+        arch == LLM_ARCH_QWEN35MOE &&
+        cparams.ctx_type == LLAMA_CONTEXT_TYPE_DEFAULT &&
+        cparams.n_seq_max == 1 &&
+        (cparams.n_rs_seq > 0 || cparams.n_outputs_max_per_seq > 1) &&
+        hparams.n_layer_nextn == 1 && il > 0 && hparams.router_layer < 0 && !hparams.is_recr(il) &&
+        output != nullptr && output->type == GGML_TYPE_S11_I8 &&
+        layers.size() > il && layers[il].nextn.eh_proj != nullptr && layers[il].ffn_gate_inp != nullptr;
+}
+
 ggml_cgraph * llama_model::build_graph(const llm_graph_params & params) const {
     std::unique_ptr<llm_graph_context> llm = build_arch_graph(params);
 
@@ -2946,6 +2967,11 @@ ggml_cgraph * llama_model::build_graph(const llm_graph_params & params) const {
     // dense linear projections are applied after pooling
     // TODO: move reranking logic here and generalize
     llm->build_dense_out(dense_2_out_layers, dense_2_out_layers_b, dense_3_out_layers);
+
+    // fused MTP-in-verify: the nextn block consumes the backend-sampled tokens, so it comes after build_sampling
+    if (params.mtp_fused && params.gtype == LLM_GRAPH_TYPE_DEFAULT && arch == LLM_ARCH_QWEN35MOE) {
+        llm->build_mtp_fused(*this);
+    }
 
     llm->res->set_outputs(params);
 

@@ -18,12 +18,16 @@
 #include "llama-memory-hybrid-iswa.h"
 #include "llama-memory-recurrent.h"
 
+#include "ggml-alloc.h"
+
+#include <algorithm>
 #include <cassert>
 #include <cmath>
 #include <cstring>
 #include <numeric>
 #include <sstream>
 #include <string>
+#include <unordered_map>
 #include <unordered_set>
 
 // dedup helpers
@@ -64,6 +68,59 @@ static bool can_reuse_kq_mask(
     res &= (kq_mask->ne[3] == n_stream);
 
     return res;
+}
+
+// S11_NKV_REUSE: elastic n_kv reuse of prefill graphs
+//   a prefill graph of the hybrid trunk input whose only change against the previous ubatch is n_kv is reused instead
+//   of rebuilt: the KQ mask (host leaf and scheduler copy), the K/V cache views and their permutes are allocated at the
+//   KV capacity and their n_kv axis is patched in place before every compute, so FLASH_ATTN_EXT (an eager CUDA segment)
+//   launches with the shapes, strides and data of a rebuild at the same n_kv
+//   S11_NKV_REUSE=0       strict n_kv predicate (O9.3)
+//   S11_NKV_REUSE_CHECK=1 shadow check of the patched layout and mask contents against fresh references
+static bool llm_nkv_reuse_enabled() {
+    static const bool enabled = [] {
+        const char * env = getenv("S11_NKV_REUSE");
+        if (env != nullptr && atoi(env) == 0) {
+            return false;
+        }
+        // with concurrent CUDA events, FLASH_ATTN_EXT is not split into its own eager segment
+        const char * opt = getenv("GGML_CUDA_GRAPH_OPT");
+        if (opt != nullptr && atoi(opt) == 1) {
+            return false;
+        }
+        return true;
+    }();
+    return enabled;
+}
+
+static bool llm_nkv_check_enabled() {
+    static const bool enabled = [] {
+        const char * env = getenv("S11_NKV_REUSE_CHECK");
+        return env != nullptr && atoi(env) != 0;
+    }();
+    return enabled;
+}
+
+static bool llm_nkv_same_layout(const ggml_tensor * a, const ggml_tensor * b) {
+    if (a->type != b->type) {
+        return false;
+    }
+    for (int i = 0; i < GGML_MAX_DIMS; ++i) {
+        if (a->ne[i] != b->ne[i] || a->nb[i] != b->nb[i]) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static void llm_nkv_log_audit(bool ok, const char * why, size_t n_views, size_t n_fa, int64_t n_kv_built, int64_t n_kv_cap) {
+    static int n_ok   = 0;
+    static int n_fail = 0;
+    if (ok ? (n_ok++ < 2) : (n_fail++ < 8)) {
+        LLAMA_LOG_INFO("s11_nkv: audit %s%s%s: views = %zu, fa = %zu, n_kv_built = %lld, n_kv_cap = %lld\n",
+                ok ? "elastic" : "strict", ok ? "" : " - ", ok ? "" : why,
+                n_views, n_fa, (long long) n_kv_built, (long long) n_kv_cap);
+    }
 }
 
 // impl
@@ -361,9 +418,20 @@ void llm_graph_input_cls::set_input(const llama_ubatch * ubatch) {
     }
 }
 
-void llm_graph_input_rs::set_input(const llama_ubatch * ubatch) {
-    GGML_UNUSED(ubatch);
+// base+tip recurrent rollback: fills the per-ubatch replay control, which also advances the rollback state machine
+static void llm_graph_set_input_rs_replay(
+        const llm_graph_input_rs * inp, const llama_memory_recurrent_context * mctx, const llama_ubatch * ubatch) {
+    if (inp->rs_ctl == nullptr || inp->rs_ctl->buffer == nullptr) {
+        return;
+    }
 
+    GGML_ASSERT(ggml_backend_buffer_is_host(inp->rs_ctl->buffer));
+    GGML_ASSERT(inp->rs_ctl->ne[0] >= LLAMA_RS_REPLAY_N_CTL);
+
+    mctx->rs_replay_set_input(*ubatch, (int32_t *) inp->rs_ctl->data);
+}
+
+void llm_graph_input_rs::set_input(const llama_ubatch * ubatch) {
     const int64_t n_rs = mctx->get_n_rs();
 
     if (s_copy) {
@@ -375,6 +443,8 @@ void llm_graph_input_rs::set_input(const llama_ubatch * ubatch) {
             data[i] = mctx->s_copy(i);
         }
     }
+
+    llm_graph_set_input_rs_replay(this, mctx, ubatch);
 }
 
 bool llm_graph_input_rs::can_reuse(const llm_graph_params & params) {
@@ -1125,11 +1195,379 @@ void llm_graph_input_attn_cross::set_input(const llama_ubatch * ubatch) {
     }
 }
 
+// S11_NKV_REUSE: elastic n_kv state of the trunk attention input
+
+void llm_graph_input_attn_kv::nkv_register(ggml_tensor * k, ggml_tensor * v, int il) {
+    if (!nkv_eligible) {
+        return;
+    }
+
+    ggml_tensor * kv[2] = { k, v };
+    for (int j = 0; j < 2; ++j) {
+        ggml_tensor * t = kv[j];
+
+        // f16, non-transposed [n_embd_head, n_head_kv, n_kv, 1] view of the cache: n_kv is axis 2
+        const bool ok = t != nullptr && t->op == GGML_OP_VIEW && t->view_src != nullptr &&
+            t->type == GGML_TYPE_F16 && t->ne[2] == nkv_built && t->ne[3] == 1 &&
+            t->nb[0] == ggml_type_size(t->type) &&
+            t->nb[1] >= t->nb[0]*(size_t) t->ne[0] && t->nb[2] >= t->nb[1]*(size_t) t->ne[1] &&
+            ggml_nbytes(t->view_src) > t->view_offs;
+        if (!ok) {
+            nkv_eligible = false;
+            nkv_views.clear();
+            return;
+        }
+
+        // the rows of the cache buffer reachable from the view offset bound the capacity
+        const int64_t rows = (int64_t) ((ggml_nbytes(t->view_src) - t->view_offs) / t->nb[2]);
+        nkv_cap = std::min(nkv_cap, rows);
+
+        nkv_entry e;
+        e.view = t;
+        e.il   = il;
+        e.is_k = j == 0;
+        nkv_views.push_back(e);
+    }
+
+    if (nkv_cap < nkv_built) {
+        nkv_eligible = false;
+        nkv_views.clear();
+    }
+}
+
+void llm_graph_input_attn_kv::nkv_fit(int64_t n) {
+    GGML_ASSERT(n >= 1 && n <= nkv_cap && "S11_NKV_REUSE: n_kv exceeds the elastic capacity");
+
+    const auto fit_mask = [n](ggml_tensor * t) {
+        t->ne[0] = n;
+        t->nb[1] = t->nb[0]*(size_t) n;
+        t->nb[2] = t->nb[1]*(size_t) t->ne[1];
+        t->nb[3] = t->nb[2]*(size_t) t->ne[2];
+    };
+
+    fit_mask(self_kq_mask);
+    for (ggml_tensor * t : nkv_mask_dev) {
+        fit_mask(t);
+    }
+
+    // strides, offsets and view_src are untouched
+    for (auto & e : nkv_views) {
+        e.view->ne[2] = n;
+        if (e.perm != nullptr) {
+            e.perm->ne[1] = n;
+        }
+    }
+
+    nkv_cur = n;
+}
+
+bool llm_graph_input_attn_kv::nkv_audit(ggml_cgraph * gf, const std::vector<ggml_backend_buffer_type_t> & bufts) {
+    nkv_dyn = false;
+    nkv_fa.clear();
+    nkv_fa_alloc.clear();
+    nkv_mask_dev.clear();
+    for (auto & e : nkv_views) {
+        e.perm = nullptr;
+        e.fa   = nullptr;
+    }
+
+    const size_t n_views = nkv_views.size();
+
+    const auto fail = [&](const char * why) {
+        llm_nkv_log_audit(false, why, n_views, nkv_fa.size(), nkv_built, nkv_cap);
+        nkv_fa.clear();
+        for (auto & e : nkv_views) {
+            e.perm = nullptr;
+            e.fa   = nullptr;
+        }
+        return false;
+    };
+
+    ggml_tensor * mask = self_kq_mask;
+
+    if (!nkv_eligible || n_views == 0 || n_views % 2 != 0) {
+        return fail("no registered K/V views");
+    }
+    if (mask == nullptr || mask != self_kq_mask_cnv || mask->type != GGML_TYPE_F16 || mask->ne[0] != nkv_built ||
+        mask->ne[2] != 1 || mask->ne[3] != 1 || !ggml_is_contiguous(mask) || nkv_cap < nkv_built) {
+        return fail("unexpected KQ mask");
+    }
+
+    std::unordered_map<const ggml_tensor *, size_t> view_idx;
+    std::unordered_map<const ggml_tensor *, size_t> perm_idx;
+    for (size_t i = 0; i < n_views; ++i) {
+        if (!view_idx.emplace(nkv_views[i].view, i).second) {
+            return fail("duplicate K/V view");
+        }
+    }
+
+    const int n_nodes = ggml_graph_n_nodes(gf);
+    std::vector<int> n_use(n_views, 0);
+
+    // every view has exactly one consumer: a PERMUTE(0,2,1,3) that moves n_kv to axis 1
+    for (int i = 0; i < n_nodes; ++i) {
+        ggml_tensor * node = ggml_graph_node(gf, i);
+        for (int s = 0; s < GGML_MAX_SRC; ++s) {
+            if (node->src[s] == nullptr) {
+                continue;
+            }
+            const auto it = view_idx.find(node->src[s]);
+            if (it == view_idx.end()) {
+                continue;
+            }
+            auto & e = nkv_views[it->second];
+            n_use[it->second]++;
+
+            const int32_t     * p = node->op_params;
+            const ggml_tensor * w = e.view;
+            if (node->op != GGML_OP_PERMUTE || s != 0 || p[0] != 0 || p[1] != 2 || p[2] != 1 || p[3] != 3) {
+                return fail("K/V view consumer is not PERMUTE(0,2,1,3)");
+            }
+            if (node->ne[0] != w->ne[0] || node->ne[1] != w->ne[2] || node->ne[2] != w->ne[1] || node->ne[3] != w->ne[3] ||
+                node->nb[0] != w->nb[0] || node->nb[1] != w->nb[2] || node->nb[2] != w->nb[1] || node->nb[3] != w->nb[3]) {
+                return fail("unexpected K/V permute layout");
+            }
+            e.perm = node;
+        }
+    }
+    for (size_t i = 0; i < n_views; ++i) {
+        if (n_use[i] != 1 || nkv_views[i].perm == nullptr) {
+            return fail("K/V view without a single permute consumer");
+        }
+        if (!perm_idx.emplace(nkv_views[i].perm, i).second) {
+            return fail("shared K/V permute");
+        }
+        n_use[i] = 0;
+    }
+
+    // every permute has exactly one consumer: a prefill FLASH_ATTN_EXT (eager segment) that reads the mask,
+    // and every consumer of the mask is such a FLASH_ATTN_EXT
+    std::vector<ggml_tensor *> mask_users;
+    for (int i = 0; i < n_nodes; ++i) {
+        ggml_tensor * node = ggml_graph_node(gf, i);
+        for (int s = 0; s < GGML_MAX_SRC; ++s) {
+            ggml_tensor * src = node->src[s];
+            if (src == nullptr) {
+                continue;
+            }
+            if (src == mask) {
+                if (node->op != GGML_OP_FLASH_ATTN_EXT || s != 3) {
+                    return fail("KQ mask consumer is not FLASH_ATTN_EXT");
+                }
+                mask_users.push_back(node);
+            }
+            const auto it = perm_idx.find(src);
+            if (it == perm_idx.end()) {
+                continue;
+            }
+            auto & e = nkv_views[it->second];
+            n_use[it->second]++;
+            if (node->op != GGML_OP_FLASH_ATTN_EXT || s != (e.is_k ? 1 : 2) || node->src[3] != mask ||
+                node->src[0] == nullptr || node->src[0]->ne[1] <= 12) {
+                return fail("K/V permute consumer is not a prefill FLASH_ATTN_EXT");
+            }
+            e.fa = node;
+        }
+    }
+
+    std::unordered_map<const ggml_tensor *, int> fa_ops;
+    for (size_t i = 0; i < n_views; ++i) {
+        const auto & e = nkv_views[i];
+        if (n_use[i] != 1 || e.fa == nullptr) {
+            return fail("K/V permute without a single FLASH_ATTN_EXT consumer");
+        }
+        auto it = fa_ops.find(e.fa);
+        if (it == fa_ops.end()) {
+            it = fa_ops.emplace(e.fa, 0).first;
+            nkv_fa.push_back(e.fa);
+        }
+        const int bit = e.is_k ? 1 : 2;
+        if (it->second & bit) {
+            return fail("FLASH_ATTN_EXT with a duplicate K/V operand");
+        }
+        it->second |= bit;
+    }
+    for (const auto & it : fa_ops) {
+        if (it.second != 3) {
+            return fail("FLASH_ATTN_EXT without both K and V registered");
+        }
+    }
+    if (mask_users.size() != nkv_fa.size()) {
+        return fail("KQ mask consumed by an unregistered FLASH_ATTN_EXT");
+    }
+    for (ggml_tensor * fa : mask_users) {
+        if (fa_ops.find(fa) == fa_ops.end()) {
+            return fail("KQ mask consumed by an unregistered FLASH_ATTN_EXT");
+        }
+    }
+
+    // the graph is allocated at the capacity: on every buffer type that allocation must cover the one at the built n_kv
+    const size_t n_buft = bufts.size();
+    std::vector<size_t> size_built(nkv_fa.size()*n_buft, 0);
+    for (size_t i = 0; i < nkv_fa.size(); ++i) {
+        for (size_t b = 0; b < n_buft; ++b) {
+            size_built[i*n_buft + b] = ggml_backend_buft_get_alloc_size(bufts[b], nkv_fa[i]);
+        }
+    }
+
+    nkv_fit(nkv_cap);
+
+    for (size_t i = 0; i < nkv_fa.size(); ++i) {
+        for (size_t b = 0; b < n_buft; ++b) {
+            if (ggml_backend_buft_get_alloc_size(bufts[b], nkv_fa[i]) < size_built[i*n_buft + b]) {
+                // restore the exact built layout (strict O9.3 graph)
+                nkv_fit(nkv_built);
+                nkv_cur = 0;
+                return fail("FLASH_ATTN_EXT allocation at the capacity is smaller than at the built n_kv");
+            }
+        }
+    }
+
+    nkv_dyn = true;
+
+    llm_nkv_log_audit(true, "", n_views, nkv_fa.size(), nkv_built, nkv_cap);
+
+    return true;
+}
+
+void llm_graph_input_attn_kv::nkv_bind() {
+    if (!nkv_dyn) {
+        return;
+    }
+
+    GGML_ASSERT(nkv_cur == nkv_cap && "S11_NKV_REUSE: the graph must be allocated at the capacity");
+
+    nkv_mask_dev.clear();
+    nkv_fa_alloc.clear();
+
+    // the scheduler rewrote FLASH_ATTN_EXT->src[3] in place to its device copy of the mask
+    for (ggml_tensor * fa : nkv_fa) {
+        ggml_tensor * m = fa->src[3];
+        if (m == nullptr || !llm_nkv_same_layout(m, self_kq_mask) || fa->buffer == nullptr) {
+            GGML_ABORT("S11_NKV_REUSE: unexpected mask operand or allocation of %s after the scheduler split", fa->name);
+        }
+        if (m != self_kq_mask && std::find(nkv_mask_dev.begin(), nkv_mask_dev.end(), m) == nkv_mask_dev.end()) {
+            nkv_mask_dev.push_back(m);
+        }
+        nkv_fa_alloc.push_back(ggml_backend_buffer_get_alloc_size(fa->buffer, fa));
+    }
+
+    for (const auto & e : nkv_views) {
+        if (e.fa->src[e.is_k ? 1 : 2] != e.perm || e.perm->src[0] != e.view) {
+            GGML_ABORT("S11_NKV_REUSE: the scheduler rewired a K/V operand of %s", e.fa->name);
+        }
+    }
+}
+
+bool llm_graph_input_attn_kv::nkv_fits(int64_t n) {
+    if (!nkv_dyn || n < 1 || n > nkv_cap) {
+        return false;
+    }
+    if (n == nkv_cur) {
+        return true;
+    }
+
+    nkv_fit(n);
+
+    // the FLASH_ATTN_EXT allocation (including any backend scratch) was sized at the capacity
+    for (size_t i = 0; i < nkv_fa.size(); ++i) {
+        if (ggml_backend_buffer_get_alloc_size(nkv_fa[i]->buffer, nkv_fa[i]) > nkv_fa_alloc[i]) {
+            return false;
+        }
+    }
+
+    return true;
+}
+
+void llm_graph_input_attn_kv::nkv_check(const llama_kv_cache_context * kv, const llama_ubatch * ubatch) const {
+    const int64_t n = kv->get_n_kv();
+    if (nkv_cur != n) {
+        GGML_ABORT("S11_NKV_REUSE_CHECK: patched n_kv = %lld, memory n_kv = %lld", (long long) nkv_cur, (long long) n);
+    }
+
+    // K/V views and permutes against freshly built references
+    {
+        ggml_init_params params = {
+            /*.mem_size   =*/ ggml_tensor_overhead()*(nkv_views.size() + 8),
+            /*.mem_buffer =*/ nullptr,
+            /*.no_alloc   =*/ true,
+        };
+        ggml_context * ctx = ggml_init(params);
+        GGML_ASSERT(ctx != nullptr);
+
+        static const int perm_axis[GGML_MAX_DIMS] = { 0, 2, 1, 3 };
+        for (const auto & e : nkv_views) {
+            const ggml_tensor * r = e.is_k ? kv->get_k(ctx, e.il) : kv->get_v(ctx, e.il);
+            bool ok = r != nullptr && r->type == e.view->type && r->view_src == e.view->view_src && r->view_offs == e.view->view_offs;
+            for (int d = 0; ok && d < GGML_MAX_DIMS; ++d) {
+                ok = r->ne[d] == e.view->ne[d] && r->nb[d] == e.view->nb[d] &&
+                     e.perm->ne[d] == r->ne[perm_axis[d]] && e.perm->nb[d] == r->nb[perm_axis[d]];
+            }
+            if (!ok) {
+                GGML_ABORT("S11_NKV_REUSE_CHECK: %s view of layer %d differs from a fresh reference at n_kv = %lld",
+                        e.is_k ? "K" : "V", e.il, (long long) n);
+            }
+        }
+
+        ggml_free(ctx);
+    }
+
+    // mask layout, scheduler copies and the FLASH_ATTN_EXT allocation
+    const ggml_tensor * mask = self_kq_mask;
+    bool ok = mask->ne[0] == n && mask->ne[1] == (int64_t) ubatch->n_tokens && mask->ne[2] == 1 && mask->ne[3] == 1 &&
+              ggml_is_contiguous(mask);
+    for (const ggml_tensor * t : nkv_mask_dev) {
+        ok = ok && llm_nkv_same_layout(t, mask);
+    }
+    for (size_t i = 0; i < nkv_fa.size(); ++i) {
+        const ggml_tensor * fa = nkv_fa[i];
+        ok = ok && (fa->src[3] == mask || std::find(nkv_mask_dev.begin(), nkv_mask_dev.end(), fa->src[3]) != nkv_mask_dev.end());
+        ok = ok && ggml_backend_buffer_get_alloc_size(fa->buffer, fa) <= nkv_fa_alloc[i];
+    }
+    if (!ok) {
+        GGML_ABORT("S11_NKV_REUSE_CHECK: KQ mask or FLASH_ATTN_EXT layout mismatch at n_kv = %lld", (long long) n);
+    }
+
+    // mask contents against an exactly sized reference filled by the unchanged set_input_kq_mask
+    {
+        ggml_init_params params = {
+            /*.mem_size   =*/ ggml_tensor_overhead()*2,
+            /*.mem_buffer =*/ nullptr,
+            /*.no_alloc   =*/ true,
+        };
+        ggml_context * ctx = ggml_init(params);
+        GGML_ASSERT(ctx != nullptr);
+
+        ggml_tensor * ref = ggml_new_tensor_4d(ctx, mask->type, mask->ne[0], mask->ne[1], mask->ne[2], mask->ne[3]);
+        ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx, ggml_backend_cpu_buffer_type());
+        GGML_ASSERT(buf != nullptr);
+
+        kv->set_input_kq_mask(ref, ubatch, cparams.causal_attn);
+
+        const bool same = memcmp(ref->data, mask->data, ggml_nbytes(ref)) == 0;
+
+        ggml_backend_buffer_free(buf);
+        ggml_free(ctx);
+
+        if (!same) {
+            GGML_ABORT("S11_NKV_REUSE_CHECK: KQ mask contents differ from a fresh reference at n_kv = %lld", (long long) n);
+        }
+    }
+}
+
 void llm_graph_input_mem_hybrid::set_input(const llama_ubatch * ubatch) {
+    if (inp_attn->nkv_dyn) {
+        inp_attn->nkv_fit(mctx->get_attn()->get_n_kv());
+    }
+
     mctx->get_attn()->set_input_k_idxs(inp_attn->self_k_idxs, ubatch);
     mctx->get_attn()->set_input_v_idxs(inp_attn->self_v_idxs, ubatch);
 
     mctx->get_attn()->set_input_kq_mask(inp_attn->self_kq_mask, ubatch, cparams.causal_attn);
+
+    if (inp_attn->nkv_dyn && llm_nkv_check_enabled()) {
+        inp_attn->nkv_check(mctx->get_attn(), ubatch);
+    }
 
     if (inp_attn->self_k_rot) {
         mctx->get_attn()->set_input_k_rot(inp_attn->self_k_rot);
@@ -1150,6 +1588,8 @@ void llm_graph_input_mem_hybrid::set_input(const llama_ubatch * ubatch) {
             data[i] = mctx->get_recr()->s_copy(i);
         }
     }
+
+    llm_graph_set_input_rs_replay(inp_rs.get(), mctx->get_recr(), ubatch);
 }
 
 bool llm_graph_input_mem_hybrid::can_reuse(const llm_graph_params & params) {
@@ -1162,7 +1602,27 @@ bool llm_graph_input_mem_hybrid::can_reuse(const llm_graph_params & params) {
     res &= inp_attn->self_k_idxs->ne[0] == params.ubatch.n_tokens;
   //res &= inp_attn->self_v_idxs->ne[0] == params.ubatch.n_tokens; // TODO: need to move this to the unified cache and check there
 
-    res &= can_reuse_kq_mask(inp_attn->self_kq_mask, mctx->get_attn(), params.ubatch, params.cparams);
+    const int64_t n_kv = mctx->get_attn()->get_n_kv();
+
+    nkv_probe   = n_kv;
+    nkv_relaxed = false;
+
+    if (inp_attn->nkv_dyn) {
+        // S11_NKV_REUSE: the mask and the K/V views are elastic up to the capacity, only n_kv may differ
+        const ggml_tensor * kq_mask = inp_attn->self_kq_mask;
+        const bool differs = n_kv != inp_attn->nkv_cur;
+
+        bool ok = params.ubatch.n_tokens > 12;
+        ok = ok && (params.cparams.kv_unified || params.ubatch.n_seqs_unq == 1);
+        ok = ok && kq_mask->ne[1] == (int64_t) params.ubatch.n_tokens && kq_mask->ne[2] == 1 && kq_mask->ne[3] == 1;
+        ok = ok && inp_attn->nkv_fits(n_kv);
+
+        nkv_relaxed = ok && differs;
+
+        res &= ok;
+    } else {
+        res &= can_reuse_kq_mask(inp_attn->self_kq_mask, mctx->get_attn(), params.ubatch, params.cparams);
+    }
 
     res &= inp_rs->s_copy->ne[0] == mctx->get_recr()->get_n_rs();
 
@@ -1193,6 +1653,8 @@ void llm_graph_input_mem_hybrid_k::set_input(const llama_ubatch * ubatch) {
             data[i] = mctx->get_recr()->s_copy(i);
         }
     }
+
+    llm_graph_set_input_rs_replay(inp_rs.get(), mctx->get_recr(), ubatch);
 }
 
 bool llm_graph_input_mem_hybrid_k::can_reuse(const llm_graph_params & params) {
@@ -1266,6 +1728,8 @@ void llm_graph_input_mem_hybrid_iswa::set_input(const llama_ubatch * ubatch) {
             data[i] = mctx->get_recr()->s_copy(i);
         }
     }
+
+    llm_graph_set_input_rs_replay(inp_rs.get(), mctx->get_recr(), ubatch);
 }
 
 bool llm_graph_input_mem_hybrid_iswa::can_reuse(const llm_graph_params & params) {
@@ -1362,6 +1826,7 @@ void llm_graph_result::reset() {
     t_embd        = nullptr;
     t_embd_pooled = nullptr;
     t_h_nextn     = nullptr;
+    t_mtp_draft   = nullptr;
 
     t_layer_inp.resize(LLAMA_MAX_LAYERS + 1);
     std::fill(t_layer_inp.begin(), t_layer_inp.end(), nullptr);
@@ -1407,6 +1872,9 @@ void llm_graph_result::set_outputs(const llm_graph_params & params) {
     }
     if (t_h_nextn != nullptr) {
         ggml_set_output(t_h_nextn);
+    }
+    if (t_mtp_draft != nullptr) {
+        ggml_set_output(t_mtp_draft);
     }
     {
         const auto & embeddings_layer_inp = params.cparams.embeddings_layer_inp;
@@ -1482,6 +1950,57 @@ void llm_graph_result::add_fused_node(llm_graph_fused_node result) {
 
 void llm_graph_result::set_params(const llm_graph_params & params) {
     this->params = params;
+}
+
+int llm_graph_result::nkv_prepare(ggml_cgraph * gf, const std::vector<ggml_backend_buffer_type_t> & bufts) {
+    int state = -1;
+    for (auto & input : inputs) {
+        auto * inp = dynamic_cast<llm_graph_input_mem_hybrid *>(input.get());
+        if (inp == nullptr || !inp->inp_attn || !inp->inp_attn->nkv_eligible) {
+            continue;
+        }
+        state = std::max(state, inp->inp_attn->nkv_audit(gf, bufts) ? 1 : 0);
+    }
+    return state;
+}
+
+void llm_graph_result::nkv_bind() {
+    for (auto & input : inputs) {
+        auto * inp = dynamic_cast<llm_graph_input_mem_hybrid *>(input.get());
+        if (inp != nullptr && inp->inp_attn) {
+            inp->inp_attn->nkv_bind();
+        }
+    }
+}
+
+bool llm_graph_result::nkv_relaxed() const {
+    for (const auto & input : inputs) {
+        const auto * inp = dynamic_cast<const llm_graph_input_mem_hybrid *>(input.get());
+        if (inp != nullptr && inp->nkv_relaxed) {
+            return true;
+        }
+    }
+    return false;
+}
+
+int64_t llm_graph_result::nkv_probe() const {
+    for (const auto & input : inputs) {
+        const auto * inp = dynamic_cast<const llm_graph_input_mem_hybrid *>(input.get());
+        if (inp != nullptr) {
+            return inp->nkv_probe;
+        }
+    }
+    return -1;
+}
+
+int64_t llm_graph_result::nkv_current() const {
+    for (const auto & input : inputs) {
+        const auto * inp = dynamic_cast<const llm_graph_input_mem_hybrid *>(input.get());
+        if (inp != nullptr && inp->inp_attn && inp->inp_attn->self_kq_mask) {
+            return inp->inp_attn->nkv_dyn ? inp->inp_attn->nkv_cur : inp->inp_attn->self_kq_mask->ne[0];
+        }
+    }
+    return -1;
 }
 
 //
@@ -3016,7 +3535,8 @@ static std::unique_ptr<llm_graph_input_attn_kv> build_attn_inp_kv_impl(
      const llama_ubatch & ubatch,
     const llama_hparams & hparams,
     const llama_cparams & cparams,
-    const llama_kv_cache_context * mctx_cur) {
+    const llama_kv_cache_context * mctx_cur,
+                    bool   nkv_elastic = false) {
 
     auto inp = std::make_unique<llm_graph_input_attn_kv>(hparams, cparams, mctx_cur);
 
@@ -3032,6 +3552,19 @@ static std::unique_ptr<llm_graph_input_attn_kv> build_attn_inp_kv_impl(
 
     inp->self_k_rot = mctx_cur->build_input_k_rot(ctx0);
     inp->self_v_rot = mctx_cur->build_input_v_rot(ctx0);
+
+    // S11_NKV_REUSE: prefill graph eligible for elastic n_kv reuse (build_attn registers the views, audited before alloc)
+    if (nkv_elastic && llm_nkv_reuse_enabled() &&
+        cparams.flash_attn && !cparams.training && !cparams.pipeline_parallel &&
+        ubatch.n_tokens > 12 && (cparams.kv_unified || ubatch.n_seqs_unq == 1) &&
+        inp->self_k_rot == nullptr && inp->self_v_rot == nullptr &&
+        inp->self_kq_mask->type == GGML_TYPE_F16 &&
+        inp->self_kq_mask->ne[1] == (int64_t) ubatch.n_tokens &&
+        inp->self_kq_mask->ne[2] == 1 && inp->self_kq_mask->ne[3] == 1) {
+        inp->nkv_eligible = true;
+        inp->nkv_built    = inp->self_kq_mask->ne[0];
+        inp->nkv_cap      = std::max<int64_t>((int64_t) cparams.n_ctx_seq, inp->nkv_built);
+    }
 
     return inp;
 }
@@ -3097,6 +3630,10 @@ ggml_tensor * llm_graph_context::build_attn(
 
         k = mctx_cur->get_k(ctx0, il);
         v = mctx_cur->get_v(ctx0, il);
+
+        if (inp->nkv_eligible) {
+            inp->nkv_register(k, v, il);
+        }
     }
 
     ggml_tensor * kq_mask = inp->get_kq_mask();
@@ -3751,6 +4288,12 @@ static std::unique_ptr<llm_graph_input_rs> build_rs_inp_impl(
     inp->head = mctx_cur->get_head();
     inp->rs_z = mctx_cur->get_rs_z();
 
+    if (mctx_cur->rs_replay_active()) {
+        inp->rs_ctl = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, LLAMA_RS_REPLAY_N_CTL);
+        ggml_set_input(inp->rs_ctl);
+        ggml_set_name(inp->rs_ctl, "rs_replay_ctl");
+    }
+
     return inp;
 }
 
@@ -3777,6 +4320,33 @@ ggml_tensor * llm_graph_context::build_rs(
     return build_rs(s, state_copy, inp->s_copy_main, state_size, n_seqs,
                     kv_state->get_n_rs(), kv_state->get_head(), kv_state->get_size(), kv_state->get_rs_z(),
                     get_state_rows);
+}
+
+ggml_tensor * llm_graph_context::build_rs_inplace(
+        llm_graph_input_rs * inp,
+        ggml_tensor * s,
+            int32_t   state_size,
+            int32_t   n_seqs) const {
+    const auto * kv_state = inp->mctx;
+
+    const int32_t  rs_zero = kv_state->get_rs_z();
+    const uint32_t rs_head = kv_state->get_head();
+
+    // single-sequence layout: there are no extra states to carry over
+    GGML_ASSERT(kv_state->get_n_rs() == (uint32_t) n_seqs);
+
+    ggml_tensor * states = ggml_reshape_2d(ctx0, s, state_size, s->ne[1]);
+
+    // zero a fresh state in place, as build_rs does before its gather
+    ggml_tensor * state_zero = ggml_view_1d(ctx0, states, state_size*(rs_zero >= 0), rs_zero*states->nb[1]*(rs_zero >= 0));
+    ggml_tensor * zeroed     = ggml_scale_inplace(ctx0, state_zero, 0);
+    ggml_build_forward_expand(gf, zeroed);
+
+    // a view of the zeroed tensor, so that the kernel which reads the cache is ordered after the zeroing
+    const size_t offs = (size_t) rs_head*states->nb[1];
+    GGML_ASSERT(offs >= zeroed->view_offs);
+
+    return ggml_view_2d(ctx0, zeroed, state_size, n_seqs, states->nb[1], offs - zeroed->view_offs);
 }
 
 ggml_tensor * llm_graph_context::build_rwkv_token_shift_load(
@@ -3824,7 +4394,7 @@ llm_graph_input_mem_hybrid * llm_graph_context::build_inp_mem_hybrid() const {
     const auto * mctx_cur = static_cast<const llama_memory_hybrid_context *>(mctx);
 
     auto inp_rs   = build_rs_inp_impl     (ctx0, ubatch, mctx_cur->get_recr());
-    auto inp_attn = build_attn_inp_kv_impl(ctx0, ubatch, hparams, cparams, mctx_cur->get_attn());
+    auto inp_attn = build_attn_inp_kv_impl(ctx0, ubatch, hparams, cparams, mctx_cur->get_attn(), /*nkv_elastic =*/ true);
 
     auto inp = std::make_unique<llm_graph_input_mem_hybrid>(cparams, std::move(inp_attn), std::move(inp_rs), mctx_cur);
 
@@ -4022,7 +4592,7 @@ void llm_graph_context::build_sampling() const {
     GGML_ASSERT(res->t_logits != nullptr && "missing t_logits tensor");
 
     // the padding row gives the chains without a row of the ubatch a valid input, even with no output at all
-    ggml_tensor * logits_t = ggml_pad(ctx0, res->t_logits, 0, 1, 0, 0);
+    ggml_tensor * logits_t = n_rows > 0 ? res->t_logits : ggml_pad(ctx0, res->t_logits, 0, 1, 0, 0);
 
     for (const auto & entry : samplers) {
         if (entry.second->iface->backend_reset) {
@@ -4032,13 +4602,15 @@ void llm_graph_context::build_sampling() const {
 
     static const std::vector<uint32_t> no_rows;
 
-    // every sampler builds n_outputs_max_per_seq chains, like the reserve, so the graph keeps its topology
-    // whatever rows the ubatch outputs: a chain without a row works on the first row and is not selected
+    const uint32_t n_chains = (ubatch.n_tokens >= 1 && ubatch.n_tokens <= 12)
+        ? std::min<uint32_t>(cparams.n_outputs_max_per_seq, std::max<uint32_t>(1u, n_rows))
+        : cparams.n_outputs_max_per_seq;
+
     for (const auto & [seq_id, sampler] : samplers) {
         const auto it = sampling_rows.find(seq_id);
         const auto & rows = it != sampling_rows.end() ? it->second : no_rows;
 
-        for (uint32_t i = 0; i < cparams.n_outputs_max_per_seq; ++i) {
+        for (uint32_t i = 0; i < n_chains; ++i) {
             const bool     active = i < rows.size();
             const uint32_t row    = active ? rows[i] : 0;
             const int      i_out  = active ? 1       : 0;

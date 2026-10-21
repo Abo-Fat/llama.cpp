@@ -22,6 +22,9 @@ public:
     // notify the cache of the current microbatch before graph execution
     void begin_ubatch(const llama_ubatch & ubatch, bool graph_reused);
 
+    // notify the cache that the graph of the current microbatch was submitted successfully (cross-ubatch head prefetch)
+    void end_ubatch();
+
     // the device that caches layer il
     ggml_backend_t backend(int32_t il) const;
 
@@ -40,6 +43,9 @@ public:
 
     std::map<ggml_backend_buffer_type_t, size_t> memory_breakdown() const;
     std::array<uint64_t, 3> s11_statistics() const;
+    // expert prefetch: layers planned ahead, bytes uploaded on the copy stream, layers planned in-stream in prefetched ubatches, guarded victims skipped,
+    // head prefetch: layers planned at the end of the previous ubatch, their bytes, adopted plans, mispredicted plans, guarded victims skipped by them
+    std::array<uint64_t, 9> prefetch_statistics() const;
 
 private:
     struct impl;

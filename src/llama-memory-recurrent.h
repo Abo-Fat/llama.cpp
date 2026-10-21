@@ -12,6 +12,20 @@
 // llama_memory_recurrent
 //
 
+// base+tip recurrent rollback (S11_RS_REPLAY, on by default; S11_RS_REPLAY=0 restores the snapshot groups):
+// the SSM cache keeps 2 groups (base, tip) instead of 1 + n_rs_seq, plus a per-layer ring with the delta-rule
+// inputs (k, v, raw g, beta) of the last keep ubatch; a partial rollback replays the accepted rows from the base
+// inside the next gated delta net kernel
+struct llama_model;
+
+// per-ubatch control input {n_rep, parity, base_row, tip_row, sel_row, 0, 0, 0}
+constexpr int64_t LLAMA_RS_REPLAY_N_CTL = 8;
+
+bool llama_memory_recurrent_replay_enabled(const llama_model & model, uint32_t n_rs_seq, uint32_t n_seq_max, bool offload);
+
+// bytes the replay layout frees compared to the snapshot groups, net of the ring and a safety margin
+size_t llama_memory_recurrent_replay_freed_bytes(const llama_model & model, uint32_t n_rs_seq, uint32_t n_seq_max, bool offload);
+
 // TODO: extract the cache state used for graph computation into llama_memory_recurrent_context_i
 //       see the implementation of llama_kv_cache_context_i for an example how to do it
 class llama_memory_recurrent : public llama_memory_i {
@@ -78,6 +92,40 @@ public:
 
     void set_rs_idx(llama_seq_id seq_id, uint32_t idx);
 
+    // base+tip recurrent rollback state, single sequence (see llama_memory_recurrent_replay_enabled)
+    bool rs_replay = false;
+
+    struct rs_replay_state {
+        uint32_t base_slot = 0;     // SSM group with the state before the last keep ubatch
+        uint32_t tip_slot  = 1;     // SSM group with the state after it
+        bool     tip_valid = false; // cleared by a partial rollback and by non-keep ubatches
+        uint32_t m_last    = 0;     // rows of the last keep ubatch, 0 if the last ubatch did not keep
+        uint32_t r_pending = 0;     // accepted rows of the last keep ubatch to replay from the base
+        uint32_t parity    = 0;     // ring half with the rows of the last keep ubatch
+    };
+
+    struct rs_replay_stats {
+        uint32_t n_ubatch          = 0;
+        uint32_t n_keep            = 0;
+        uint32_t n_tip_hits        = 0;
+        uint32_t n_rollback        = 0;
+        uint32_t n_replay_ubatch   = 0;
+        uint32_t n_replay_rows     = 0;
+        uint32_t n_unrepresentable = 0;
+    };
+
+    rs_replay_state rsr;
+    rs_replay_stats rs_stats;
+
+    // per layer delta-rule input ring [k | v | g | beta, 1 + n_rs_seq rows, 2 halves]
+    std::vector<ggml_tensor *> ring_l;
+
+    void rs_replay_reset();
+    void rs_replay_rollback(uint32_t n_rollback);
+
+    // fills the control input of the ubatch about to run and advances the state machine
+    void rs_replay_set_input(const llama_ubatch & ubatch, int32_t * ctl);
+
     // computed before each graph build
     uint32_t n = 0;
 
@@ -133,7 +181,8 @@ private:
     size_t size_p_bytes() const;
 
     void state_write_meta(llama_io_write_i & io, const std::vector<std::pair<uint32_t, uint32_t>> & cell_ranges, llama_seq_id seq_id = -1) const;
-    void state_write_data(llama_io_write_i & io, const std::vector<std::pair<uint32_t, uint32_t>> & cell_ranges) const;
+    void state_write_data(llama_io_write_i & io, const std::vector<std::pair<uint32_t, uint32_t>> & cell_ranges,
+            const std::vector<std::pair<uint32_t, uint32_t>> & cell_ranges_s) const;
 
     bool state_read_meta(llama_io_read_i & io, uint32_t cell_count, llama_seq_id dest_seq_id = -1);
     bool state_read_data(llama_io_read_i & io, uint32_t cell_count);
@@ -181,6 +230,10 @@ public:
     ggml_tensor * get_p_l(int32_t il) const;
 
     int32_t s_copy(int i) const;
+
+    bool          rs_replay_active() const;
+    void          rs_replay_set_input(const llama_ubatch & ubatch, int32_t * ctl) const;
+    ggml_tensor * get_ring_l(int32_t il) const;
 
 private:
     const llama_memory_status status;

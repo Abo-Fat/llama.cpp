@@ -7,6 +7,7 @@
 #include "llama-batch.h"
 #include "llama-io.h"
 #include "llama-memory.h"
+#include "llama-memory-recurrent.h"
 #include "llama-mmap.h"
 #include "llama-model.h"
 #include "llama-moe-cache.h"
@@ -21,6 +22,72 @@
 #include <stdexcept>
 #include <string>
 #include <unordered_map>
+#include <cstdio>
+
+// S11_NKV_REUSE counters for the prefill graphs (n_tokens > 12), printed periodically and when the context is freed
+namespace {
+struct s11_nkv_stats {
+    uint64_t n_ub               = 0;
+    uint64_t rebuild_slot       = 0;
+    uint64_t rebuild_ntok       = 0;
+    uint64_t rebuild_nout       = 0;
+    uint64_t rebuild_nkv        = 0;
+    uint64_t rebuild_other      = 0;
+    uint64_t reuse_strict       = 0;
+    uint64_t reuse_relaxed      = 0;
+    uint64_t reuse_relaxed_xreq = 0;
+    uint64_t audit_elastic      = 0;
+    uint64_t audit_strict       = 0;
+    uint64_t audit_none         = 0;
+    int64_t  us_build           = 0;
+    int64_t  us_alloc           = 0;
+    int64_t  us_inputs          = 0;
+};
+
+struct s11_nkv_prev {
+    int64_t n_tokens  = -1;
+    int64_t n_outputs = -1;
+    int64_t n_kv      = -1;
+};
+}
+
+static s11_nkv_stats g_s11_nkv;
+static std::unordered_map<const llm_graph_result *, s11_nkv_prev> g_s11_nkv_prev;
+
+static bool s11_nkv_env_enabled() {
+    const char * env = getenv("S11_NKV_REUSE");
+    return !(env != nullptr && atoi(env) == 0);
+}
+
+static void s11_nkv_print(const char * tag, ggml_backend_sched_t sched) {
+    const s11_nkv_stats & s = g_s11_nkv;
+    const uint64_t n_build = s.audit_elastic + s.audit_strict + s.audit_none;
+
+    std::string cbuf;
+    if (sched != nullptr) {
+        for (int i = 0; i < ggml_backend_sched_get_n_backends(sched); ++i) {
+            ggml_backend_t backend = ggml_backend_sched_get_backend(sched, i);
+            char tmp[160];
+            snprintf(tmp, sizeof(tmp), " %s=%.2fMiB", ggml_backend_name(backend),
+                    ggml_backend_sched_get_buffer_size(sched, backend)/(1024.0*1024.0));
+            cbuf += tmp;
+        }
+    }
+
+    LLAMA_LOG_INFO("s11_nkv[%s]: enabled=%d ub=%" PRIu64
+            " rebuild{slot=%" PRIu64 " n_tokens=%" PRIu64 " n_outputs=%" PRIu64 " n_kv=%" PRIu64 " other=%" PRIu64 "}"
+            " reuse{strict=%" PRIu64 " relaxed=%" PRIu64 " relaxed_xreq=%" PRIu64 "}"
+            " audit{elastic=%" PRIu64 " strict=%" PRIu64 " none=%" PRIu64 "}"
+            " us/build=%.1f us/alloc=%.1f us/set_inputs=%.1f compute_buf:%s\n",
+            tag, s11_nkv_env_enabled() ? 1 : 0, s.n_ub,
+            s.rebuild_slot, s.rebuild_ntok, s.rebuild_nout, s.rebuild_nkv, s.rebuild_other,
+            s.reuse_strict, s.reuse_relaxed, s.reuse_relaxed_xreq,
+            s.audit_elastic, s.audit_strict, s.audit_none,
+            n_build ? (double) s.us_build/n_build : 0.0,
+            n_build ? (double) s.us_alloc/n_build : 0.0,
+            s.n_ub  ? (double) s.us_inputs/s.n_ub : 0.0,
+            cbuf.c_str());
+}
 
 //
 // llama_context
@@ -276,6 +343,24 @@ llama_context::llama_context(
     cparams.op_offload     = params.op_offload;
     cparams.kv_unified     = params.kv_unified;
     cparams.moe_cache_size = params.moe_cache_size;
+    if ((cparams.n_rs_seq > 0 || hparams.n_layer_nextn > 0) && cparams.moe_cache_size >= (size_t) 4096 * 1024 * 1024) {
+        const size_t extra_ctx  = cparams.n_ctx > 4096 ? (size_t)(cparams.n_ctx - 4096) * 32 * 1024 : 0;
+        const size_t nextn_mib  = model.mtp_fused_kv(cparams) ? (std::getenv("S11_MOE_PIN") && std::strcmp(std::getenv("S11_MOE_PIN"), "0") == 0 ? 312ULL : 32ULL) : (size_t) hparams.n_layer_nextn * 320ULL;
+        const size_t rs_mib     = model.mtp_fused_kv(cparams) ? 56ULL : 64ULL;
+        size_t rs_reserve = (size_t) cparams.n_rs_seq * rs_mib * 1024 * 1024 +
+                                  nextn_mib * 1024 * 1024 + extra_ctx;
+        // the base+tip recurrent rollback keeps 2 SSM groups instead of 1 + n_rs_seq: the freed bytes go to the cache
+        const size_t rs_freed = cparams.ctx_type == LLAMA_CONTEXT_TYPE_DEFAULT ?
+            llama_memory_recurrent_replay_freed_bytes(model, cparams.n_rs_seq, cparams.n_seq_max, cparams.offload_kqv) : 0;
+        if (rs_freed > 0) {
+            const size_t rs_give = std::min(rs_freed, rs_reserve);
+            rs_reserve -= rs_give;
+            LLAMA_LOG_INFO("%s: rs_replay: %.2f MiB of the rollback reserve returned to the MoE cache\n", __func__, rs_give/1024.0/1024.0);
+        }
+        if (cparams.moe_cache_size > rs_reserve + (size_t) 3200 * 1024 * 1024) {
+            cparams.moe_cache_size -= rs_reserve;
+        }
+    }
 
     // initialized later
     cparams.pipeline_parallel = false;
@@ -492,6 +577,10 @@ llama_context::llama_context(
 llama_context::~llama_context() {
     // wait for any pending asynchronous copies into the output buffers before they are freed
     synchronize();
+
+    if (g_s11_nkv.n_ub > 0 && sched) {
+        s11_nkv_print("final", sched.get());
+    }
 
     // when training, ggml_opt allocates extra buffers through the scheduler, so the sizes no longer match the expectation
     if (!model.hparams.no_alloc && !opt_ctx) {
@@ -1250,6 +1339,55 @@ void llama_context::set_embeddings_nextn(bool value, bool masked) {
     cparams.embeddings_nextn_masked = masked;
 }
 
+bool llama_context::mtp_fused_supported() const {
+    if (!memory || cparams.embeddings || cparams.pooling_type != LLAMA_POOLING_TYPE_NONE || !model.mtp_fused_kv(cparams)) {
+        return false;
+    }
+
+    // the nextn experts are served by the MoE cache, the S11 CPU expert executors only cover the trunk layers
+    const char * mode = getenv("S11_EXPERT_MODE");
+    if (mode && (strcmp(mode, "cpu") == 0 || strcmp(mode, "hybrid") == 0)) {
+        return false;
+    }
+
+    return true;
+}
+
+bool llama_context::set_mtp_fused(bool value) {
+    if (value && !mtp_fused_supported()) {
+        return false;
+    }
+
+    if (mtp_fused != value) {
+        // the MTP block changes the graph shape
+        sched_need_reserve = true;
+        LLAMA_LOG_INFO("%s: fused MTP-in-verify = %d\n", __func__, value);
+    }
+
+    mtp_fused = value;
+
+    return true;
+}
+
+llama_token llama_context::get_mtp_draft_ith(int32_t idx) {
+    output_reorder();
+
+    if (!mtp_fused || !mtp_draft.has_data()) {
+        return LLAMA_TOKEN_NULL;
+    }
+
+    try {
+        const int64_t row = output_resolve_row(idx);
+        if (row < 0 || row >= (int64_t) mtp_draft.size) {
+            return LLAMA_TOKEN_NULL;
+        }
+        return mtp_draft.data[row];
+    } catch (const std::exception & err) {
+        LLAMA_LOG_ERROR("%s: invalid MTP draft id %d, reason: %s\n", __func__, idx, err.what());
+        return LLAMA_TOKEN_NULL;
+    }
+}
+
 void llama_context::set_embeddings_layer_inp(uint32_t lid, bool enable) {
     LLAMA_LOG_DEBUG("%s: lid = %d, enable = %d\n", __func__, lid, enable);
 
@@ -1425,8 +1563,12 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     // in order to correctly reuse a graph, it's full topology has to be uniquely determined by these parameters
     const auto gparams = graph_params(res, ubatch, mctx, gtype);
 
+    // S11_NKV_REUSE counters cover the prefill graphs (n_tokens > 12)
+    const bool nkv_track = ubatch.n_tokens > 12;
+    const bool same_slot = gf_res_prev_active == res;
+
     bool graph_reused = false;
-    if (!graph_reuse_disable && gf_res_prev_active == res && res->can_reuse(gparams)) {
+    if (!graph_reuse_disable && same_slot && res->can_reuse(gparams)) {
         //LLAMA_LOG_DEBUG("%s: reusing previous graph\n", __func__);
 
         // with pipeline parallelism, the previous graph_compute_async may still be running
@@ -1438,18 +1580,47 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
 
         n_reused++;
         graph_reused = true;
+
+        if (nkv_track) {
+            if (res->nkv_relaxed()) {
+                g_s11_nkv.reuse_relaxed++;
+                if (ubatch.pos != nullptr && ubatch.pos[0] == 0) {
+                    g_s11_nkv.reuse_relaxed_xreq++;
+                }
+            } else {
+                g_s11_nkv.reuse_strict++;
+            }
+        }
     } else {
+        if (nkv_track) {
+            const auto it = g_s11_nkv_prev.find(res);
+            if (!same_slot) {
+                g_s11_nkv.rebuild_slot++;
+            } else if (it == g_s11_nkv_prev.end()) {
+                g_s11_nkv.rebuild_other++;
+            } else if (it->second.n_tokens != (int64_t) ubatch.n_tokens) {
+                g_s11_nkv.rebuild_ntok++;
+            } else if (it->second.n_outputs != (int64_t) n_outputs) {
+                g_s11_nkv.rebuild_nout++;
+            } else {
+                const int64_t n_kv = res->nkv_probe();
+                if (n_kv >= 0 && n_kv != it->second.n_kv) {
+                    g_s11_nkv.rebuild_nkv++;
+                } else {
+                    g_s11_nkv.rebuild_other++;
+                }
+            }
+        }
+
         gf_res_prev_active = nullptr;
         res->reset();
 
         ggml_backend_sched_reset(sched.get());
         ggml_backend_sched_set_eval_callback(sched.get(), cparams.cb_eval, cparams.cb_eval_user_data);
 
-        //const auto t_start_us = ggml_time_us();
+        const int64_t t_build_us = ggml_time_us();
 
         gf = model.build_graph(gparams);
-
-        //LLAMA_LOG_INFO("graph build time: %.3f ms\n", (ggml_time_us() - t_start_us)/1000.0);
 
         if (!gf) {
             LLAMA_LOG_ERROR("%s: failed to initialize graph\n", __func__);
@@ -1457,10 +1628,30 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
             return nullptr;
         }
 
+        // S11_NKV_REUSE: audit the elastic n_kv operands and size them at the capacity before the allocation
+        const int nkv_state = res->nkv_prepare(gf, backend_buft);
+
+        const int64_t t_alloc_us = ggml_time_us();
+
         if (!ggml_backend_sched_alloc_graph(sched.get(), gf)) {
             LLAMA_LOG_ERROR("%s: failed to allocate graph\n", __func__);
             ret = GGML_STATUS_ALLOC_FAILED;
             return nullptr;
+        }
+
+        // S11_NKV_REUSE: bind the scheduler copy of the KQ mask and the FLASH_ATTN_EXT allocations
+        res->nkv_bind();
+
+        if (nkv_track) {
+            g_s11_nkv.us_build += t_alloc_us - t_build_us;
+            g_s11_nkv.us_alloc += ggml_time_us() - t_alloc_us;
+            if (nkv_state > 0) {
+                g_s11_nkv.audit_elastic++;
+            } else if (nkv_state == 0) {
+                g_s11_nkv.audit_strict++;
+            } else {
+                g_s11_nkv.audit_none++;
+            }
         }
 
         gf_res_prev_active = res;
@@ -1468,12 +1659,24 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
 
     // set the input data for the input tensors
     {
-        //const auto t_start_us = ggml_time_us();
+        const int64_t t_inputs_us = ggml_time_us();
 
         // FIXME this call causes a crash if any model inputs were not used in the graph and were therefore not allocated
         res->set_inputs(&ubatch);
 
-        //LLAMA_LOG_INFO("graph set inputs time: %.3f ms\n", (ggml_time_us() - t_start_us)/1000.0);
+        if (nkv_track) {
+            g_s11_nkv.us_inputs += ggml_time_us() - t_inputs_us;
+            g_s11_nkv.n_ub++;
+
+            s11_nkv_prev & prev = g_s11_nkv_prev[res];
+            prev.n_tokens  = ubatch.n_tokens;
+            prev.n_outputs = n_outputs;
+            prev.n_kv      = res->nkv_current();
+
+            if (g_s11_nkv.n_ub % 256 == 0) {
+                s11_nkv_print("periodic", sched.get());
+            }
+        }
     }
 
     if (moe_cache) {
@@ -1485,6 +1688,10 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         LLAMA_LOG_ERROR("%s: failed to compute graph, compute status: %d\n", __func__, status);
         ret = status;
         return nullptr;
+    }
+
+    if (moe_cache) {
+        moe_cache->end_ubatch();
     }
 
     ret = GGML_STATUS_SUCCESS;
@@ -2071,6 +2278,17 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
             copy_tensor_async_rows(res->t_candidates,     sampling.candidates, stride, n_outputs_prev, sched.get(), &sampling.candidates_count);
         }
 
+        // fused MTP drafts, copied with the sampled tokens of the same rows
+        if (mtp_draft.has_data() && res->t_mtp_draft != nullptr && n_outputs > 0) {
+            ggml_tensor * t_draft = res->t_mtp_draft;
+            GGML_ASSERT(ggml_nelements(t_draft) == (int64_t) n_outputs);
+            GGML_ASSERT((size_t) (n_outputs_prev + n_outputs) <= mtp_draft.size);
+
+            ggml_backend_t backend_draft = ggml_backend_sched_get_tensor_backend(sched.get(), t_draft);
+            GGML_ASSERT(backend_draft != nullptr);
+            ggml_backend_tensor_get_async(backend_draft, t_draft, mtp_draft.data + n_outputs_prev, 0, n_outputs*sizeof(llama_token));
+        }
+
         n_outputs_prev += n_outputs;
         n_tokens_prev  += ubatch.n_tokens;
     } while (mctx->next());
@@ -2188,10 +2406,13 @@ uint32_t llama_context::output_reserve(int32_t n_outputs) {
         output_ids.resize(n_batch);
     }
 
+    // fused MTP drafts, one token per output row
+    const size_t mtp_token_count = mtp_fused ? (size_t) n_outputs_max : 0;
+
     const size_t prev_size = buf_output ? ggml_backend_buffer_get_size(buf_output.get()) : 0;
     const size_t new_size  =
         (logits.size + embd.size + embd_nextn.size + embd_layer_inp_float_count + backend_float_count) * sizeof(float) +
-        (                                                                         backend_token_count) * sizeof(llama_token);
+        (                                                     backend_token_count + mtp_token_count) * sizeof(llama_token);
 
     // alloc only when more than the current capacity is required
     // TODO: also consider shrinking the buffer
@@ -2285,6 +2506,15 @@ uint32_t llama_context::output_reserve(int32_t n_outputs) {
         sampling.logits_count.clear();
         sampling.probs_count.clear();
         sampling.candidates_count.clear();
+    }
+
+    if (mtp_token_count > 0) {
+        mtp_draft = {(llama_token *) (base + offset), mtp_token_count};
+        offset += mtp_draft.size * sizeof(llama_token);
+
+        std::fill_n(mtp_draft.data, mtp_draft.size, LLAMA_TOKEN_NULL);
+    } else {
+        mtp_draft = {nullptr, 0};
     }
 
     // set all ids as invalid (negative)
@@ -2383,6 +2613,10 @@ void llama_context::output_reorder() {
             std::swap(sampling.probs_count[i0],      sampling.probs_count[i1]);
             std::swap(sampling.candidates_count[i0], sampling.candidates_count[i1]);
         }
+
+        if (mtp_draft.has_data()) {
+            std::swap(mtp_draft.data[i0], mtp_draft.data[i1]);
+        }
     }
 
     output_swaps.clear();
@@ -2465,7 +2699,14 @@ llm_graph_result * llama_context::get_gf_res_reserve() const {
 }
 
 llm_graph_result * llama_context::get_gf_res_prev(uint32_t n_tokens) {
-    const size_t slot = ((n_tokens == 1) ? 2u : 0u) + (n_outputs > 0 ? 1u : 0u);
+    size_t slot = 0;
+    if (n_tokens == 1) {
+        slot = 2u + (n_outputs > 0 ? 1u : 0u);
+    } else if (n_tokens >= 2 && n_tokens <= 12) {
+        slot = 4u + (n_tokens - 2u);
+    } else {
+        slot = (n_outputs > 0 ? 1u : 0u);
+    }
     auto & res = gf_res_prev[slot];
     if (!res) {
         res.reset(new llm_graph_result(gf_res_reserve->get_max_nodes()));
@@ -2611,6 +2852,7 @@ llm_graph_params llama_context::graph_params(
         /*.n_outputs   =*/ n_outputs,
         /*.cb          =*/ graph_get_cb(),
         /*.res         =*/ res,
+        /*.mtp_fused   =*/ mtp_fused,
     };
 }
 
@@ -4180,6 +4422,20 @@ llama_token llama_get_sampled_token_ith(llama_context * ctx, int32_t i) {
     ctx->synchronize();
 
     return ctx->get_sampled_token_ith(i);
+}
+
+bool llama_set_mtp_fused(llama_context * ctx, bool value) {
+    return ctx->set_mtp_fused(value);
+}
+
+bool llama_mtp_fused_supported(const llama_context * ctx) {
+    return ctx != nullptr && ctx->mtp_fused_supported();
+}
+
+llama_token llama_get_mtp_draft_ith(llama_context * ctx, int32_t i) {
+    ctx->synchronize();
+
+    return ctx->get_mtp_draft_ith(i);
 }
 
 float * llama_get_sampled_probs_ith(llama_context * ctx, int32_t i) {

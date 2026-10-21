@@ -8,12 +8,57 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
+#include <cstdint>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
 #include <stdexcept>
+#include <string>
 #include <unordered_map>
 #include <vector>
+
+#ifdef __linux__
+#include <sys/resource.h>
+#include <unistd.h>
+#endif
+
+// host memory available to new allocations in KiB, -1 if unknown
+static long long llama_moe_cache_mem_available_kib() {
+#ifdef __linux__
+    FILE * f = std::fopen("/proc/meminfo", "r");
+    if (f == nullptr) {
+        return -1;
+    }
+    char line[256];
+    long long res = -1;
+    while (std::fgets(line, sizeof(line), f) != nullptr) {
+        long long v = 0;
+        if (std::sscanf(line, "MemAvailable: %lld kB", &v) == 1) {
+            res = v;
+            break;
+        }
+    }
+    std::fclose(f);
+    return res;
+#else
+    return -1;
+#endif
+}
+
+static std::string llama_moe_cache_memlock_limit() {
+#ifdef __linux__
+    struct rlimit rl;
+    if (getrlimit(RLIMIT_MEMLOCK, &rl) == 0) {
+        if (rl.rlim_cur == RLIM_INFINITY) {
+            return "unlimited";
+        }
+        return std::to_string((unsigned long long) rl.rlim_cur / 1024) + " KiB";
+    }
+#endif
+    return "unknown";
+}
 
 namespace {
 
@@ -44,6 +89,17 @@ struct moe_cache_lru {
     uint32_t seen_gen = 0;
     std::vector<int32_t> uniq;
 
+    // slots used by the layers of the current prefetched ubatch, the victims skip the ones of layers whose split has not run yet
+    std::vector<uint32_t> stamp_epoch; // [n_slots]
+    std::vector<int16_t>  stamp_layer; // [n_slots]
+    uint32_t epoch       = 0;
+    bool     stamping    = false; // only during a prefetched ubatch, the victims are unchanged otherwise
+    uint64_t stamp_skips = 0;
+    uint32_t guard_epoch2 = 0;    // head prefetch: all the slots stamped in this earlier epoch are guarded too
+    int32_t  guard_layer2 = 0;    // prefill head prefetch: only the slots of guard_epoch2 stamped at layers >= guard_layer2 are guarded (0: all)
+    bool     ahead_no_pinned = false; // prefill head prefetch: the decode-pinned slots are never victims of an ahead plan
+    uint64_t pinned_skips = 0;
+
     void init(int32_t n_layer, int32_t n_expert, int32_t n_slots) {
         this->n_expert = n_expert;
         this->n_slots  = n_slots;
@@ -53,7 +109,7 @@ struct moe_cache_lru {
         decode_pinned.assign(n_slots, 0);
         n_occupied = 0;
         n_pinned   = 0;
-        max_pinned = std::min<int32_t>(3328, std::max<int32_t>(2048, n_slots - 1957));
+        max_pinned = std::min<int32_t>(3328, std::max<int32_t>(2048, 5406 - 1957));
         if (const char * env_pin = std::getenv("S11_MOE_MAX_PINNED")) {
             max_pinned = std::min<int32_t>(std::max<int32_t>(2048, std::atoi(env_pin)), std::max<int32_t>(2048, n_slots - 512));
         }
@@ -70,6 +126,15 @@ struct moe_cache_lru {
         head = 0;
         tail = n_slots - 1;
         seen.assign(n_expert, 0);
+        stamp_epoch.assign(n_slots, 0u);
+        stamp_layer.assign(n_slots, (int16_t) -1);
+        epoch       = 0;
+        stamping    = false;
+        stamp_skips = 0;
+        guard_epoch2 = 0;
+        guard_layer2 = 0;
+        ahead_no_pinned = false;
+        pinned_skips = 0;
     }
 
     // move slot s to the tail (most recently used)
@@ -95,7 +160,48 @@ struct moe_cache_lru {
         int32_t slot;
     };
 
-    int32_t pick_victim_slot(int32_t il, bool is_decode) {
+    void begin_epoch() {
+        if (++epoch == 0) {
+            std::fill(stamp_epoch.begin(), stamp_epoch.end(), 0u);
+            epoch = 1;
+        }
+        stamping = true;
+    }
+
+    // slot s is used by a layer >= guard of the current prefetched ubatch
+    bool guarded(int32_t s, int32_t guard) const {
+        return stamping && ((stamp_epoch[s] == epoch && stamp_layer[s] >= guard) ||
+                            (guard_epoch2 != 0 && stamp_epoch[s] == guard_epoch2 &&
+                             (guard_layer2 == 0 || stamp_layer[s] >= guard_layer2)));
+    }
+
+    void stamp(int32_t s, int32_t il) {
+        if (stamping) {
+            stamp_epoch[s] = epoch;
+            stamp_layer[s] = (int16_t) il;
+        }
+    }
+
+    // stamps the resident experts of a memoized layer without touching them, so the LRU order is unchanged
+    void stamp_mask(int32_t il, const std::array<uint64_t, 4> & mask) {
+        if (!stamping) {
+            return;
+        }
+        const int32_t * slots = slot_map[il];
+        for (int w = 0; w < 4; ++w) {
+            uint64_t bits = mask[w];
+            while (bits != 0) {
+                const int32_t s = slots[w*64 + __builtin_ctzll(bits)];
+                if (s >= 0) {
+                    stamp(s, il);
+                }
+                bits &= (bits - 1);
+            }
+        }
+    }
+
+    // guarded slots are skipped, ahead returns -1 instead of falling back to them
+    int32_t pick_victim_slot(int32_t il, bool is_decode, int32_t guard, bool ahead) {
         // When unfilled slots remain at head, always use head first
         if (key_of[head] < 0) {
             return head;
@@ -104,23 +210,77 @@ struct moe_cache_lru {
         int32_t cur = head;
         while (cur >= 0) {
             if ((key_of[cur] < 0 || (key_of[cur] / n_expert) != il) &&
-                (is_decode || !decode_pinned[cur] || n_pinned >= max_pinned)) {
-                return cur;
+                (is_decode || !decode_pinned[cur]) && (!ahead_no_pinned || !decode_pinned[cur])) {
+                if (!guarded(cur, guard)) {
+                    return cur;
+                }
+                stamp_skips++;
             }
             cur = next[cur];
+        }
+        cur = head;
+        while (cur >= 0) {
+            if (key_of[cur] < 0 || (key_of[cur] / n_expert) != il) {
+                if (ahead_no_pinned && decode_pinned[cur]) {
+                    pinned_skips++;
+                } else if (!guarded(cur, guard)) {
+                    return cur;
+                } else {
+                    stamp_skips++;
+                }
+            }
+            cur = next[cur];
+        }
+        if (ahead) {
+            return -1;
+        }
+        if (stamping) {
+            cur = head;
+            while (cur >= 0) {
+                if (key_of[cur] < 0 || (key_of[cur] / n_expert) != il) {
+                    return cur;
+                }
+                cur = next[cur];
+            }
         }
         return head;
     }
 
-    bool plan_from_uniq(int32_t il, size_t n_ids, std::vector<fill> & fills, size_t & n_hit, bool admit = true) {
+    // ahead: planned before the splits of the layers >= guard have run, fails without any change if their slots would be needed
+    bool plan_from_uniq(int32_t il, size_t n_ids, std::vector<fill> & fills, size_t & n_hit, bool admit = true, bool ahead = false, int32_t guard = -1) {
         fills.clear();
         n_hit = 0;
         if (uniq.size() > (size_t) n_slots) {
             return false;
         }
+        if (guard < 0) {
+            guard = il;
+        }
 
         int32_t * slots = slot_map[il];
         const bool is_decode = n_ids <= 32;
+
+        if (ahead) {
+            size_t need = 0;
+            for (int32_t e : uniq) {
+                if (slots[e] < 0) {
+                    need++;
+                }
+            }
+            size_t avail = 0;
+            for (int32_t cur = head; cur >= 0 && avail < need; cur = next[cur]) {
+                if ((key_of[cur] < 0 || (key_of[cur] / n_expert) != il) && !guarded(cur, guard)) {
+                    if (ahead_no_pinned && decode_pinned[cur]) {
+                        pinned_skips++;
+                    } else {
+                        avail++;
+                    }
+                }
+            }
+            if (avail < need) {
+                return false;
+            }
+        }
 
         for (int32_t e : uniq) {
             const int32_t s = slots[e];
@@ -133,6 +293,7 @@ struct moe_cache_lru {
                     }
                 }
                 touch(s);
+                stamp(s, il);
                 n_hit++;
             }
         }
@@ -143,7 +304,8 @@ struct moe_cache_lru {
             if (slots[e] >= 0) {
                 continue;
             }
-            const int32_t s = pick_victim_slot(il, is_decode);
+            const int32_t s = pick_victim_slot(il, is_decode, guard, ahead);
+            GGML_ASSERT(s >= 0);
             if (key_of[s] >= 0) {
                 const int32_t old_il = key_of[s] / n_expert;
                 const int32_t old_e  = key_of[s] % n_expert;
@@ -176,6 +338,7 @@ struct moe_cache_lru {
                 }
             }
             touch(s);
+            stamp(s, il);
             fills.push_back({ e, s });
         }
         return true;
@@ -306,6 +469,8 @@ struct llama_moe_cache::impl {
 
     uint64_t rolling_seq_hash    = 14695981039346656037ULL;
     uint64_t current_ubatch_hash = 0;
+    int32_t  last_end_pos        = 0;
+    std::array<uint64_t, 16384> pos_hash_history{};
     std::unordered_map<uint64_t, ubatch_route_record> known_ubatches;
     std::vector<const void *> last_dst_ptr;
     std::vector<uint64_t> uploaded_gen;
@@ -314,6 +479,81 @@ struct llama_moe_cache::impl {
     size_t slot_map_ring_idx = 0;
     ggml_backend_buffer_ptr buf_stage;
 
+    // expert prefetch of memoized ubatches, see pf_plan_window
+    // disabled with S11_MOE_PREFETCH=0, S11_MOE_PREFETCH_SYNC=1 synchronizes around every copy stream dependency
+    using pf_stream_new_t  = void * (*)(ggml_backend_t);
+    using pf_stream_free_t = void (*)(void *);
+    using pf_memcpy_t      = void (*)(void *, void *, const void *, size_t);
+    using pf_event_t       = void (*)(void *, ggml_backend_event_t);
+    using pf_sync_t        = void (*)(void *);
+    using pf_capturing_t   = bool (*)(ggml_backend_t);
+    static constexpr int32_t pf_lmax = 4;
+    bool             host_pinned   = false;
+    bool             pf_enabled    = false;
+    bool             pf_sync       = false;
+    ggml_backend_t   pf_backend    = nullptr;
+    void *           pf_h2d        = nullptr;
+    pf_stream_free_t pf_h2d_free   = nullptr;
+    pf_memcpy_t      pf_h2d_memcpy = nullptr;
+    pf_event_t       pf_h2d_record = nullptr;
+    pf_event_t       pf_h2d_wait   = nullptr;
+    pf_sync_t        pf_h2d_sync   = nullptr;
+    pf_capturing_t   pf_capturing  = nullptr;
+    ggml_backend_event_ptr pf_ev_start;              // compute -> copy stream, the previous ubatches are done
+    std::vector<ggml_backend_event_ptr> pf_ev_prog;  // [n_layer] compute -> copy stream, the layers before il are done
+    std::vector<ggml_backend_event_ptr> pf_ev_layer; // [n_layer] copy stream -> compute, the fills of layer il are done
+    const ubatch_route_record * pf_rec = nullptr;
+    std::vector<uint8_t> pf_state; // [n_layer] 0 not planned, 1 planned with fills, 2 planned without fills
+    int32_t pf_next      = 0;
+    bool    pf_stopped   = false;
+    int32_t pf_mtp_il    = 0;
+    int32_t pf_pending   = 0;
+    int32_t pf_last_fill = -1;
+    std::vector<moe_cache_lru::fill> pf_fills;
+    uint64_t prefetch_layers = 0;
+    uint64_t prefetch_bytes  = 0;
+    uint64_t fallback_layers = 0;
+
+    // cross-ubatch head prefetch, see end_ubatch
+    static constexpr size_t   hd_elig_ids = 64;      // decode and verify ubatches only (up to 8 tokens)
+    static constexpr size_t   hd_memo_cap = 65536;
+    static constexpr uint64_t hd_terminal = ~0ULL;   // the ubatch was followed by the first ubatch of a sequence
+    bool     hd_enabled          = false;
+    bool     hd_force_mispredict = false;
+    bool     hd_start_ok         = false;            // hd_ev_start was recorded before the current ubatch
+    ggml_backend_event_ptr hd_ev_start;              // compute -> copy stream, the ubatches before the current one are done
+    std::unordered_map<uint64_t, uint64_t> hd_next_of; // ubatch hash -> hash of its successor, 0 if it is not unique
+    uint64_t hd_prev_hash = 0;
+    bool     hd_active    = false;
+    uint64_t hd_hash      = 0;
+    const ubatch_route_record * hd_rec = nullptr;
+    std::vector<uint8_t> hd_state; // [n_layer] like pf_state, for the head layers of the predicted ubatch
+    int32_t  hd_next      = 0;
+    int32_t  hd_last_fill = -1;
+    uint64_t head_planned_layers = 0;
+    uint64_t head_bytes          = 0;
+    uint64_t head_adopted        = 0;
+    uint64_t head_mispredict     = 0;
+    uint64_t head_stamp_skips    = 0;
+
+    // prefill-to-prefill head prefetch, see end_ubatch_prefill
+    bool     hd_pf_enabled     = false;
+    int32_t  hd_pf_G           = 0;                  // the copy stream waits for the splits of the layers < hd_pf_G of N
+    ggml_backend_event_ptr hd_ev_mid;                // compute -> copy stream, recorded in copy() of layer hd_pf_G of N
+    bool     hd_mid_armed      = false;
+    bool     hd_mid_ok         = false;
+    bool     hd_rec_is_prefill = false;
+    uint64_t pfh_armed          = 0;
+    uint64_t pfh_mid_recorded   = 0;
+    uint64_t pfh_planned        = 0;
+    uint64_t pfh_planned_layers = 0;
+    uint64_t pfh_bytes          = 0;
+    uint64_t pfh_adopted        = 0;
+    uint64_t pfh_mispredicted   = 0;
+    uint64_t pfh_dryrun_fail    = 0;
+    uint64_t pfh_wrap_skips     = 0;
+    uint64_t pfh_stamp_skips    = 0;
+
     // slot maps in host memory
     ggml_context_ptr ctx_host;
     ggml_backend_buffer_ptr buf_host;
@@ -321,6 +561,10 @@ struct llama_moe_cache::impl {
 
     // views used by copy_experts
     ggml_context_ptr ctx_views;
+
+    // host expert ranges page-locked by this cache (not the ones registered by someone else), see pin_host_experts
+    std::vector<std::pair<void *, size_t>> pinned_ranges;
+    void (*unpin_host_range)(void *) = nullptr;
 
     impl(const llama_model & model, const std::vector<ggml_backend_t> & backends, const std::vector<ggml_backend_buffer_type_t> & bufts, size_t size) :
             n_expert_used(model.hparams.n_expert_used_max()), layers(model.layers.size()), last_dst_ptr(model.layers.size(), nullptr), uploaded_gen(model.layers.size(), 0ULL) {
@@ -560,6 +804,9 @@ struct llama_moe_cache::impl {
                     }
                 }
             }
+
+            pin_host_experts();
+            init_prefetch(model);
         }
 
         // as weights, the ops that read the banks run on the device and the slot maps are copied with the copy callback
@@ -592,6 +839,858 @@ struct llama_moe_cache::impl {
 
     ~impl() {
         log_stats();
+        free_prefetch();
+        unpin_host_experts();
+    }
+
+    // the misses of memoized ubatches are planned up to pf_lmax layers ahead, in layer order, and uploaded on a copy stream:
+    // - the copy stream waits for pf_ev_start (previous ubatches) or pf_ev_prog[il] (the layers before il) before it reuses slots
+    // - the split of layer il waits for pf_ev_layer[il]
+    // - the slots of the layers >= il of the current ubatch are not evicted before the split of il has run (moe_cache_lru::guarded)
+    void init_prefetch(const llama_model & model) {
+        pf_mtp_il = std::min<int32_t>((int32_t) model.hparams.n_layer(), (int32_t) layers.size());
+        const char * env = std::getenv("S11_MOE_PREFETCH");
+        if (env != nullptr && std::strcmp(env, "0") == 0) {
+            LLAMA_LOG_INFO("llama_moe_cache: expert prefetch disabled (S11_MOE_PREFETCH=0)\n");
+            return;
+        }
+        const char * s11_mode = std::getenv("S11_EXPERT_MODE");
+        const bool hybrid = s11_mode != nullptr && std::strcmp(s11_mode, "hybrid") == 0;
+        ggml_backend_t     be  = devices.size() == 1 ? devices[0].backend : nullptr;
+        ggml_backend_dev_t dev = be != nullptr ? ggml_backend_get_device(be) : nullptr;
+        ggml_backend_reg_t reg = dev != nullptr ? ggml_backend_dev_backend_reg(dev) : nullptr;
+        const char * reason = nullptr;
+        if (be == nullptr || !devices[0].buf || reg == nullptr) {
+            reason = "one GPU cache is required";
+        } else if (ggml_backend_buft_is_host(devices[0].buft)) {
+            reason = "the cache is in host memory";
+        } else if (!host_pinned) {
+            reason = "the host experts are not page-locked";
+        } else if (hybrid || s11_event_sync || s11_route_trace.is_open()) {
+            reason = "unsupported route mode";
+        } else if (layers.size() > 64 || pf_mtp_il <= 0) {
+            reason = "unsupported layer count";
+        }
+        pf_stream_new_t stream_new = nullptr;
+        if (reason == nullptr) {
+            stream_new    = (pf_stream_new_t)  ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_h2d_stream_new");
+            pf_h2d_free   = (pf_stream_free_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_h2d_stream_free");
+            pf_h2d_memcpy = (pf_memcpy_t)      ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_h2d_memcpy");
+            pf_h2d_record = (pf_event_t)       ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_h2d_record");
+            pf_h2d_wait   = (pf_event_t)       ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_h2d_wait");
+            pf_h2d_sync   = (pf_sync_t)        ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_h2d_sync");
+            pf_capturing  = (pf_capturing_t)   ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_stream_is_capturing");
+            if (stream_new == nullptr || pf_h2d_free == nullptr || pf_h2d_memcpy == nullptr || pf_h2d_record == nullptr ||
+                pf_h2d_wait == nullptr || pf_h2d_sync == nullptr || pf_capturing == nullptr) {
+                reason = "not supported by the backend";
+            }
+        }
+        if (reason == nullptr) {
+            pf_h2d = stream_new(be);
+            if (pf_h2d == nullptr) {
+                reason = "the copy stream cannot be created";
+            }
+        }
+        if (reason == nullptr) {
+            pf_ev_start.reset(ggml_backend_event_new(dev));
+            bool ok = pf_ev_start != nullptr;
+            pf_ev_prog.resize(layers.size());
+            pf_ev_layer.resize(layers.size());
+            for (size_t il = 0; il < layers.size() && ok; ++il) {
+                pf_ev_prog[il].reset(ggml_backend_event_new(dev));
+                pf_ev_layer[il].reset(ggml_backend_event_new(dev));
+                ok = pf_ev_prog[il] != nullptr && pf_ev_layer[il] != nullptr;
+            }
+            if (!ok) {
+                reason = "events are not supported by the device";
+            }
+        }
+        if (reason != nullptr) {
+            LLAMA_LOG_INFO("llama_moe_cache: expert prefetch off (%s)\n", reason);
+            free_prefetch();
+            return;
+        }
+        const char * env_sync = std::getenv("S11_MOE_PREFETCH_SYNC");
+        pf_sync    = env_sync != nullptr && std::strcmp(env_sync, "1") == 0;
+        pf_backend = be;
+        pf_state.assign(layers.size(), 0);
+        pf_enabled = true;
+        LLAMA_LOG_INFO("llama_moe_cache: expert prefetch on: up to %d layers ahead on a copy stream%s\n", (int) pf_lmax,
+            pf_sync ? ", synchronized (S11_MOE_PREFETCH_SYNC=1)" : "");
+
+        const char * env_hd = std::getenv("S11_MOE_HEAD_PREFETCH");
+        if (env_hd != nullptr && std::strcmp(env_hd, "0") == 0) {
+            LLAMA_LOG_INFO("llama_moe_cache: head prefetch disabled (S11_MOE_HEAD_PREFETCH=0)\n");
+            return;
+        }
+        hd_ev_start.reset(ggml_backend_event_new(dev));
+        if (!hd_ev_start) {
+            LLAMA_LOG_INFO("llama_moe_cache: head prefetch off (events are not supported by the device)\n");
+            return;
+        }
+        const char * env_fm = std::getenv("S11_MOE_HEAD_FORCE_MISPREDICT");
+        hd_force_mispredict = env_fm != nullptr && std::strcmp(env_fm, "1") == 0;
+        hd_state.assign(layers.size(), 0);
+        hd_next_of.reserve(4096);
+        hd_enabled = true;
+        LLAMA_LOG_INFO("llama_moe_cache: head prefetch on: the first %d layers of the memoized next ubatch%s\n", (int) pf_lmax,
+            hd_force_mispredict ? ", never adopted (S11_MOE_HEAD_FORCE_MISPREDICT=1)" : "");
+
+        const char * env_hp = std::getenv("S11_MOE_HEAD_PREFILL");
+        if (env_hp != nullptr && std::strcmp(env_hp, "0") == 0) {
+            LLAMA_LOG_INFO("llama_moe_cache: prefill head prefetch disabled (S11_MOE_HEAD_PREFILL=0)\n");
+            return;
+        }
+        if (pf_mtp_il - 1 < pf_lmax) {
+            LLAMA_LOG_INFO("llama_moe_cache: prefill head prefetch off (unsupported layer count)\n");
+            return;
+        }
+        int32_t G = pf_mtp_il - 1;
+        if (const char * env_g = std::getenv("S11_MOE_HEAD_PREFILL_GUARD")) {
+            G = std::atoi(env_g);
+        }
+        G = std::max<int32_t>(pf_lmax, std::min<int32_t>(G, pf_mtp_il - 1));
+        hd_ev_mid.reset(ggml_backend_event_new(dev));
+        if (!hd_ev_mid) {
+            LLAMA_LOG_INFO("llama_moe_cache: prefill head prefetch off (events are not supported by the device)\n");
+            return;
+        }
+        hd_pf_G       = G;
+        hd_pf_enabled = true;
+        LLAMA_LOG_INFO("llama_moe_cache: prefill head prefetch on: the first %d layers of the memoized next prefill ubatch after layer %d\n",
+            (int) pf_lmax, (int) hd_pf_G);
+    }
+
+    void free_prefetch() {
+        pf_enabled = false;
+        pf_rec     = nullptr;
+        if (pf_h2d != nullptr && pf_h2d_free != nullptr) {
+            pf_h2d_free(pf_h2d); // synchronizes the copy stream first
+        }
+        pf_h2d = nullptr;
+        pf_ev_layer.clear();
+        pf_ev_prog.clear();
+        pf_ev_start.reset();
+        hd_enabled = false;
+        hd_active  = false;
+        hd_rec     = nullptr;
+        hd_ev_start.reset();
+        hd_pf_enabled     = false;
+        hd_mid_armed      = false;
+        hd_mid_ok         = false;
+        hd_rec_is_prefill = false;
+        hd_ev_mid.reset();
+    }
+
+    // called before the hash of the next ubatch is computed
+    void pf_end_ubatch() {
+        if (pf_pending > 0 && pf_last_fill >= 0) {
+            // fills of layers whose split did not run: the later work of the compute stream is ordered after them
+            ggml_backend_event_wait(pf_backend, pf_ev_layer[pf_last_fill].get());
+        }
+        pf_pending = 0;
+        pf_rec     = nullptr;
+        pf_next    = 0;
+        pf_stopped = false;
+        std::fill(pf_state.begin(), pf_state.end(), (uint8_t) 0);
+        for (group & g : groups) {
+            g.lru.stamping = false;
+        }
+    }
+
+    // a memoized ubatch: the experts of its layers are known before its graph runs
+    // adopt: its head layers were planned at the end of the previous ubatch, see end_ubatch
+    void pf_start_ubatch(const llama_ubatch & ubatch, bool adopt) {
+        if (current_ubatch_hash == 0 || ubatch.n_tokens == 0 || ubatch.n_tokens > 128) {
+            if (adopt) {
+                hd_mispredicted();
+            }
+            return;
+        }
+        const auto it = known_ubatches.find(current_ubatch_hash);
+        if (it == known_ubatches.end() || it->second.valid_layers == 0 ||
+            it->second.n_ids != (size_t) ubatch.n_tokens*(size_t) n_expert_used) {
+            if (adopt) {
+                hd_mispredicted();
+            }
+            return;
+        }
+        if (adopt && &it->second != hd_rec) {
+            hd_mispredicted();
+            adopt = false;
+        }
+        pf_rec = &it->second;
+        if (adopt) {
+            // keep the epoch of the head plan, its slots stay guarded until the splits of their layers have run
+            for (group & g : groups) {
+                if (g.n_slots > 0) {
+                    g.lru.stamping = true;
+                }
+            }
+            for (size_t j = 0; j < hd_state.size() && j < pf_state.size(); ++j) {
+                if (hd_state[j] != 0) {
+                    pf_state[j] = hd_state[j];
+                    if (hd_state[j] == 1) {
+                        pf_pending++;
+                        pf_last_fill = (int32_t) j;
+                    }
+                }
+            }
+            pf_next    = hd_next;
+            pf_stopped = false;
+            if (hd_rec_is_prefill) {
+                pfh_adopted++;
+            } else {
+                head_adopted++;
+            }
+            hd_clear();
+            pf_plan_window(-1);
+            return;
+        }
+        for (group & g : groups) {
+            if (g.n_slots > 0) {
+                g.lru.begin_epoch();
+            }
+        }
+        pf_next    = 0;
+        pf_stopped = false;
+        pf_plan_window(-1);
+    }
+
+    void hd_clear() {
+        hd_active    = false;
+        hd_hash      = 0;
+        hd_rec       = nullptr;
+        hd_next      = 0;
+        hd_last_fill = -1;
+        hd_rec_is_prefill = false;
+        std::fill(hd_state.begin(), hd_state.end(), (uint8_t) 0);
+    }
+
+    void hd_link(uint64_t prev, uint64_t succ) {
+        const auto it = hd_next_of.find(prev);
+        if (it == hd_next_of.end()) {
+            if (hd_next_of.size() < hd_memo_cap) {
+                hd_next_of.emplace(prev, succ);
+            }
+        } else if (it->second != succ) {
+            it->second = 0;
+        }
+    }
+
+    // the memoized successor of the ubatch h, if it is unique and a decode or verify ubatch
+    const ubatch_route_record * hd_predict(uint64_t h, uint64_t & hp) const {
+        const auto it = hd_next_of.find(h);
+        if (it == hd_next_of.end() || it->second == 0 || it->second == hd_terminal) {
+            return nullptr;
+        }
+        const auto ir = known_ubatches.find(it->second);
+        if (ir == known_ubatches.end() || ir->second.valid_layers == 0 || ir->second.n_ids == 0 ||
+            ir->second.n_ids > hd_elig_ids || ir->second.n_ids % (size_t) n_expert_used != 0) {
+            return nullptr;
+        }
+        hp = it->second;
+        return &ir->second;
+    }
+
+    // the ubatch is not the predicted one: its work on the compute stream is ordered after the head fills, which stay resident
+    void hd_mispredicted() {
+        if (hd_last_fill >= 0) {
+            if (pf_sync) {
+                pf_h2d_sync(pf_h2d);
+            }
+            ggml_backend_event_wait(pf_backend, pf_ev_layer[hd_last_fill].get());
+        }
+        if (hd_rec_is_prefill) {
+            pfh_mispredicted++;
+        } else {
+            head_mispredict++;
+        }
+        hd_clear();
+    }
+
+    // the memoized successor of the ubatch h, if it is unique and a prefill ubatch whose head layers are memoized
+    const ubatch_route_record * hd_predict_prefill(uint64_t h, uint64_t & hp) const {
+        const auto it = hd_next_of.find(h);
+        if (it == hd_next_of.end() || it->second == 0 || it->second == hd_terminal) {
+            return nullptr;
+        }
+        const auto ir = known_ubatches.find(it->second);
+        const uint64_t head_bits = (1ULL << pf_lmax) - 1;
+        if (ir == known_ubatches.end() || ir->second.n_ids <= hd_elig_ids ||
+            ir->second.n_ids > (size_t) 128*(size_t) n_expert_used || ir->second.n_ids % (size_t) n_expert_used != 0 ||
+            (ir->second.valid_layers & head_bits) != head_bits) {
+            return nullptr;
+        }
+        hp = it->second;
+        return &ir->second;
+    }
+
+    // cross-ubatch head prefetch, after the graph of the current ubatch N was submitted:
+    // on repeats the successor of a memoized ubatch is deterministic, the first pf_lmax layers of the predicted ubatch N+1
+    // are planned now as pf_plan_window would at its begin, and uploaded on the copy stream during the tail of N
+    // - the copy stream waits for hd_ev_start (recorded before N) before it reuses slots, all the slots of N are guarded
+    // - the slot maps are uploaded as before: the copy callbacks of N have run, the ones of N+1 upload the new maps
+    // - N+1 adopts the plan if its hash is the predicted one, otherwise its compute stream waits for the head fills
+    // disabled with S11_MOE_HEAD_PREFETCH=0, S11_MOE_HEAD_FORCE_MISPREDICT=1 never adopts the plan (test mode)
+    void end_ubatch() {
+        const bool start_ok = hd_start_ok;
+        hd_start_ok = false;
+        const bool mid_armed = hd_mid_armed;
+        const bool mid_ok    = hd_mid_ok;
+        hd_mid_armed = false;
+        hd_mid_ok    = false;
+        if (hd_pf_enabled && pf_rec != nullptr && pf_rec->n_ids > hd_elig_ids) {
+            end_ubatch_prefill(mid_armed && mid_ok);
+            return;
+        }
+        if (!hd_enabled || !pf_enabled || !start_ok || hd_active || pf_rec == nullptr || current_ubatch_hash == 0 ||
+            pf_rec->n_ids > hd_elig_ids) {
+            return;
+        }
+        uint64_t hp = 0;
+        const ubatch_route_record * rec = hd_predict(current_ubatch_hash, hp);
+        if (rec == nullptr) {
+            return;
+        }
+        for (const group & g : groups) {
+            if (g.n_slots > 0 && !g.lru.stamping) {
+                return; // the slots of N are not all stamped
+            }
+        }
+        if (pf_capturing(pf_backend)) {
+            return;
+        }
+
+        uint64_t skips0 = 0;
+        for (const group & g : groups) {
+            skips0 += g.lru.stamp_skips;
+        }
+        bool wrapped = false;
+        for (group & g : groups) {
+            if (g.n_slots == 0) {
+                continue;
+            }
+            const uint32_t prev = g.lru.epoch;
+            g.lru.begin_epoch();
+            g.lru.guard_epoch2 = prev;
+            wrapped = wrapped || g.lru.epoch == 1; // the stamps of N were cleared
+        }
+
+        std::fill(hd_state.begin(), hd_state.end(), (uint8_t) 0);
+        hd_last_fill = -1;
+        int32_t j = 0;
+        int32_t n_planned = 0;
+        if (!wrapped) {
+            const size_t n_ids     = rec->n_ids;
+            const bool   is_decode = n_ids <= 32;
+            stats & st = n_ids <= (size_t) 8*n_expert_used ? stats_small : stats_large;
+            bool waited = false;
+            for (; j < pf_mtp_il && j < pf_lmax; ++j) {
+                const layer & l = layers[j];
+                if (l.ig < 0) {
+                    continue;
+                }
+                group & g = groups[l.ig];
+                moe_cache_lru & lru = g.lru;
+                if (j >= 64 || g.n_slots == 0 || l.experts.empty() || l.experts[0]->type != GGML_TYPE_S11_W2 || lru.n_expert > 256 ||
+                    lru.slot_map[j] == nullptr || (rec->valid_layers & (1ULL << j)) == 0) {
+                    break;
+                }
+                const auto & mask = rec->masks[j];
+                uint64_t miss_pinned = 0;
+                uint64_t miss_res    = 0;
+                for (int w = 0; w < 4; ++w) {
+                    miss_pinned |= mask[w] & ~lru.pinned_mask[j][w];
+                    miss_res    |= mask[w] & ~lru.resident_mask[j][w];
+                }
+                size_t n_hit = 0;
+                pf_fills.clear();
+                if (miss_res == 0 && (!is_decode || miss_pinned == 0 || lru.n_pinned >= lru.max_pinned)) {
+                    lru.stamp_mask(j, mask);
+                    n_hit = (size_t) (__builtin_popcountll(mask[0]) + __builtin_popcountll(mask[1]) +
+                                      __builtin_popcountll(mask[2]) + __builtin_popcountll(mask[3]));
+                } else {
+                    lru.uniq.clear();
+                    for (int w = 0; w < 4; ++w) {
+                        uint64_t bits = mask[w];
+                        while (bits != 0) {
+                            lru.uniq.push_back(w*64 + __builtin_ctzll(bits));
+                            bits &= (bits - 1);
+                        }
+                    }
+                    // dry run first, no change if the guarded slots of N and of the head layers would be needed
+                    if (!lru.plan_from_uniq(j, n_ids, pf_fills, n_hit, true, true, 0)) {
+                        break;
+                    }
+                }
+                size_t bytes = 0;
+                if (!pf_fills.empty()) {
+                    if (!waited) {
+                        pf_h2d_wait(pf_h2d, hd_ev_start.get());
+                        waited = true;
+                    }
+                    for (size_t ip = 0; ip < l.experts.size(); ++ip) {
+                        const ggml_tensor * we   = l.experts[ip];
+                        ggml_tensor       * bank = g.banks[ip];
+                        const size_t expert_size = we->nb[2];
+                        for (size_t i = 0; i < pf_fills.size();) {
+                            size_t n = 1;
+                            while (i + n < pf_fills.size() && pf_fills[i + n].expert == pf_fills[i].expert + (int32_t) n && pf_fills[i + n].slot == pf_fills[i].slot + (int32_t) n) {
+                                n++;
+                            }
+                            pf_h2d_memcpy(pf_h2d, (uint8_t *) bank->data + pf_fills[i].slot*expert_size,
+                                (const uint8_t *) we->data + pf_fills[i].expert*expert_size, n*expert_size);
+                            bytes += n*expert_size;
+                            i += n;
+                        }
+                    }
+                    pf_h2d_record(pf_h2d, pf_ev_layer[j].get());
+                    if (pf_sync) {
+                        pf_h2d_sync(pf_h2d);
+                    }
+                    hd_state[j]  = 1;
+                    hd_last_fill = j;
+                } else {
+                    hd_state[j] = 2;
+                }
+                st.hits   += n_hit;
+                st.misses += pf_fills.size();
+                st.bytes  += bytes;
+                prefetch_layers++;
+                prefetch_bytes += bytes;
+                head_planned_layers++;
+                head_bytes += bytes;
+                n_planned++;
+            }
+        }
+
+        uint64_t skips1 = 0;
+        for (group & g : groups) {
+            g.lru.stamping     = false;
+            g.lru.guard_epoch2 = 0;
+            skips1 += g.lru.stamp_skips;
+        }
+        head_stamp_skips += skips1 - skips0;
+
+        if (n_planned > 0) {
+            hd_active = true;
+            hd_hash   = hp;
+            hd_rec    = rec;
+            hd_next   = j;
+        } else {
+            hd_clear();
+        }
+    }
+
+    // prefill-to-prefill head prefetch, after the graph of the memoized prefill ubatch N was submitted:
+    // the first pf_lmax layers of the predicted prefill ubatch N+1 are planned and uploaded during the tail of N
+    // - the copy stream waits for hd_ev_mid, recorded on the compute stream in copy() of layer hd_pf_G of N, before its MoE split
+    // - the slots stamped in N at the layers >= hd_pf_G stay guarded (guard_layer2), the slots of the head layers too (guard 0)
+    // - the decode-pinned slots are never evicted (ahead_no_pinned), a failed dry run stops the plan without any change
+    // - adoption and mispredictions are handled as for the decode head prefetch
+    // disabled with S11_MOE_HEAD_PREFILL=0, nothing is planned if hd_ev_mid was not recorded in N
+    void end_ubatch_prefill(bool ok) {
+        if (!ok || !hd_enabled || !pf_enabled || hd_active || pf_rec == nullptr || current_ubatch_hash == 0) {
+            return;
+        }
+        uint64_t hp = 0;
+        const ubatch_route_record * rec = hd_predict_prefill(current_ubatch_hash, hp);
+        if (rec == nullptr) {
+            return;
+        }
+        for (const group & g : groups) {
+            if (g.n_slots > 0 && !g.lru.stamping) {
+                return; // the slots of N are not all stamped
+            }
+        }
+        if (pf_capturing(pf_backend)) {
+            return;
+        }
+
+        uint64_t skips0 = 0;
+        for (const group & g : groups) {
+            skips0 += g.lru.stamp_skips;
+        }
+        bool wrapped = false;
+        for (group & g : groups) {
+            if (g.n_slots == 0) {
+                continue;
+            }
+            const uint32_t prev = g.lru.epoch;
+            g.lru.begin_epoch();
+            g.lru.guard_epoch2    = prev;
+            g.lru.guard_layer2    = hd_pf_G;
+            g.lru.ahead_no_pinned = true;
+            wrapped = wrapped || g.lru.epoch == 1; // the stamps of N were cleared
+        }
+        if (wrapped) {
+            pfh_wrap_skips++;
+        }
+
+        std::fill(hd_state.begin(), hd_state.end(), (uint8_t) 0);
+        hd_last_fill = -1;
+        int32_t j = 0;
+        int32_t n_planned = 0;
+        if (!wrapped) {
+            const size_t n_ids     = rec->n_ids;
+            const bool   is_decode = n_ids <= 32;
+            stats & st = n_ids <= (size_t) 8*n_expert_used ? stats_small : stats_large;
+            bool waited = false;
+            for (; j < pf_mtp_il && j < pf_lmax; ++j) {
+                const layer & l = layers[j];
+                if (l.ig < 0) {
+                    continue;
+                }
+                group & g = groups[l.ig];
+                moe_cache_lru & lru = g.lru;
+                if (j >= 64 || g.n_slots == 0 || l.experts.empty() || l.experts[0]->type != GGML_TYPE_S11_W2 || lru.n_expert > 256 ||
+                    lru.slot_map[j] == nullptr || (rec->valid_layers & (1ULL << j)) == 0) {
+                    break;
+                }
+                const auto & mask = rec->masks[j];
+                uint64_t miss_pinned = 0;
+                uint64_t miss_res    = 0;
+                for (int w = 0; w < 4; ++w) {
+                    miss_pinned |= mask[w] & ~lru.pinned_mask[j][w];
+                    miss_res    |= mask[w] & ~lru.resident_mask[j][w];
+                }
+                size_t n_hit = 0;
+                pf_fills.clear();
+                if (miss_res == 0 && (!is_decode || miss_pinned == 0 || lru.n_pinned >= lru.max_pinned)) {
+                    lru.stamp_mask(j, mask);
+                    n_hit = (size_t) (__builtin_popcountll(mask[0]) + __builtin_popcountll(mask[1]) +
+                                      __builtin_popcountll(mask[2]) + __builtin_popcountll(mask[3]));
+                } else {
+                    lru.uniq.clear();
+                    for (int w = 0; w < 4; ++w) {
+                        uint64_t bits = mask[w];
+                        while (bits != 0) {
+                            lru.uniq.push_back(w*64 + __builtin_ctzll(bits));
+                            bits &= (bits - 1);
+                        }
+                    }
+                    // dry run first, no change if the guarded slots of N, of the head layers or the pinned slots would be needed
+                    if (!lru.plan_from_uniq(j, n_ids, pf_fills, n_hit, true, true, 0)) {
+                        pfh_dryrun_fail++;
+                        break;
+                    }
+                }
+                size_t bytes = 0;
+                if (!pf_fills.empty()) {
+                    if (!waited) {
+                        // the fills may reuse the slots of the layers < hd_pf_G of N: the copy stream waits for their splits
+                        pf_h2d_wait(pf_h2d, hd_ev_mid.get());
+                        waited = true;
+                    }
+                    for (size_t ip = 0; ip < l.experts.size(); ++ip) {
+                        const ggml_tensor * we   = l.experts[ip];
+                        ggml_tensor       * bank = g.banks[ip];
+                        const size_t expert_size = we->nb[2];
+                        for (size_t i = 0; i < pf_fills.size();) {
+                            size_t n = 1;
+                            while (i + n < pf_fills.size() && pf_fills[i + n].expert == pf_fills[i].expert + (int32_t) n && pf_fills[i + n].slot == pf_fills[i].slot + (int32_t) n) {
+                                n++;
+                            }
+                            pf_h2d_memcpy(pf_h2d, (uint8_t *) bank->data + pf_fills[i].slot*expert_size,
+                                (const uint8_t *) we->data + pf_fills[i].expert*expert_size, n*expert_size);
+                            bytes += n*expert_size;
+                            i += n;
+                        }
+                    }
+                    pf_h2d_record(pf_h2d, pf_ev_layer[j].get());
+                    if (pf_sync) {
+                        pf_h2d_sync(pf_h2d);
+                    }
+                    hd_state[j]  = 1;
+                    hd_last_fill = j;
+                } else {
+                    hd_state[j] = 2;
+                }
+                st.hits   += n_hit;
+                st.misses += pf_fills.size();
+                st.bytes  += bytes;
+                prefetch_layers++;
+                prefetch_bytes += bytes;
+                pfh_planned_layers++;
+                pfh_bytes += bytes;
+                n_planned++;
+            }
+        }
+
+        uint64_t skips1 = 0;
+        for (group & g : groups) {
+            g.lru.stamping        = false;
+            g.lru.guard_epoch2    = 0;
+            g.lru.guard_layer2    = 0;
+            g.lru.ahead_no_pinned = false;
+            skips1 += g.lru.stamp_skips;
+        }
+        pfh_stamp_skips += skips1 - skips0;
+
+        if (n_planned > 0) {
+            hd_active = true;
+            hd_hash   = hp;
+            hd_rec    = rec;
+            hd_next   = j;
+            hd_rec_is_prefill = true;
+            pfh_planned++;
+        } else {
+            hd_clear();
+        }
+    }
+
+    // plans the memoized experts of the layers after cur (-1 before the first layer) up to pf_lmax layers ahead, in layer order,
+    // exactly as copy would; stops at the first layer it cannot plan, which copy plans in-stream before the window resumes
+    void pf_plan_window(int32_t cur) {
+        const int32_t guard = cur < 0 ? 0 : cur;
+        ggml_backend_event_t sync_ev = cur < 0 ? pf_ev_start.get() : pf_ev_prog[cur].get();
+        bool waited = false;
+        const size_t n_ids     = pf_rec->n_ids;
+        const bool   is_decode = n_ids <= 32;
+        stats & st = n_ids <= (size_t) 8*n_expert_used ? stats_small : stats_large;
+        while (!pf_stopped && pf_next < pf_mtp_il && pf_next <= cur + pf_lmax) {
+            const int32_t j = pf_next;
+            const layer & l = layers[j];
+            if (l.ig < 0) {
+                pf_next++;
+                continue;
+            }
+            group & g = groups[l.ig];
+            moe_cache_lru & lru = g.lru;
+            if (j >= 64 || g.n_slots == 0 || l.experts.empty() || l.experts[0]->type != GGML_TYPE_S11_W2 || lru.n_expert > 256 ||
+                lru.slot_map[j] == nullptr || (pf_rec->valid_layers & (1ULL << j)) == 0) {
+                pf_stopped = true;
+                break;
+            }
+            const auto & mask = pf_rec->masks[j];
+            uint64_t miss_pinned = 0;
+            uint64_t miss_res    = 0;
+            for (int w = 0; w < 4; ++w) {
+                miss_pinned |= mask[w] & ~lru.pinned_mask[j][w];
+                miss_res    |= mask[w] & ~lru.resident_mask[j][w];
+            }
+            size_t n_hit = 0;
+            pf_fills.clear();
+            if (miss_res == 0 && (!is_decode || miss_pinned == 0 || lru.n_pinned >= lru.max_pinned)) {
+                lru.stamp_mask(j, mask);
+                n_hit = (size_t) (__builtin_popcountll(mask[0]) + __builtin_popcountll(mask[1]) +
+                                  __builtin_popcountll(mask[2]) + __builtin_popcountll(mask[3]));
+            } else {
+                lru.uniq.clear();
+                for (int w = 0; w < 4; ++w) {
+                    uint64_t bits = mask[w];
+                    while (bits != 0) {
+                        lru.uniq.push_back(w*64 + __builtin_ctzll(bits));
+                        bits &= (bits - 1);
+                    }
+                }
+                if (!lru.plan_from_uniq(j, n_ids, pf_fills, n_hit, true, true, guard)) {
+                    pf_stopped = true;
+                    break;
+                }
+            }
+            size_t bytes = 0;
+            if (!pf_fills.empty()) {
+                if (!waited) {
+                    // the fills may reuse the slots of the layers before cur: the copy stream waits for their splits
+                    if (pf_sync) {
+                        ggml_backend_synchronize(pf_backend);
+                    }
+                    ggml_backend_event_record(sync_ev, pf_backend);
+                    pf_h2d_wait(pf_h2d, sync_ev);
+                    waited = true;
+                }
+                for (size_t ip = 0; ip < l.experts.size(); ++ip) {
+                    const ggml_tensor * we   = l.experts[ip];
+                    ggml_tensor       * bank = g.banks[ip];
+                    const size_t expert_size = we->nb[2];
+                    for (size_t i = 0; i < pf_fills.size();) {
+                        size_t n = 1;
+                        while (i + n < pf_fills.size() && pf_fills[i + n].expert == pf_fills[i].expert + (int32_t) n && pf_fills[i + n].slot == pf_fills[i].slot + (int32_t) n) {
+                            n++;
+                        }
+                        pf_h2d_memcpy(pf_h2d, (uint8_t *) bank->data + pf_fills[i].slot*expert_size,
+                            (const uint8_t *) we->data + pf_fills[i].expert*expert_size, n*expert_size);
+                        bytes += n*expert_size;
+                        i += n;
+                    }
+                }
+                pf_h2d_record(pf_h2d, pf_ev_layer[j].get());
+                if (pf_sync) {
+                    pf_h2d_sync(pf_h2d);
+                }
+                pf_state[j]  = 1;
+                pf_pending++;
+                pf_last_fill = j;
+            } else {
+                pf_state[j] = 2;
+            }
+            st.hits   += n_hit;
+            st.misses += pf_fills.size();
+            st.bytes  += bytes;
+            prefetch_layers++;
+            prefetch_bytes += bytes;
+            pf_next++;
+        }
+    }
+
+    // page-locks the host experts of the cached layers so the uploads of the misses are DMA from pinned memory
+    // the bytes, slots and order of the uploads are unchanged; all or nothing, on any failure the experts stay pageable
+    // disabled with S11_MOE_PIN=0; falls back if the device free memory drops by more than S11_MOE_PIN_MAX_DEV_MIB (default 40)
+    void pin_host_experts() {
+        const char * env = std::getenv("S11_MOE_PIN");
+        if (env != nullptr && std::strcmp(env, "0") == 0) {
+            LLAMA_LOG_INFO("llama_moe_cache: host expert pinning disabled (S11_MOE_PIN=0)\n");
+            return;
+        }
+        if (devices.empty()) {
+            return;
+        }
+        ggml_backend_dev_t dev = ggml_backend_get_device(devices[0].backend);
+        ggml_backend_reg_t reg = dev ? ggml_backend_dev_backend_reg(dev) : nullptr;
+        if (reg == nullptr) {
+            return;
+        }
+        using pin_fn_t    = bool (*)(void *, size_t, int *);
+        using unpin_fn_t  = void (*)(void *);
+        using is_reg_fn_t = bool (*)(const void *);
+        auto pin_fn    = (pin_fn_t)    ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_pin_host_range");
+        auto unpin_fn  = (unpin_fn_t)  ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_unpin_host_range");
+        auto is_reg_fn = (is_reg_fn_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_is_host_registered");
+        if (pin_fn == nullptr || unpin_fn == nullptr || is_reg_fn == nullptr) {
+            LLAMA_LOG_INFO("llama_moe_cache: host expert pinning is not supported by %s\n", ggml_backend_reg_name(reg));
+            return;
+        }
+
+        size_t page = 4096;
+#ifdef __linux__
+        {
+            const long ps = sysconf(_SC_PAGESIZE);
+            if (ps > 0) {
+                page = (size_t) ps;
+            }
+        }
+#endif
+
+        // exact expert ranges rounded out to pages, merged where they overlap or touch
+        std::vector<std::pair<uintptr_t, uintptr_t>> ranges;
+        size_t expert_bytes = 0;
+        const void * first_ptr = nullptr;
+        const void * last_ptr  = nullptr;
+        for (const layer & l : layers) {
+            if (l.ig < 0) {
+                continue;
+            }
+            for (const ggml_tensor * w : l.experts) {
+                const size_t nb = ggml_nbytes(w);
+                if (nb == 0) {
+                    continue;
+                }
+                if (w->data == nullptr) {
+                    LLAMA_LOG_WARN("llama_moe_cache: host expert %s has no data, the experts stay pageable\n", w->name);
+                    return;
+                }
+                const uintptr_t b = (uintptr_t) w->data;
+                ranges.emplace_back(b & ~(uintptr_t) (page - 1), (b + nb + page - 1) & ~(uintptr_t) (page - 1));
+                expert_bytes += nb;
+                if (first_ptr == nullptr) {
+                    first_ptr = w->data;
+                }
+                last_ptr = (const uint8_t *) w->data + nb - 1;
+            }
+        }
+        if (ranges.empty()) {
+            return;
+        }
+        std::sort(ranges.begin(), ranges.end());
+        std::vector<std::pair<uintptr_t, uintptr_t>> merged;
+        for (const auto & r : ranges) {
+            if (!merged.empty() && r.first <= merged.back().second) {
+                merged.back().second = std::max(merged.back().second, r.second);
+            } else {
+                merged.push_back(r);
+            }
+        }
+        size_t merged_bytes = 0;
+        for (const auto & r : merged) {
+            merged_bytes += r.second - r.first;
+        }
+
+        size_t free0 = 0;
+        size_t free1 = 0;
+        size_t total = 0;
+        ggml_backend_dev_memory(dev, &free0, &total);
+        const long long avail0 = llama_moe_cache_mem_available_kib();
+
+        const auto t0 = std::chrono::steady_clock::now();
+        bool registered = true;
+        size_t owned    = 0;
+        size_t external = 0;
+        for (const auto & r : merged) {
+            void * p = (void *) r.first;
+            const size_t n = r.second - r.first;
+            int already = 0;
+            if (!pin_fn(p, n, &already)) {
+                registered = false;
+                break;
+            }
+            if (already) {
+                external += n;
+            } else {
+                pinned_ranges.emplace_back(p, n);
+                owned += n;
+            }
+        }
+        const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+
+        ggml_backend_dev_memory(dev, &free1, &total);
+        const long long avail1 = llama_moe_cache_mem_available_kib();
+        const bool first_ok = registered && is_reg_fn(first_ptr);
+        const bool last_ok  = registered && is_reg_fn(last_ptr);
+        const double dev_delta_mib = free0 > free1 ? (free0 - free1)/1024.0/1024.0 : 0.0;
+        double max_dev_mib = 40.0;
+        if (const char * s = std::getenv("S11_MOE_PIN_MAX_DEV_MIB")) {
+            max_dev_mib = std::atof(s);
+        }
+
+        const char * status = "on";
+        if (!registered) {
+            status = "off (register failed)";
+        } else if (!first_ok || !last_ok) {
+            status = "off (experts not registered)";
+        } else if (dev_delta_mib > max_dev_mib) {
+            status = "off (device memory delta too large)";
+        }
+        const bool ok = registered && first_ok && last_ok && dev_delta_mib <= max_dev_mib;
+        if (!ok) {
+            for (const auto & r : pinned_ranges) {
+                unpin_fn(r.first);
+            }
+            pinned_ranges.clear();
+        } else {
+            unpin_host_range = unpin_fn;
+            host_pinned = true;
+        }
+
+        LLAMA_LOG_INFO("llama_moe_cache: host expert pinning %s: %zu ranges, experts %.2f MiB, ranges %.2f MiB (%.4fx), "
+            "owned %.2f MiB, external %.2f MiB, %.1f ms, device free delta %.2f MiB (max %.1f), "
+            "MemAvailable %.1f -> %.1f MiB, RLIMIT_MEMLOCK %s, first/last registered %d/%d\n",
+            status, merged.size(), expert_bytes/1024.0/1024.0, merged_bytes/1024.0/1024.0,
+            expert_bytes > 0 ? (double) merged_bytes/expert_bytes : 0.0,
+            owned/1024.0/1024.0, external/1024.0/1024.0, ms, dev_delta_mib, max_dev_mib,
+            avail0 >= 0 ? avail0/1024.0 : -1.0, avail1 >= 0 ? avail1/1024.0 : -1.0,
+            llama_moe_cache_memlock_limit().c_str(), (int) first_ok, (int) last_ok);
+    }
+
+    void unpin_host_experts() {
+        if (unpin_host_range != nullptr) {
+            for (const auto & r : pinned_ranges) {
+                unpin_host_range(r.first);
+            }
+        }
+        pinned_ranges.clear();
+        unpin_host_range = nullptr;
     }
 
     ggml_tensor * get_slot_map(int32_t il, int64_t n_tokens, int64_t n_expert_used) const {
@@ -652,12 +1751,27 @@ struct llama_moe_cache::impl {
         if (!graph_reused) {
             std::fill(last_dst_ptr.begin(), last_dst_ptr.end(), nullptr);
         }
+        if (pf_enabled) {
+            pf_end_ubatch();
+        }
+        hd_start_ok  = false;
+        hd_mid_armed = false;
+        hd_mid_ok    = false;
         if (!ubatch.token || ubatch.n_tokens == 0) {
             current_ubatch_hash = 0;
+            hd_prev_hash        = 0;
+            if (hd_active) {
+                hd_mispredicted();
+            }
             return;
         }
         if (ubatch.pos && ubatch.pos[0] == 0) {
             rolling_seq_hash = 14695981039346656037ULL;
+            last_end_pos     = 0;
+            pos_hash_history[0] = rolling_seq_hash;
+        } else if (ubatch.pos && ubatch.pos[0] > 0 && ubatch.pos[0] < last_end_pos &&
+                   (size_t) ubatch.pos[0] < pos_hash_history.size() && pos_hash_history[ubatch.pos[0]] != 0) {
+            rolling_seq_hash = pos_hash_history[ubatch.pos[0]];
         }
         uint64_t h = rolling_seq_hash;
         h = (h ^ uint64_t(ubatch.n_tokens)) * 1099511628211ULL;
@@ -667,8 +1781,65 @@ struct llama_moe_cache::impl {
         for (uint32_t i = 0; i < ubatch.n_tokens; ++i) {
             h = (h ^ uint64_t(uint32_t(ubatch.token[i]))) * 1099511628211ULL;
         }
+        if (ubatch.pos && ubatch.pos[0] >= 0) {
+            uint64_t ph = rolling_seq_hash;
+            for (uint32_t i = 0; i < ubatch.n_tokens; ++i) {
+                const int32_t p = ubatch.pos[i];
+                ph = (ph ^ uint64_t(1u)) * 1099511628211ULL;
+                ph = (ph ^ uint64_t(uint32_t(p))) * 1099511628211ULL;
+                ph = (ph ^ uint64_t(uint32_t(ubatch.token[i]))) * 1099511628211ULL;
+                if (p + 1 >= 0 && (size_t) (p + 1) < pos_hash_history.size()) {
+                    pos_hash_history[p + 1] = ph ? ph : 1ULL;
+                }
+            }
+            last_end_pos = ubatch.pos[ubatch.n_tokens - 1] + 1;
+        }
         rolling_seq_hash    = h;
         current_ubatch_hash = h ? h : 1ULL;
+        bool adopt = false;
+        if (hd_enabled) {
+            // successor memo from the ubatch hashes only, the first ubatch of a sequence is never predicted
+            const bool first = ubatch.pos && ubatch.pos[0] == 0;
+            if (hd_prev_hash != 0) {
+                hd_link(hd_prev_hash, first ? hd_terminal : current_ubatch_hash);
+            }
+            hd_prev_hash = current_ubatch_hash;
+            if (hd_active) {
+                adopt = !hd_force_mispredict && current_ubatch_hash == hd_hash;
+                if (!adopt) {
+                    hd_mispredicted();
+                }
+            }
+        }
+        if (pf_enabled) {
+            pf_start_ubatch(ubatch, adopt);
+        }
+        if (hd_enabled && pf_rec != nullptr && pf_rec->n_ids <= hd_elig_ids) {
+            uint64_t hp = 0;
+            if (hd_predict(current_ubatch_hash, hp) != nullptr) {
+                // the head fills planned at the end of this ubatch may reuse the slots of the ubatches before it
+                if (pf_sync) {
+                    ggml_backend_synchronize(pf_backend);
+                }
+                ggml_backend_event_record(hd_ev_start.get(), pf_backend);
+                hd_start_ok = true;
+            }
+        }
+        if (hd_pf_enabled && hd_enabled && pf_enabled && !hd_active && pf_rec != nullptr && pf_rec->n_ids > hd_elig_ids &&
+            pf_rec->n_ids <= (size_t) 128*(size_t) n_expert_used) {
+            bool all_stamping = true;
+            for (const group & g : groups) {
+                if (g.n_slots > 0 && !g.lru.stamping) {
+                    all_stamping = false;
+                }
+            }
+            uint64_t hp = 0;
+            if (all_stamping && hd_predict_prefill(current_ubatch_hash, hp) != nullptr) {
+                // hd_ev_mid is recorded in copy() of layer hd_pf_G, see end_ubatch_prefill
+                hd_mid_armed = true;
+                pfh_armed++;
+            }
+        }
     }
 
     bool copy(ggml_backend_t backend, const ggml_tensor * src, ggml_tensor * dst, ggml_cgraph * graph) {
@@ -681,6 +1852,16 @@ struct llama_moe_cache::impl {
         group & g = groups[l.ig];
 
         GGML_ASSERT(backend == devices[g.id].backend);
+
+        // prefill head prefetch: the work of N before the MoE split of layer hd_pf_G, see end_ubatch_prefill
+        if (hd_mid_armed && !hd_mid_ok && pf_enabled && il == hd_pf_G && backend == pf_backend && !pf_capturing(backend)) {
+            if (pf_sync) {
+                ggml_backend_synchronize(pf_backend);
+            }
+            ggml_backend_event_record(hd_ev_mid.get(), pf_backend);
+            hd_mid_ok = true;
+            pfh_mid_recorded++;
+        }
 
         // the get_rows that looks up the slots of the selected experts
         const int n_nodes = ggml_graph_n_nodes(graph);
@@ -729,12 +1910,35 @@ struct llama_moe_cache::impl {
         size_t n_hit = 0;
         bool used_fast_route = false;
 
-        if (is_s11_fast) {
+        // the experts of this layer were planned ahead and uploaded on the copy stream, see pf_plan_window
+        bool prefetched = false;
+        if (pf_rec != nullptr && il < (int32_t) pf_state.size() && pf_state[il] != 0) {
+            if (pf_sync && pf_capturing(backend)) {
+                GGML_ABORT("MoE cache prefetch: the compute stream is capturing at the copy of layer %d", il);
+            }
+            if (pf_state[il] == 1) {
+                // the split of this layer reads the slots filled on the copy stream
+                if (pf_sync) {
+                    pf_h2d_sync(pf_h2d);
+                }
+                ggml_backend_event_wait(backend, pf_ev_layer[il].get());
+                pf_pending--;
+            }
+            pf_state[il] = 0;
+            prefetched = is_s11_fast && n_sel == pf_rec->n_ids;
+            if (prefetched) {
+                fills.clear();
+            }
+        }
+        if (pf_rec != nullptr && !prefetched && il < pf_mtp_il) {
+            fallback_layers++;
+        }
+
+        if (is_s11_fast && !prefetched) {
             auto it_rec = known_ubatches.find(current_ubatch_hash);
             if (it_rec != known_ubatches.end() &&
                 it_rec->second.n_ids == n_sel &&
                 (it_rec->second.valid_layers & (1ULL << il)) != 0) {
-                used_fast_route = true;
                 const auto & mask = it_rec->second.masks[il];
                 const bool is_decode = n_sel <= 32;
                 const uint64_t miss_pinned =
@@ -747,9 +1951,10 @@ struct llama_moe_cache::impl {
                     (mask[1] & ~g.lru.resident_mask[il][1]) |
                     (mask[2] & ~g.lru.resident_mask[il][2]) |
                     (mask[3] & ~g.lru.resident_mask[il][3]);
-                if ((is_decode && miss_pinned == 0 && g.lru.n_pinned < g.lru.max_pinned) ||
-                    (!is_decode && miss_res == 0 && g.lru.n_occupied < g.lru.n_slots)) {
+                used_fast_route = true;
+                if (miss_res == 0 && (!is_decode || miss_pinned == 0 || g.lru.n_pinned >= g.lru.max_pinned)) {
                     fills.clear();
+                    g.lru.stamp_mask(il, mask);
                     n_hit = (size_t) (__builtin_popcountll(mask[0]) +
                                       __builtin_popcountll(mask[1]) +
                                       __builtin_popcountll(mask[2]) +
@@ -771,7 +1976,7 @@ struct llama_moe_cache::impl {
             }
         }
 
-        if (!used_fast_route) {
+        if (!used_fast_route && !prefetched) {
             ids.resize(n_sel);
             ggml_backend_tensor_get_async(backend, sel, ids.data(), 0, ggml_nbytes(sel));
             ++route_readbacks;
@@ -855,6 +2060,17 @@ struct llama_moe_cache::impl {
             uploaded_gen[il] = g.lru.dirty_gen[il];
         }
 
+        if (pf_rec != nullptr && il < pf_mtp_il) {
+            if (prefetched) {
+                pf_plan_window(il);
+            } else if (pf_stopped && il == pf_next) {
+                // resume strictly after this in-stream plan so the plans stay in layer order, the guard keeps the slots of this layer
+                pf_stopped = false;
+                pf_next    = il + 1;
+                pf_plan_window(il);
+            }
+        }
+
         return true;
     }
 
@@ -872,6 +2088,30 @@ struct llama_moe_cache::impl {
         if (stats_copy.hits > 0) {
             LLAMA_LOG_INFO("llama_moe_cache: large batches: %zu experts copied from the cache, %.2f MiB\n", stats_copy.hits, stats_copy.bytes/1024.0/1024.0);
         }
+        if (prefetch_layers > 0 || fallback_layers > 0) {
+            uint64_t skips = 0;
+            for (const group & g : groups) {
+                skips += g.lru.stamp_skips;
+            }
+            LLAMA_LOG_INFO("llama_moe_cache: prefetch: %llu layers ahead, %.2f MiB on the copy stream, %llu layers in-stream, %llu guarded victims skipped\n",
+                (unsigned long long) prefetch_layers, prefetch_bytes/1024.0/1024.0, (unsigned long long) fallback_layers, (unsigned long long) skips);
+        }
+        if (head_planned_layers > 0 || head_mispredict > 0) {
+            LLAMA_LOG_INFO("llama_moe_cache: head prefetch: %llu layers, %.2f MiB, %llu adopted, %llu mispredicted, %llu guarded victims skipped\n",
+                (unsigned long long) head_planned_layers, head_bytes/1024.0/1024.0, (unsigned long long) head_adopted,
+                (unsigned long long) head_mispredict, (unsigned long long) head_stamp_skips);
+        }
+        if (pfh_armed > 0) {
+            uint64_t pskips = 0;
+            for (const group & g : groups) {
+                pskips += g.lru.pinned_skips;
+            }
+            LLAMA_LOG_INFO("llama_moe_cache: prefill head prefetch (G=%d): %llu armed, %llu mid recorded, %llu planned, %llu layers, %.2f MiB, %llu adopted, %llu mispredicted, %llu dry-run failures, %llu wrap skips, %llu guarded victims skipped, %llu pinned skips\n",
+                (int) hd_pf_G, (unsigned long long) pfh_armed, (unsigned long long) pfh_mid_recorded, (unsigned long long) pfh_planned,
+                (unsigned long long) pfh_planned_layers, pfh_bytes/1024.0/1024.0, (unsigned long long) pfh_adopted,
+                (unsigned long long) pfh_mispredicted, (unsigned long long) pfh_dryrun_fail, (unsigned long long) pfh_wrap_skips,
+                (unsigned long long) pfh_stamp_skips, (unsigned long long) pskips);
+        }
     }
 };
 
@@ -883,6 +2123,10 @@ llama_moe_cache::~llama_moe_cache() = default;
 
 void llama_moe_cache::begin_ubatch(const llama_ubatch & ubatch, bool graph_reused) {
     pimpl->begin_ubatch(ubatch, graph_reused);
+}
+
+void llama_moe_cache::end_ubatch() {
+    pimpl->end_ubatch();
 }
 
 ggml_backend_t llama_moe_cache::backend(int32_t il) const {
@@ -921,4 +2165,13 @@ std::map<ggml_backend_buffer_type_t, size_t> llama_moe_cache::memory_breakdown()
 
 std::array<uint64_t, 3> llama_moe_cache::s11_statistics() const {
     return {pimpl->stats_small.bytes + pimpl->stats_large.bytes, pimpl->route_readbacks, pimpl->route_syncs};
+}
+
+std::array<uint64_t, 9> llama_moe_cache::prefetch_statistics() const {
+    uint64_t skips = 0;
+    for (const auto & g : pimpl->groups) {
+        skips += g.lru.stamp_skips;
+    }
+    return {pimpl->prefetch_layers, pimpl->prefetch_bytes, pimpl->fallback_layers, skips,
+            pimpl->head_planned_layers, pimpl->head_bytes, pimpl->head_adopted, pimpl->head_mispredict, pimpl->head_stamp_skips};
 }

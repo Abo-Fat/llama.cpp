@@ -800,6 +800,9 @@ struct llama_model {
 
     llama_memory_i * create_memory(const llama_memory_params & params, const llama_cparams & cparams) const;
 
+    // true when a target context with these parameters keeps the nextn layer in its attention cache (fused MTP-in-verify)
+    bool mtp_fused_kv(const llama_cparams & cparams) const;
+
     ggml_cgraph * build_graph(const llm_graph_params & params) const;
 
     virtual void load_stats  (llama_model_loader & ml) = 0;
