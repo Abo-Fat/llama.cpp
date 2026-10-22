@@ -335,8 +335,34 @@ static void test_perf() {
     BENCH(llama_sampler_init_xtc    (1.0f, 0.1f, 1, 1),       data, 32);
 }
 
+static void test_greedy_suffix() {
+    for (size_t n : {64u, 248320u}) {
+        for (bool tied : {false, true}) {
+            std::vector<float> probs(n, 0.001f);
+            probs[5] = 0.45f;
+            probs[n - 2] = tied ? 0.45f : 0.5f;
+            sampler_tester reference(probs, {}), fast(probs, {});
+            for (auto * tester : {&reference, &fast}) {
+                auto * penalties = llama_sampler_init_penalties(n, 64, 1.1f, 0.1f, 0.2f);
+                llama_sampler_accept(penalties, 5);
+                llama_sampler_accept(penalties, llama_token(n - 2));
+                tester->apply(penalties);
+            }
+            reference.apply(llama_sampler_init_top_k(40));
+            reference.apply(llama_sampler_init_top_p(0.95f, 0));
+            reference.apply(llama_sampler_init_min_p(0.05f, 0));
+            reference.apply(llama_sampler_init_temp(0.0f));
+            reference.apply(llama_sampler_init_greedy());
+            fast.apply(llama_sampler_init_temp(0.0f));
+            fast.apply(llama_sampler_init_greedy());
+            GGML_ASSERT(reference.cur_p.data[reference.cur_p.selected].id == fast.cur_p.data[fast.cur_p.selected].id);
+        }
+    }
+}
+
 int main(void) {
     ggml_time_init();
+    test_greedy_suffix();
 
     test_dist_singleton_rng();
 

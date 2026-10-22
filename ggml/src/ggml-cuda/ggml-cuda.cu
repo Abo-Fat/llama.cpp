@@ -961,7 +961,7 @@ static size_t ggml_backend_cuda_buffer_type_get_alignment(ggml_backend_buffer_ty
 
 static size_t ggml_backend_cuda_buffer_type_get_alloc_size(ggml_backend_buffer_type_t buft, const ggml_tensor * tensor) {
     if (ggml_cuda_s11_bf16_head(tensor)) {
-        return ggml_nelements(tensor) * sizeof(nv_bfloat16);
+        return ggml_cuda_s11_head_alloc_size(tensor);
     }
     ggml_backend_cuda_buffer_type_context * buft_ctx = (ggml_backend_cuda_buffer_type_context *) buft->context;
 

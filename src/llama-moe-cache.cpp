@@ -469,6 +469,7 @@ struct llama_moe_cache::impl {
 
     uint64_t rolling_seq_hash    = 14695981039346656037ULL;
     uint64_t current_ubatch_hash = 0;
+    uint64_t previous_prompt_hash = 0;
     int32_t  last_end_pos        = 0;
     std::array<uint64_t, 16384> pos_hash_history{};
     std::unordered_map<uint64_t, ubatch_route_record> known_ubatches;
@@ -1811,6 +1812,28 @@ struct llama_moe_cache::impl {
                 }
             }
         }
+        static const bool prompt_admission = [] {
+            const char * value = std::getenv("S11_MOE_PROMPT_ADMISSION");
+            if (!value || std::strcmp(value, "0") == 0) { return false; }
+            if (std::strcmp(value, "1") == 0) { return true; }
+            GGML_ABORT("Invalid S11_MOE_PROMPT_ADMISSION: %s", value);
+        }();
+        if (prompt_admission && ubatch.pos && ubatch.pos[0] == 0) {
+            GGML_ASSERT(ubatch.n_seqs_unq == 1 && "S11 prompt admission requires a single sequence");
+            if (!adopt && previous_prompt_hash != 0 && previous_prompt_hash != current_ubatch_hash) {
+                int cleared = 0;
+                for (group & g : groups) {
+                    if (g.n_slots > 0 && !g.ref.empty() && g.ref[0]->type == GGML_TYPE_S11_W2) {
+                        cleared += g.lru.n_pinned;
+                        std::fill(g.lru.decode_pinned.begin(), g.lru.decode_pinned.end(), 0);
+                        g.lru.pinned_mask = {};
+                        g.lru.n_pinned = 0;
+                    }
+                }
+                LLAMA_LOG_INFO("llama_moe_cache: prompt switch released %d decode pins (weights retained)\n", cleared);
+            }
+            previous_prompt_hash = current_ubatch_hash;
+        }
         if (pf_enabled) {
             pf_start_ubatch(ubatch, adopt);
         }
@@ -2005,8 +2028,30 @@ struct llama_moe_cache::impl {
                 }
             }
 
+            static const bool trace_misses = [] {
+                const char * value = std::getenv("S11_ROUTE_TRACE_MISSES");
+                if (!value || std::strcmp(value, "0") == 0) { return false; }
+                if (std::strcmp(value, "1") == 0) { return true; }
+                GGML_ABORT("Invalid S11_ROUTE_TRACE_MISSES: %s", value);
+            }();
+            std::array<uint64_t, 4> resident_before{};
+            if (trace_misses) {
+                GGML_ASSERT(s11_route_trace.is_open() && il >= 0 && il < 64 && g.lru.n_expert <= 256 &&
+                            "S11_ROUTE_TRACE_MISSES requires a bounded S11_ROUTE_TRACE");
+                resident_before = g.lru.resident_mask[il];
+            }
             if (!g.lru.plan(il, ids.data(), ids.size(), fills, n_hit, !cpu_miss)) {
                 GGML_ABORT("the MoE cache is too small for the experts selected in layer %d", il);
+            }
+            if (trace_misses) {
+                GGML_ASSERT(s11_route_trace.is_open() && "S11_ROUTE_TRACE_MISSES requires S11_ROUTE_TRACE");
+                std::string misses;
+                for (const auto & fill : fills) {
+                    misses += std::to_string(fill.expert) + ",";
+                }
+                LLAMA_LOG_INFO("s11_route_misses layer=%d n=%zu resident=%016llx:%016llx:%016llx:%016llx ids=%s\n",
+                    il, n_sel, (unsigned long long) resident_before[0], (unsigned long long) resident_before[1],
+                    (unsigned long long) resident_before[2], (unsigned long long) resident_before[3], misses.c_str());
             }
 
             if (is_s11_fast && known_ubatches.size() < 65536) {

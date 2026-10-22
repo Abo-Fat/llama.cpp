@@ -134,7 +134,7 @@ struct ring_buffer {
 // writes result in res, does not mutate cur
 static void llama_token_data_array_partial_sort(const llama_token_data_array & cur, int npartial, std::vector<llama_token_data> & res) {
     static const auto comp = [](const llama_token_data & a, const llama_token_data & b) {
-        return a.logit > b.logit;
+        return a.logit > b.logit || (a.logit == b.logit && a.id < b.id);
     };
 
     constexpr int   nbuckets     = 128;
@@ -192,7 +192,7 @@ static void llama_token_data_array_partial_sort(const llama_token_data_array & c
 // reduces the size of cur_p to npartial, keeping only the top npartial elements
 static void llama_token_data_array_partial_sort_inplace(llama_token_data_array * cur_p, int npartial) {
     static const auto comp = [](const llama_token_data & a, const llama_token_data & b) {
-        return a.logit > b.logit;
+        return a.logit > b.logit || (a.logit == b.logit && a.id < b.id);
     };
 
     if (npartial <= 128) {
@@ -1489,7 +1489,8 @@ static void llama_sampler_top_k_backend_apply(
 
     struct ggml_tensor * logits = ggml_reshape_1d(ctx, data->logits, ggml_nelements(data->logits));
 
-    struct ggml_tensor * top_k = ggml_top_k(ctx, logits, sctx->k);
+    // Unordered TOP_K can reorder equal maxima between runs.
+    struct ggml_tensor * top_k = ggml_argsort_top_k(ctx, logits, sctx->k);
     ggml_set_name(top_k, "top_k");
 
     if (data->candidates) {

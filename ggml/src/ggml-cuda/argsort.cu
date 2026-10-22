@@ -178,7 +178,9 @@ static inline __device__ void bitonic_step(const float * x_row, int * dst_row, c
         if (dst_row[col] >= ncols ||
             (dst_row[ixj] < ncols && (order == GGML_SORT_ORDER_ASC ?
                 x_row[dst_row[col]] > x_row[dst_row[ixj]] :
-                x_row[dst_row[col]] < x_row[dst_row[ixj]]))
+                x_row[dst_row[col]] < x_row[dst_row[ixj]])) ||
+            (dst_row[col] < ncols && dst_row[ixj] < ncols &&
+             x_row[dst_row[col]] == x_row[dst_row[ixj]] && dst_row[col] > dst_row[ixj])
         ) {
             ggml_cuda_swap(dst_row[col], dst_row[ixj]);
         }
@@ -186,7 +188,9 @@ static inline __device__ void bitonic_step(const float * x_row, int * dst_row, c
         if (dst_row[ixj] >= ncols ||
             (dst_row[col] < ncols && (order == GGML_SORT_ORDER_ASC ?
                 x_row[dst_row[col]] < x_row[dst_row[ixj]] :
-                x_row[dst_row[col]] > x_row[dst_row[ixj]]))
+                x_row[dst_row[col]] > x_row[dst_row[ixj]])) ||
+            (dst_row[col] < ncols && dst_row[ixj] < ncols &&
+             x_row[dst_row[col]] == x_row[dst_row[ixj]] && dst_row[col] < dst_row[ixj])
         ) {
             ggml_cuda_swap(dst_row[col], dst_row[ixj]);
         }

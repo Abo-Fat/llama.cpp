@@ -2753,6 +2753,15 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     // the experts of host-resident layers may be read from the MoE cache
     ggml_tensor * slots = build_moe_cache_slots(selected_experts, up_exps, gate_exps, down_exps, gate_up_exps, il);
 
+    if (slots && up_exps && up_exps->type == GGML_TYPE_S11_W2) {
+        // Cache-bank views must not split the up/gate pair matched by CUDA fusion.
+        for (ggml_tensor * w : {up_exps, gate_exps, down_exps}) {
+            if (w) {
+                ggml_build_forward_expand(gf, moe_cache->get_experts(w));
+            }
+        }
+    }
+
     cur = ggml_reshape_3d(ctx0, cur, n_embd, 1, n_tokens);
 
     if (weight_before_ffn) {

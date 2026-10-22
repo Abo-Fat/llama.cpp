@@ -7,6 +7,81 @@ are not runtime dependencies.
 
 ## Format and arithmetic
 
+CPU and CUDA ARGMAX use the lowest token index for equal maxima, matching
+the CPU greedy sampler on token-ID-ordered inputs. CPU sampling sorts ties
+by token ID; backend top-k sampling uses ordered ARGSORT instead of
+unordered TOP_K. This matters for ties introduced by BF16 head rounding.
+O11 uses a separately authorized deterministic oracle, retaining O10 data.
+Graph on/off timing alone does not establish a graph correctness defect.
+
+`S11_HEAD_LAYOUT=mixed` keeps the first 81,920 output-head rows in BF16 and
+the remaining rows in canonical I8 storage. It requires `k=2048` and
+`S11_CUDA_OPT=tiled`. Target scoring still covers the complete vocabulary;
+only the physical storage changes. It saves 314.84 MiB relative to the
+full BF16 head, without training or requantization. I8 restoration falls
+back to correctly rounded division near BF16 rounding boundaries.
+`S11_HEAD_CHECK=1` checks restored rows bitwise during derived-head loading.
+The complete 508,559,360-element restoration check and the mixed-layout G0
+results are recorded in the O11 experiment directory.
+The canonical mixed-layout tail is uploaded once, after restoring the prefix.
+
+`S11_HEAD_MMA=1` uses BF16 Tensor Cores for 4-8-row verification heads,
+only with the full `bf16` head layout. Single-row prefill and two-row MTP
+heads retain the original reduction. It changes accumulation order, so
+qualification includes full-vocabulary logit comparisons and target token
+IDs, not just throughput. `S11_HEAD_MMA_DUMP` is a one-shot diagnostic
+output path and requires CUDA graphs to be disabled.
+
+For single-sequence cached inference, `S11_MOE_PROMPT_ADMISSION=1` releases
+previous decode pins when the first prompt chunk changes. Resident weights,
+LRU contents and in-flight epoch guards are retained; repeated prompts keep
+their pins. It is experimental and off by default: final holdout testing
+found a short-prefill regression. This is cache admission, not KV-prefix
+reuse or a trained router.
+`S11_ROUTE_TRACE_MISSES=1` adds miss IDs to logs when `S11_ROUTE_TRACE` is set;
+route diagnostics are not used as performance measurements.
+
+`S11_GREEDY_FAST=1` removes a proven maximum-preserving sampler suffix for
+zero-temperature generation without requested probabilities. Logit bias,
+penalties and DRY remain; unusual sampler ordering retains the original
+chain. Temperature-zero compaction is kept so backend sampling exports one
+logit instead of copying the whole vocabulary to the host. Wide CUDA
+ARGMAX uses deterministic two-stage reduction. The fast chain is qualified
+for the 8GiB recipe; the 16GiB recipe retains its original chain because
+one short-prefill workload regressed.
+
+`S11_SCHED_REUSE=1` retains capacity-compatible backend schedulers and compute
+buffers when samplers are rebound. It still synchronizes, invalidates cached
+graphs and reserves fresh graphs; sampler parameters and probability-output
+requests are not reused. A changed graph-node capacity recreates the scheduler.
+This avoids repeated pinned-host allocation on the short-prefill path. It is
+off by default in the library and enabled by the qualified 16GiB launcher
+profile only; the 8GiB profile retains scheduler recreation.
+
+### O11 launch profiles
+
+The launcher defaults to the qualified 8GiB cached layout and accepts
+`S11_EXPERT_MODE=gpu-resident` for the 16GiB resident layout. Explicit
+environment overrides still take precedence. Flash Attention accepts
+`1`/`on` and `0`/`off`. Speculation remains opt-in:
+
+```bash
+S11_EXPERT_MODE=gpu-cache bash tools/s11-native/run.sh \
+  --spec-type ngram-simple,draft-mtp \
+  --spec-ngram-simple-size-n 3 --spec-ngram-simple-size-m 5 \
+  --spec-draft-n-max 1 --spec-draft-n-min 1 --spec-draft-p-min 0.0
+```
+
+Use `gpu-resident` instead for 16GiB. The released draft vocabulary cap is
+98,304 in both budgets. Earlier resident combinations missed the final
+short-prefill gate even with the original 81,920 cap; the final fix reuses
+the scheduler rather than attributing the regression solely to vocabulary
+size. The larger cap was not readmitted after this fix.
+Target scoring always uses all 248,320 rows.
+Resource claims apply to the measured single-sequence configurations, not
+arbitrary context, parallelism or environment overrides. See the workspace
+[O11 results](../../../REPORT.md#16-o11固定预算-prefill--decode-深度优化).
+
 `convert_s11.py` exports source codes/scales losslessly and verifies every
 source tensor through inverse layout mapping. The native types are:
 

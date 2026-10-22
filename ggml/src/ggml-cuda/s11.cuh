@@ -9,6 +9,7 @@ void ggml_cuda_s11_mul_mat(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
 void ggml_cuda_s11_get_rows(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
 void ggml_cuda_s11_dense(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
 bool ggml_cuda_s11_bf16_head(const ggml_tensor * tensor);
+size_t ggml_cuda_s11_head_alloc_size(const ggml_tensor * tensor);
 void ggml_cuda_s11_upload_head(ggml_tensor * tensor, const void * canonical, cudaStream_t stream);
 void ggml_cuda_s11_reset_graph_state();
 void ggml_cuda_s11_begin_split(const ggml_cgraph * cgraph);

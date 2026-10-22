@@ -736,7 +736,19 @@ void llama_context::sched_reserve() {
     gf_res_reserve.reset(new llm_graph_result(max_nodes));
     gf_res_prev_active = nullptr;
 
-    sched.reset(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), max_nodes, cparams.pipeline_parallel, cparams.op_offload));
+    static const bool reuse_sched = [] {
+        const char * value = std::getenv("S11_SCHED_REUSE");
+        if (!value || std::strcmp(value, "0") == 0) { return false; }
+        if (std::strcmp(value, "1") == 0) { return true; }
+        GGML_ABORT("Invalid S11_SCHED_REUSE: %s", value);
+    }();
+    if (!reuse_sched || !sched || sched_max_nodes != max_nodes) {
+        sched.reset(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), max_nodes, cparams.pipeline_parallel, cparams.op_offload));
+        sched_max_nodes = max_nodes;
+    } else {
+        // Rebuild graphs for the new sampler, but retain compatible compute buffers.
+        ggml_backend_sched_reset(sched.get());
+    }
     ggml_backend_sched_set_copy_callback(sched.get(), sched_copy_experts, this);
 
     llama_memory_context_ptr mctx;

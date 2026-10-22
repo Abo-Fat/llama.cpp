@@ -2841,14 +2841,15 @@ struct test_rms_norm_mul_rope : public test_case {
 struct test_argmax : public test_case {
     const ggml_type type;
     const std::array<int64_t, 4> ne;
+    const bool tied_max;
 
     std::string vars() override {
-        return VARS_TO_STR2(type, ne);
+        return VARS_TO_STR3(type, ne, tied_max);
     }
 
     test_argmax(ggml_type type = GGML_TYPE_F32,
-            std::array<int64_t, 4> ne = {10, 100, 1, 1})
-        : type(type), ne(ne) {}
+            std::array<int64_t, 4> ne = {10, 100, 1, 1}, bool tied_max = false)
+        : type(type), ne(ne), tied_max(tied_max) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         ggml_tensor * a = ggml_new_tensor(ctx, type, 4, ne.data());
@@ -2872,6 +2873,19 @@ struct test_argmax : public test_case {
                         data[i] = i;
                     }
                     std::shuffle(data.begin(), data.end(), rng);
+                    if (tied_max && std::strcmp(t->name, "a") == 0) {
+                        GGML_ASSERT(t->ne[0] > 5839);
+                        std::fill(data.begin(), data.end(), -2.0f);
+                        if (r % 4 == 0) {
+                            data[1118] = data[5839] = 1.0f;
+                        } else if (r % 4 == 1) {
+                            data[32] = data[63] = 1.0f;
+                        } else if (r % 4 == 2) {
+                            std::fill(data.begin(), data.end(), -1.0f);
+                        } else {
+                            std::fill(data.begin(), data.end(), -INFINITY);
+                        }
+                    }
                     ggml_backend_tensor_set(t, data.data(), r * t->nb[1], t->ne[0] * sizeof(float));
                 }
             } else {
@@ -6872,15 +6886,16 @@ struct test_argsort : public test_case {
     const ggml_type type;
     const std::array<int64_t, 4> ne;
     ggml_sort_order order;
+    const bool ties;
 
     std::string vars() override {
-        return VARS_TO_STR3(type, ne, order);
+        return VARS_TO_STR4(type, ne, order, ties);
     }
 
     test_argsort(ggml_type type = GGML_TYPE_F32,
             std::array<int64_t, 4> ne = {16, 10, 10, 10},
-            ggml_sort_order order = GGML_SORT_ORDER_ASC)
-        : type(type), ne(ne), order(order) {}
+            ggml_sort_order order = GGML_SORT_ORDER_ASC, bool ties = false)
+        : type(type), ne(ne), order(order), ties(ties) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         ggml_tensor * a = ggml_new_tensor(ctx, type, 4, ne.data());
@@ -6909,7 +6924,7 @@ struct test_argsort : public test_case {
                 for (int64_t r = 0; r < ggml_nrows(t); r++) {
                     std::vector<float> data(t->ne[0]);
                     for (int i = 0; i < t->ne[0]; i++) {
-                        data[i] = i;
+                        data[i] = ties ? i / 4 : i;
                     }
                     std::shuffle(data.begin(), data.end(), rng);
                     ggml_backend_tensor_set(t, data.data(), r * t->nb[1], t->ne[0] * sizeof(float));
@@ -10061,6 +10076,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_argmax(GGML_TYPE_F32, {1024, 12, 1, 1}));
     test_cases.emplace_back(new test_argmax(GGML_TYPE_F32, {2000, 10, 1, 1}));
     test_cases.emplace_back(new test_argmax(GGML_TYPE_F32, {5438,  3, 1, 1}));
+    test_cases.emplace_back(new test_argmax(GGML_TYPE_F32, {8192, 3, 1, 1}, true));
+    test_cases.emplace_back(new test_argmax(GGML_TYPE_F32, {248320, 3, 1, 1}, true));
+    for (int n : {16383, 16384, 16385}) {
+        test_cases.emplace_back(new test_argmax(GGML_TYPE_F32, {n, 4, 1, 1}, true));
+    }
 
     for (int ne3 : {1, 3}) { // CUDA backward pass only supports ne3 == 1
         test_cases.emplace_back(new test_repeat(GGML_TYPE_F32, {10, 5, 4, ne3}, {1, 1, 1, 1}));
@@ -11211,6 +11231,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
         test_cases.emplace_back(new test_argsort(GGML_TYPE_F32, {16, 10, 10, 10}, order));
         test_cases.emplace_back(new test_argsort(GGML_TYPE_F32, {60, 10, 10, 10}, order)); // qwen
+        test_cases.emplace_back(new test_argsort(GGML_TYPE_F32, {40, 1, 1, 1}, order, true));
+        test_cases.emplace_back(new test_argsort(GGML_TYPE_F32, {248320, 1, 1, 1}, order, true));
         test_cases.emplace_back(new test_argsort(GGML_TYPE_F32, {1023, 2, 1, 3}, order));
         test_cases.emplace_back(new test_argsort(GGML_TYPE_F32, {1024, 2, 1, 3}, order));
         test_cases.emplace_back(new test_argsort(GGML_TYPE_F32, {1025, 2, 1, 3}, order));

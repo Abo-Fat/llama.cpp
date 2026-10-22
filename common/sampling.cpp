@@ -11,6 +11,7 @@
 #include <cctype>
 #include <climits>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <random>
 #include <unordered_map>
@@ -345,7 +346,43 @@ struct common_sampler * common_sampler_init(
 
         bool use_adaptive_p = false; // see below
 
-        for (const auto & cnstr : params.samplers) {
+        static const bool greedy_fast = [] {
+            const char * value = std::getenv("S11_GREEDY_FAST");
+            if (!value || std::strcmp(value, "0") == 0) { return false; }
+            if (std::strcmp(value, "1") == 0) { return true; }
+            GGML_ABORT("Invalid S11_GREEDY_FAST: %s", value);
+        }();
+        size_t n_samplers = params.samplers.size();
+        if (greedy_fast && params.n_probs == 0 && n_samplers > 0 &&
+            params.samplers.back() == COMMON_SAMPLER_TYPE_TEMPERATURE &&
+            params.temp == 0.0f && params.dynatemp_range == 0.0f) {
+            const auto preserves_max = [&](common_sampler_type type) {
+                switch (type) {
+                    case COMMON_SAMPLER_TYPE_TOP_K:       return params.top_k > 0;
+                    case COMMON_SAMPLER_TYPE_TOP_P:       return params.top_p > 0.0f && params.top_p <= 1.0f;
+                    case COMMON_SAMPLER_TYPE_MIN_P:       return params.min_p >= 0.0f && params.min_p < 1.0f;
+                    case COMMON_SAMPLER_TYPE_TYPICAL_P:   return params.typ_p == 1.0f;
+                    case COMMON_SAMPLER_TYPE_XTC:         return params.xtc_probability == 0.0f;
+                    case COMMON_SAMPLER_TYPE_TOP_N_SIGMA: return params.top_n_sigma <= 0.0f;
+                    default:                             return false;
+                }
+            };
+            size_t keep = n_samplers - 1;
+            while (keep > 0 && preserves_max(params.samplers[keep - 1])) {
+                --keep;
+            }
+            // These prefix operations change logits but retain token-ID ordering.
+            const bool ordered_prefix = std::all_of(params.samplers.begin(), params.samplers.begin() + keep,
+                [](common_sampler_type type) {
+                    return type == COMMON_SAMPLER_TYPE_PENALTIES || type == COMMON_SAMPLER_TYPE_DRY;
+                });
+            if (ordered_prefix) {
+                n_samplers = keep;
+            }
+        }
+
+        for (size_t i = 0; i < n_samplers; ++i) {
+            const auto cnstr = params.samplers[i];
             switch (cnstr) {
                 case COMMON_SAMPLER_TYPE_DRY:
                     {
@@ -394,6 +431,10 @@ struct common_sampler * common_sampler_init(
                 default:
                     GGML_ASSERT(false && "unknown sampler type");
             }
+        }
+        if (n_samplers < params.samplers.size()) {
+            // Keep the scalar backend export; raw greedy would copy the whole vocabulary to the host.
+            samplers.push_back(llama_sampler_init_temp_ext(params.temp, params.dynatemp_range, params.dynatemp_exponent));
         }
         if (use_adaptive_p) {
             // only if user explicitly included adaptive-p sampler

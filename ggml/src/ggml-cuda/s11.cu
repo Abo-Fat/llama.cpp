@@ -2375,15 +2375,32 @@ static void s11_launch_shexp_up_gate_k128_prefill(
 #endif
 }
 
-bool ggml_cuda_s11_bf16_head(const ggml_tensor * tensor) {
-    static const bool enabled = [] {
+static int s11_head_layout() {
+    static const int layout = [] {
         const char * value = std::getenv("S11_HEAD_LAYOUT");
-        if (!value || std::strcmp(value, "packed") == 0) { return false; }
-        if (std::strcmp(value, "bf16") == 0) { return true; }
+        if (!value || std::strcmp(value, "packed") == 0) { return 1; }
+        if (std::strcmp(value, "bf16") == 0) { return 0; }
+        if (std::strcmp(value, "mixed") == 0) { return 2; }
         GGML_ABORT("Invalid S11_HEAD_LAYOUT: %s", value);
     }();
-    return enabled && tensor->type == GGML_TYPE_S11_I8 &&
+    return layout;
+}
+
+// Both derived layouts use canonical shadow storage and immutable-buffer guards.
+bool ggml_cuda_s11_bf16_head(const ggml_tensor * tensor) {
+    return s11_head_layout() != 1 && tensor->type == GGML_TYPE_S11_I8 &&
         std::strcmp(tensor->name, "output.weight") == 0 && tensor->ne[2] == 1 && tensor->ne[3] == 1;
+}
+
+size_t ggml_cuda_s11_head_alloc_size(const ggml_tensor * tensor) {
+    GGML_ASSERT(ggml_cuda_s11_bf16_head(tensor));
+    if (s11_head_layout() == 2) {
+        GGML_ASSERT(tensor->ne[0] == 2048 && "S11 mixed head requires k=2048");
+        const int64_t prefix = std::min<int64_t>(81920, tensor->ne[1]);
+        return size_t(prefix) * tensor->ne[0] * sizeof(nv_bfloat16) +
+            size_t(tensor->ne[1] - prefix) * tensor->nb[1];
+    }
+    return ggml_nelements(tensor) * sizeof(nv_bfloat16);
 }
 
 static __global__ void s11_restore_head(const unsigned char * packed, nv_bfloat16 * output, int k, int rows) {
@@ -2395,20 +2412,79 @@ static __global__ void s11_restore_head(const unsigned char * packed, nv_bfloat1
     }
 }
 
+static __device__ __forceinline__ float s11_head_restore_i8(int code, float reciprocal) {
+    if (reciprocal >= 0x1p-60f && reciprocal <= 0x1p60f) {
+        const float value = __fdividef(float(code), reciprocal);
+        const unsigned int low = __float_as_uint(value) & 0xffffu;
+        // Fast division is within 2 ULP; resolve BF16 midpoint cases exactly.
+        if (low < 0x7ffcu || low > 0x8004u) {
+            return s11_bf16(value);
+        }
+    }
+    return s11_bf16(__fdiv_rn(float(code), reciprocal));
+}
+
+static __global__ void s11_check_head_restore(const unsigned char * packed, const nv_bfloat16 * reference,
+        int k, int rows, unsigned long long * mismatches) {
+    const int index = blockIdx.x * blockDim.x + threadIdx.x;
+    if (index < k * rows) {
+        const int row = index / k, col = index % k;
+        const unsigned char * block = packed + row * (k / 128) * 132 + (col / 128) * 132;
+        const float reciprocal = s11_scale(block, GGML_TYPE_S11_I8);
+        const float value = s11_head_restore_i8(
+            reinterpret_cast<const signed char *>(block)[col % 128], reciprocal);
+        if (__float_as_uint(value) != __float_as_uint(__bfloat162float(reference[index]))) {
+            atomicAdd(mismatches, 1ULL);
+        }
+    }
+}
+
 void ggml_cuda_s11_upload_head(ggml_tensor * tensor, const void * canonical, cudaStream_t stream) {
     constexpr int tile_rows = 128;
+    const int64_t restore_rows = s11_head_layout() == 2 ? std::min<int64_t>(81920, tensor->ne[1]) : tensor->ne[1];
     unsigned char * staging = nullptr;
+    unsigned long long * mismatches_d = nullptr;
+    const char * check = std::getenv("S11_HEAD_CHECK");
+    if (check && std::strcmp(check, "0") != 0 && std::strcmp(check, "1") != 0) {
+        GGML_ABORT("Invalid S11_HEAD_CHECK: %s", check);
+    }
+    if (check && std::strcmp(check, "1") == 0) {
+        CUDA_CHECK(cudaMalloc(reinterpret_cast<void **>(&mismatches_d), sizeof(unsigned long long)));
+        CUDA_CHECK(cudaMemsetAsync(mismatches_d, 0, sizeof(unsigned long long), stream));
+    }
     CUDA_CHECK(cudaMalloc(reinterpret_cast<void **>(&staging), tile_rows * tensor->nb[1]));
-    for (int64_t row = 0; row < tensor->ne[1]; row += tile_rows) {
-        const int rows = std::min<int64_t>(tile_rows, tensor->ne[1] - row);
+    for (int64_t row = 0; row < restore_rows; row += tile_rows) {
+        const int rows = std::min<int64_t>(tile_rows, restore_rows - row);
         CUDA_CHECK(cudaMemcpyAsync(staging, static_cast<const char *>(canonical) + row * tensor->nb[1],
                                    rows * tensor->nb[1], cudaMemcpyHostToDevice, stream));
         s11_restore_head<<<(rows * tensor->ne[0] + 255) / 256, 256, 0, stream>>>(
             staging, static_cast<nv_bfloat16 *>(tensor->data) + row * tensor->ne[0], tensor->ne[0], rows);
         CUDA_CHECK(cudaGetLastError());
+        if (mismatches_d) {
+            s11_check_head_restore<<<(rows * tensor->ne[0] + 255) / 256, 256, 0, stream>>>(
+                staging, static_cast<const nv_bfloat16 *>(tensor->data) + row * tensor->ne[0],
+                tensor->ne[0], rows, mismatches_d);
+            CUDA_CHECK(cudaGetLastError());
+        }
+    }
+    if (restore_rows < tensor->ne[1]) {
+        CUDA_CHECK(cudaMemcpyAsync(
+            static_cast<char *>(tensor->data) + restore_rows * tensor->ne[0] * sizeof(nv_bfloat16),
+            static_cast<const char *>(canonical) + restore_rows * tensor->nb[1],
+            (tensor->ne[1] - restore_rows) * tensor->nb[1], cudaMemcpyHostToDevice, stream));
     }
     CUDA_CHECK(cudaStreamSynchronize(stream));
     CUDA_CHECK(cudaFree(staging));
+    if (mismatches_d) {
+        unsigned long long mismatches = 0;
+        CUDA_CHECK(cudaMemcpy(&mismatches, mismatches_d, sizeof(mismatches), cudaMemcpyDeviceToHost));
+        CUDA_CHECK(cudaFree(mismatches_d));
+        fprintf(stderr, "s11_head_restore_check elements=%llu mismatches=%llu\n",
+                (unsigned long long) (restore_rows * tensor->ne[0]), mismatches);
+        if (mismatches != 0) {
+            GGML_ABORT("S11 packed head restoration is not bit exact");
+        }
+    }
 }
 
 static __global__ void s11_head_bf16(const nv_bfloat16 * weights, const char * input, char * output,
@@ -2462,8 +2538,39 @@ static __global__ void s11_head_bf16(const nv_bfloat16 * weights, const char * i
     }
 }
 
+struct s11_head_weight8 {
+    float2 v[4];
+};
+
+template <int LAYOUT>
+static __device__ __forceinline__ s11_head_weight8 s11_head_load8(const void * weights, int row, int col) {
+    s11_head_weight8 result;
+    if constexpr (LAYOUT == 1) {
+        const auto * block = static_cast<const unsigned char *>(weights) + size_t(row) * (16 * 132) + (col / 128) * 132;
+        const uint32_t lo = *reinterpret_cast<const uint32_t *>(block + col % 128);
+        const uint32_t hi = *reinterpret_cast<const uint32_t *>(block + col % 128 + 4);
+        const float reciprocal = s11_scale(block, GGML_TYPE_S11_I8);
+        #pragma unroll
+        for (int p = 0; p < 4; ++p) {
+            const uint32_t pair = (p < 2 ? lo : hi) >> ((p % 2) * 16);
+            result.v[p].x = s11_head_restore_i8(static_cast<signed char>(pair & 0xffu), reciprocal);
+            result.v[p].y = s11_head_restore_i8(static_cast<signed char>((pair >> 8) & 0xffu), reciprocal);
+        }
+    } else {
+        const auto * ptr = static_cast<const nv_bfloat16 *>(weights) + size_t(row) * 2048 + col;
+        const uint4 raw = *reinterpret_cast<const uint4 *>(ptr);
+        const auto * pairs = reinterpret_cast<const nv_bfloat162 *>(&raw);
+        #pragma unroll
+        for (int p = 0; p < 4; ++p) {
+            result.v[p] = __bfloat1622float2(pairs[p]);
+        }
+    }
+    return result;
+}
+
+template <int LAYOUT>
 static __global__ void __launch_bounds__(256) s11_head_bf16_m1(
-        const nv_bfloat16 * __restrict__ weights, const char * __restrict__ input,
+        const void * __restrict__ weights, const char * __restrict__ input,
         char * __restrict__ output, int n, int n_active) {
     __shared__ __align__(16) float x_sh[2048];
     const int t = threadIdx.x;
@@ -2478,8 +2585,7 @@ static __global__ void __launch_bounds__(256) s11_head_bf16_m1(
     const float4 * x_in4 = reinterpret_cast<const float4 *>(input);
     float4 * x_sh4 = reinterpret_cast<float4 *>(x_sh);
     #pragma unroll
-    for (int i = 0; i < 2; ++i) {
-        const int idx4 = t + i * 256;
+    for (int idx4 = t; idx4 < 512; idx4 += 256) {
         float4 v = x_in4[idx4];
         v.x = s11_bf16(v.x);
         v.y = s11_bf16(v.y);
@@ -2495,19 +2601,17 @@ static __global__ void __launch_bounds__(256) s11_head_bf16_m1(
         }
         return;
     }
-    const nv_bfloat16 * w_row = weights + size_t(row) * 2048;
     float sum = 0.0f;
     #pragma unroll 4
     for (int base = 0; base < 2048; base += 256) {
         const int col = base + lane * 8;
-        const uint4 w8 = *reinterpret_cast<const uint4 *>(w_row + col);
+        const s11_head_weight8 w8 = s11_head_load8<LAYOUT>(weights, row, col);
         const float4 x_lo = *reinterpret_cast<const float4 *>(x_sh + col);
         const float4 x_hi = *reinterpret_cast<const float4 *>(x_sh + col + 4);
-        const nv_bfloat162 * w2 = reinterpret_cast<const nv_bfloat162 *>(&w8);
-        const float2 f0 = __bfloat1622float2(w2[0]);
-        const float2 f1 = __bfloat1622float2(w2[1]);
-        const float2 f2 = __bfloat1622float2(w2[2]);
-        const float2 f3 = __bfloat1622float2(w2[3]);
+        const float2 f0 = w8.v[0];
+        const float2 f1 = w8.v[1];
+        const float2 f2 = w8.v[2];
+        const float2 f3 = w8.v[3];
         sum = __fadd_rn(sum, __fmul_rn(x_lo.x, f0.x));
         sum = __fadd_rn(sum, __fmul_rn(x_lo.y, f0.y));
         sum = __fadd_rn(sum, __fmul_rn(x_lo.z, f1.x));
@@ -2525,33 +2629,39 @@ static __global__ void __launch_bounds__(256) s11_head_bf16_m1(
     }
 }
 
-template <int COLS>
+template <int COLS, int LAYOUT>
 static __global__ void __launch_bounds__(256) s11_head_bf16_multi(
-        const nv_bfloat16 * __restrict__ weights, const char * __restrict__ input,
+        const void * __restrict__ weights, const char * __restrict__ input,
         char * __restrict__ output, int n, int tokens,
         size_t input_stride, size_t output_stride) {
     __shared__ __align__(16) float x_sh[COLS][1024];
+    const int token_base = blockIdx.y * COLS;
+    input += size_t(token_base) * input_stride;
+    output += size_t(token_base) * output_stride;
+    tokens = min(COLS, tokens - token_base);
     const int t = threadIdx.x;
     const int lane = t % 32;
     const int row = blockIdx.x * 8 + t / 32;
-    const nv_bfloat16 * w_row = (row < n) ? (weights + size_t(row) * 2048) : nullptr;
     float sums[COLS] = {};
 
     for (int half_k = 0; half_k < 2048; half_k += 1024) {
         #pragma unroll
         for (int c = 0; c < COLS; ++c) {
             float4 * x_sh4 = reinterpret_cast<float4 *>(x_sh[c]);
-            if (c < tokens) {
-                const float4 * x_in4 = reinterpret_cast<const float4 *>(
-                    reinterpret_cast<const float *>(input + size_t(c) * input_stride) + half_k);
-                float4 v = x_in4[t];
-                v.x = s11_bf16(v.x);
-                v.y = s11_bf16(v.y);
-                v.z = s11_bf16(v.z);
-                v.w = s11_bf16(v.w);
-                x_sh4[t] = v;
-            } else {
-                x_sh4[t] = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+            #pragma unroll
+            for (int idx4 = t; idx4 < 256; idx4 += 256) {
+                if (c < tokens) {
+                    const float4 * x_in4 = reinterpret_cast<const float4 *>(
+                        reinterpret_cast<const float *>(input + size_t(c) * input_stride) + half_k);
+                    float4 v = x_in4[idx4];
+                    v.x = s11_bf16(v.x);
+                    v.y = s11_bf16(v.y);
+                    v.z = s11_bf16(v.z);
+                    v.w = s11_bf16(v.w);
+                    x_sh4[idx4] = v;
+                } else {
+                    x_sh4[idx4] = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+                }
             }
         }
         __syncthreads();
@@ -2560,12 +2670,11 @@ static __global__ void __launch_bounds__(256) s11_head_bf16_multi(
             #pragma unroll 4
             for (int base = 0; base < 1024; base += 256) {
                 const int col = base + lane * 8;
-                const uint4 w8 = *reinterpret_cast<const uint4 *>(w_row + half_k + col);
-                const nv_bfloat162 * w2 = reinterpret_cast<const nv_bfloat162 *>(&w8);
-                const float2 f0 = __bfloat1622float2(w2[0]);
-                const float2 f1 = __bfloat1622float2(w2[1]);
-                const float2 f2 = __bfloat1622float2(w2[2]);
-                const float2 f3 = __bfloat1622float2(w2[3]);
+                const s11_head_weight8 w8 = s11_head_load8<LAYOUT>(weights, row, half_k + col);
+                const float2 f0 = w8.v[0];
+                const float2 f1 = w8.v[1];
+                const float2 f2 = w8.v[2];
+                const float2 f3 = w8.v[3];
                 #pragma unroll
                 for (int c = 0; c < COLS; ++c) {
                     const float4 x_lo = *reinterpret_cast<const float4 *>(x_sh[c] + col);
@@ -2604,6 +2713,107 @@ static __global__ void __launch_bounds__(256) s11_head_bf16_multi(
 
 static bool s11_tensors_overlap(const ggml_tensor * a, const ggml_tensor * b);
 
+template <int LAYOUT>
+static void s11_launch_head_bf16(ggml_backend_cuda_context & ctx, const ggml_tensor * w,
+        const ggml_tensor * x, ggml_tensor * dst, int tokens, int n_active) {
+    const void * weights = w->data;
+    const auto * input = static_cast<const char *>(x->data);
+    auto * output = static_cast<char *>(dst->data);
+    const dim3 grid((n_active + 7) / 8, tokens > 8 ? (tokens + 7) / 8 : 1);
+    if (tokens == 1) {
+        s11_head_bf16_m1<LAYOUT><<<dim3((w->ne[1] + 7) / 8, 1), 256, 0, ctx.stream()>>>(
+            weights, input, output, w->ne[1], n_active);
+    } else if (tokens == 2) {
+        s11_head_bf16_multi<2, LAYOUT><<<grid, 256, 0, ctx.stream()>>>(
+            weights, input, output, n_active, tokens, x->nb[1], dst->nb[1]);
+    } else if (tokens <= 4) {
+        s11_head_bf16_multi<4, LAYOUT><<<grid, 256, 0, ctx.stream()>>>(
+            weights, input, output, n_active, tokens, x->nb[1], dst->nb[1]);
+    } else if (tokens <= 6) {
+        s11_head_bf16_multi<6, LAYOUT><<<grid, 256, 0, ctx.stream()>>>(
+            weights, input, output, n_active, tokens, x->nb[1], dst->nb[1]);
+    } else {
+        s11_head_bf16_multi<8, LAYOUT><<<grid, 256, 0, ctx.stream()>>>(
+            weights, input, output, n_active, tokens, x->nb[1], dst->nb[1]);
+    }
+}
+
+static void s11_launch_head_mixed(ggml_backend_cuda_context & ctx, const ggml_tensor * w,
+        const ggml_tensor * x, ggml_tensor * dst, int tokens, int n_active) {
+    const int prefix = std::min<int64_t>(81920, w->ne[1]);
+    ggml_tensor weights_part = *w;
+    ggml_tensor output_part = *dst;
+    weights_part.ne[1] = prefix;
+    s11_launch_head_bf16<0>(ctx, &weights_part, x, &output_part, tokens, std::min(prefix, n_active));
+    if (w->ne[1] > prefix && (n_active > prefix || tokens == 1)) {
+        // Keep the original token stride while writing the packed vocabulary tail.
+        weights_part.ne[1] = w->ne[1] - prefix;
+        weights_part.data = static_cast<char *>(w->data) + size_t(prefix) * 2048 * sizeof(nv_bfloat16);
+        output_part.data = static_cast<char *>(dst->data) + size_t(prefix) * sizeof(float);
+        s11_launch_head_bf16<1>(ctx, &weights_part, x, &output_part, tokens, std::max(0, n_active - prefix));
+    }
+}
+
+static __global__ void s11_head_cast_input(const char * input, nv_bfloat16 * output, int tokens, size_t stride) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < tokens * 2048) {
+        const auto * row = reinterpret_cast<const float *>(input + size_t(i / 2048) * stride);
+        output[i] = __float2bfloat16_rn(row[i % 2048]);
+    }
+}
+
+static __global__ void s11_head_round_output(char * output, int rows, int active, int tokens, size_t stride) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < rows * tokens) {
+        const int row = i % rows;
+        auto * value = reinterpret_cast<float *>(output + size_t(i / rows) * stride) + row;
+        *value = row < active ? s11_bf16(*value) : -1e30f;
+    }
+}
+
+static void s11_launch_head_mma(ggml_backend_cuda_context & ctx, const ggml_tensor * w,
+        const ggml_tensor * x, ggml_tensor * dst, int tokens, int active) {
+    ggml_cuda_pool_alloc<nv_bfloat16> input(ctx.pool(), size_t(tokens) * 2048);
+    s11_head_cast_input<<<(tokens * 2048 + 255) / 256, 256, 0, ctx.stream()>>>(
+        static_cast<const char *>(x->data), input.get(), tokens, x->nb[1]);
+    CUDA_CHECK(cudaGetLastError());
+    cublasHandle_t handle = ctx.cublas_handle();
+    CUBLAS_CHECK(cublasSetStream(handle, ctx.stream()));
+    const float alpha = 1.0f, beta = 0.0f;
+    CUBLAS_CHECK(cublasGemmEx(handle, CUBLAS_OP_T, CUBLAS_OP_N,
+        active, tokens, 2048, &alpha, w->data, CUDA_R_16BF, 2048,
+        input.get(), CUDA_R_16BF, 2048, &beta, dst->data, CUDA_R_32F,
+        int(dst->nb[1] / sizeof(float)), CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP));
+    const int rows = tokens == 1 ? int(w->ne[1]) : active;
+    s11_head_round_output<<<(rows * tokens + 255) / 256, 256, 0, ctx.stream()>>>(
+        static_cast<char *>(dst->data), rows, active, tokens, dst->nb[1]);
+    static bool dumped = false;
+    const char * dump_path = std::getenv("S11_HEAD_MMA_DUMP");
+    if (dump_path && !dumped) {
+        GGML_ASSERT(*dump_path && std::getenv("GGML_CUDA_DISABLE_GRAPHS") &&
+                    "S11_HEAD_MMA_DUMP requires a path and disabled CUDA graphs");
+        ggml_cuda_pool_alloc<float> reference(ctx.pool(), size_t(tokens) * dst->nb[1] / sizeof(float));
+        ggml_tensor ref_dst = *dst;
+        ref_dst.data = reference.get();
+        s11_launch_head_bf16<0>(ctx, w, x, &ref_dst, tokens, active);
+        std::vector<float> ref(size_t(tokens) * active), candidate(ref.size());
+        CUDA_CHECK(cudaMemcpy2DAsync(ref.data(), active * sizeof(float), reference.get(), dst->nb[1],
+            active * sizeof(float), tokens, cudaMemcpyDeviceToHost, ctx.stream()));
+        CUDA_CHECK(cudaMemcpy2DAsync(candidate.data(), active * sizeof(float), dst->data, dst->nb[1],
+            active * sizeof(float), tokens, cudaMemcpyDeviceToHost, ctx.stream()));
+        CUDA_CHECK(cudaStreamSynchronize(ctx.stream()));
+        FILE * file = std::fopen(dump_path, "wbx");
+        if (!file) { GGML_ABORT("Cannot create S11_HEAD_MMA_DUMP: %s", dump_path); }
+        const uint32_t shape[] = {uint32_t(tokens), uint32_t(active)};
+        const bool ok = std::fwrite(shape, sizeof(shape), 1, file) == 1 &&
+            std::fwrite(ref.data(), sizeof(float), ref.size(), file) == ref.size() &&
+            std::fwrite(candidate.data(), sizeof(float), candidate.size(), file) == candidate.size();
+        const int close_status = std::fclose(file);
+        if (!ok || close_status != 0) { GGML_ABORT("Cannot write S11_HEAD_MMA_DUMP: %s", dump_path); }
+        dumped = true;
+    }
+}
+
 void ggml_cuda_s11_mul_mat(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const ggml_tensor * w = dst->src[0];
     const ggml_tensor * x = dst->src[1];
@@ -2616,31 +2826,36 @@ void ggml_cuda_s11_mul_mat(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const int input_slots = ids ? x->ne[1] : 1;
     GGML_ASSERT(!ids || input_slots == 1 || input_slots == slots);
     const int optimization = s11_optimization();
-    if (ggml_cuda_s11_bf16_head(w)) {
+    const bool bf16_head = ggml_cuda_s11_bf16_head(w);
+    const bool packed_head = !bf16_head && w->type == GGML_TYPE_S11_I8 &&
+        std::strcmp(w->name, "output.weight") == 0 && w->ne[2] == 1 && w->ne[3] == 1 &&
+        w->nb[1] == 16 * 132 && k == 2048 && tokens >= 1 && tokens <= 8 && optimization >= 2;
+    if (bf16_head || packed_head) {
         GGML_ASSERT(!ids && !w->view_src);
         // op_params[14] shortlists the head rows (MTP draft heads only); the multi-token paths leave the rows past it unwritten
         const int n_active = (dst->op_params[14] > 0 && dst->op_params[14] < w->ne[1])
             ? dst->op_params[14] : int(w->ne[1]);
-        if (tokens == 1 && optimization >= 2 && k == 2048) {
-            s11_head_bf16_m1<<<dim3((w->ne[1] + 7) / 8, 1), 256, 0, ctx.stream()>>>(
-                static_cast<const nv_bfloat16 *>(w->data), static_cast<const char *>(x->data),
-                static_cast<char *>(dst->data), w->ne[1], n_active);
-        } else if (tokens == 2 && optimization >= 2 && k == 2048) {
-            s11_head_bf16_multi<2><<<dim3((n_active + 7) / 8, 1), 256, 0, ctx.stream()>>>(
-                static_cast<const nv_bfloat16 *>(w->data), static_cast<const char *>(x->data),
-                static_cast<char *>(dst->data), n_active, tokens, x->nb[1], dst->nb[1]);
-        } else if (tokens > 2 && tokens <= 4 && optimization >= 2 && k == 2048) {
-            s11_head_bf16_multi<4><<<dim3((n_active + 7) / 8, 1), 256, 0, ctx.stream()>>>(
-                static_cast<const nv_bfloat16 *>(w->data), static_cast<const char *>(x->data),
-                static_cast<char *>(dst->data), n_active, tokens, x->nb[1], dst->nb[1]);
-        } else if (tokens > 4 && tokens <= 6 && optimization >= 2 && k == 2048) {
-            s11_head_bf16_multi<6><<<dim3((n_active + 7) / 8, 1), 256, 0, ctx.stream()>>>(
-                static_cast<const nv_bfloat16 *>(w->data), static_cast<const char *>(x->data),
-                static_cast<char *>(dst->data), n_active, tokens, x->nb[1], dst->nb[1]);
-        } else if (tokens > 6 && tokens <= 8 && optimization >= 2 && k == 2048) {
-            s11_head_bf16_multi<8><<<dim3((n_active + 7) / 8, 1), 256, 0, ctx.stream()>>>(
-                static_cast<const nv_bfloat16 *>(w->data), static_cast<const char *>(x->data),
-                static_cast<char *>(dst->data), n_active, tokens, x->nb[1], dst->nb[1]);
+        static const bool mma = [] {
+            const char * value = std::getenv("S11_HEAD_MMA");
+            if (!value || std::strcmp(value, "0") == 0) { return false; }
+            if (std::strcmp(value, "1") == 0) { return true; }
+            GGML_ABORT("Invalid S11_HEAD_MMA: %s", value);
+        }();
+        if (mma && s11_head_layout() != 0) {
+            GGML_ABORT("S11_HEAD_MMA requires S11_HEAD_LAYOUT=bf16");
+        }
+        if (mma && tokens >= 4 && tokens <= 8 && k == 2048 && optimization >= 2) {
+            s11_launch_head_mma(ctx, w, x, dst, tokens, n_active);
+        } else if (s11_head_layout() == 2) {
+            GGML_ASSERT(k == 2048 && optimization >= 2 && tokens > 0 &&
+                        "S11 mixed head requires S11_CUDA_OPT=tiled and k=2048");
+            s11_launch_head_mixed(ctx, w, x, dst, tokens, n_active);
+        } else if (tokens >= 1 && tokens <= 8 && optimization >= 2 && k == 2048) {
+            if (packed_head) {
+                s11_launch_head_bf16<1>(ctx, w, x, dst, tokens, n_active);
+            } else {
+                s11_launch_head_bf16<0>(ctx, w, x, dst, tokens, n_active);
+            }
         } else {
             s11_head_bf16<<<dim3((w->ne[1] + 3) / 4, tokens), 128, 0, ctx.stream()>>>(
                 static_cast<const nv_bfloat16 *>(w->data), static_cast<const char *>(x->data), static_cast<char *>(dst->data),
