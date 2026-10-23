@@ -335,6 +335,8 @@ ggml_tensor * llama_model_qwen35moe::graph::build_layer_attn(
     Kcur = ggml_reshape_3d(ctx0, Kcur, n_embd_head, n_head_kv, n_tokens);
     Kcur = build_norm(Kcur, model.layers[il].attn_k_norm, nullptr, LLM_NORM_RMS, il);
     cb(Kcur, "Kcur_normed", il);
+    ggml_build_forward_expand(gf, Qcur);
+    ggml_build_forward_expand(gf, Kcur);
 
     ggml_tensor * gate = ggml_view_3d(ctx0, Qcur_full, n_embd_head, n_head, n_tokens,
         ggml_element_size(Qcur_full) * n_embd_head * 2,
@@ -357,9 +359,13 @@ ggml_tensor * llama_model_qwen35moe::graph::build_layer_attn(
             n_rot, sections, rope_type, n_ctx_orig, freq_base, freq_scale,
             ext_factor, attn_factor, beta_fast, beta_slow
             );
+    ggml_build_forward_expand(gf, Qcur);
+    ggml_build_forward_expand(gf, Kcur);
     if (s11_model) {
         Qcur = ggml_cast(ctx0, ggml_cast(ctx0, Qcur, GGML_TYPE_BF16), GGML_TYPE_F32);
         Kcur = ggml_cast(ctx0, ggml_cast(ctx0, Kcur, GGML_TYPE_BF16), GGML_TYPE_F32);
+        ggml_build_forward_expand(gf, Qcur);
+        ggml_build_forward_expand(gf, Kcur);
     }
 
     cb(Qcur, "Qcur", il);

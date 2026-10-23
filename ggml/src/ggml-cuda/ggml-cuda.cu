@@ -4914,8 +4914,15 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
                 cgraph->nodes[i]->src[0] && cgraph->nodes[i]->src[0]->type == GGML_TYPE_S11_W2 &&
                 cgraph->nodes[i]->ne[1] == 8 && cgraph->nodes[i]->ne[2] < 8 &&
                 cgraph->nodes[i + 16]->op == GGML_OP_CPY && cgraph->nodes[i + 17]->op == GGML_OP_CPY) {
+                ggml_tensor * x   = cgraph->nodes[i]->src[1];
                 ggml_tensor * ids = cgraph->nodes[i]->src[2];
                 ggml_tensor * c2  = cgraph->nodes[i + 17];
+                if (x) {
+                    params->add_alloc_dep(params->user_data, x, c2);
+                    if (x->view_src) {
+                        params->add_alloc_dep(params->user_data, x->view_src, c2);
+                    }
+                }
                 if (ids) {
                     params->add_alloc_dep(params->user_data, ids, c2);
                     if (ids->view_src) {
@@ -4947,6 +4954,117 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
                     if (pw->view_src) {
                         params->add_alloc_dep(params->user_data, pw->view_src, c2);
                     }
+                }
+            }
+
+            auto pin_s11_tensor = [&](ggml_tensor * t, ggml_tensor * consumer) {
+                if (t && consumer) {
+                    params->add_alloc_dep(params->user_data, t, consumer);
+                    if (t->view_src) {
+                        params->add_alloc_dep(params->user_data, t->view_src, consumer);
+                    }
+                }
+            };
+
+            // S11 Pattern H-Conv-State: 21-node GDN build_conv_state + SSM_CONV + SILU + Q/K L2-norm
+            if (i + 20 < cgraph->n_nodes &&
+                cgraph->nodes[i]->op == GGML_OP_PERMUTE &&
+                cgraph->nodes[i + 1]->op == GGML_OP_CONT &&
+                cgraph->nodes[i + 2]->op == GGML_OP_CONCAT &&
+                cgraph->nodes[i + 3]->op == GGML_OP_VIEW &&
+                cgraph->nodes[i + 4]->op == GGML_OP_VIEW &&
+                cgraph->nodes[i + 5]->op == GGML_OP_CPY &&
+                cgraph->nodes[i + 6]->op == GGML_OP_CPY &&
+                cgraph->nodes[i + 7]->op == GGML_OP_SSM_CONV &&
+                cgraph->nodes[i + 8]->op == GGML_OP_UNARY &&
+                cgraph->nodes[i + 10]->op == GGML_OP_CPY &&
+                cgraph->nodes[i + 15]->op == GGML_OP_CPY &&
+                cgraph->nodes[i + 20]->op == GGML_OP_CPY &&
+                cgraph->nodes[i + 7]->src[0] == cgraph->nodes[i + 2] &&
+                cgraph->nodes[i + 7]->src[1] == cgraph->nodes[i + 6]) {
+                ggml_tensor * h11 = cgraph->nodes[i + 20];
+                pin_s11_tensor(cgraph->nodes[i]->src[0], h11);
+                pin_s11_tensor(cgraph->nodes[i + 2]->src[0], h11);
+                pin_s11_tensor(cgraph->nodes[i + 5], h11);
+                pin_s11_tensor(cgraph->nodes[i + 6]->src[0], h11);
+                pin_s11_tensor(cgraph->nodes[i + 7]->src[0], h11);
+                pin_s11_tensor(cgraph->nodes[i + 10], h11);
+                pin_s11_tensor(cgraph->nodes[i + 15], h11);
+            }
+
+            // S11 Pattern H-Conv: 15-node GDN CPY(ssm_conv1d, F32) + SSM_CONV + SILU + Q/K L2-norm
+            if (i + 14 < cgraph->n_nodes &&
+                cgraph->nodes[i]->op == GGML_OP_CPY &&
+                cgraph->nodes[i]->ne[0] == 4 && cgraph->nodes[i]->ne[1] == 8192 &&
+                cgraph->nodes[i + 1]->op == GGML_OP_SSM_CONV &&
+                cgraph->nodes[i + 1]->src[1] == cgraph->nodes[i] &&
+                cgraph->nodes[i + 2]->op == GGML_OP_UNARY &&
+                cgraph->nodes[i + 4]->op == GGML_OP_CPY &&
+                cgraph->nodes[i + 9]->op == GGML_OP_CPY &&
+                cgraph->nodes[i + 14]->op == GGML_OP_CPY) {
+                ggml_tensor * h11 = cgraph->nodes[i + 14];
+                pin_s11_tensor(cgraph->nodes[i + 1]->src[0], h11);
+                pin_s11_tensor(cgraph->nodes[i]->src[0], h11);
+                pin_s11_tensor(cgraph->nodes[i + 4], h11);
+                pin_s11_tensor(cgraph->nodes[i + 9], h11);
+            }
+
+            // S11 Pattern B-Prologue: 12-node GDN beta + sigmoid + alpha + gate prologue
+            if (i + 11 < cgraph->n_nodes &&
+                cgraph->nodes[i]->op == GGML_OP_MUL_MAT &&
+                cgraph->nodes[i]->src[0] && cgraph->nodes[i]->src[0]->type == GGML_TYPE_BF16 &&
+                cgraph->nodes[i]->src[0]->ne[0] == 2048 && cgraph->nodes[i]->src[0]->ne[1] == 32 &&
+                cgraph->nodes[i + 4]->op == GGML_OP_CPY &&
+                cgraph->nodes[i + 5]->op == GGML_OP_MUL_MAT &&
+                cgraph->nodes[i + 5]->src[1] == cgraph->nodes[i]->src[1] &&
+                cgraph->nodes[i + 11]->op == GGML_OP_RESHAPE) {
+                ggml_tensor * g_res = cgraph->nodes[i + 11];
+                pin_s11_tensor(cgraph->nodes[i]->src[1], g_res);
+                pin_s11_tensor(cgraph->nodes[i + 4], g_res);
+            }
+
+            // S11 Pattern FA-QK-Norm-14: 14-node Full-Attention Qcur + Kcur k=256 head RMSNorms
+            if (i + 13 < cgraph->n_nodes &&
+                cgraph->nodes[i]->op == GGML_OP_VIEW &&
+                cgraph->nodes[i]->ne[0] == 256 && cgraph->nodes[i]->ne[1] == 16 &&
+                cgraph->nodes[i + 1]->op == GGML_OP_RMS_NORM && cgraph->nodes[i + 1]->src[0] == cgraph->nodes[i] &&
+                cgraph->nodes[i + 2]->op == GGML_OP_CPY &&
+                cgraph->nodes[i + 6]->op == GGML_OP_CPY &&
+                cgraph->nodes[i + 7]->op == GGML_OP_RESHAPE &&
+                cgraph->nodes[i + 7]->ne[0] == 256 && cgraph->nodes[i + 7]->ne[1] == 2 &&
+                cgraph->nodes[i + 8]->op == GGML_OP_RMS_NORM && cgraph->nodes[i + 8]->src[0] == cgraph->nodes[i + 7] &&
+                cgraph->nodes[i + 9]->op == GGML_OP_CPY &&
+                cgraph->nodes[i + 13]->op == GGML_OP_CPY) {
+                ggml_tensor * k_normed = cgraph->nodes[i + 13];
+                pin_s11_tensor(cgraph->nodes[i]->src[0], k_normed);
+                pin_s11_tensor(cgraph->nodes[i + 7]->src[0], k_normed);
+                pin_s11_tensor(cgraph->nodes[i + 2]->src[0], k_normed);
+                pin_s11_tensor(cgraph->nodes[i + 9]->src[0], k_normed);
+                pin_s11_tensor(cgraph->nodes[i + 6], k_normed);
+            }
+
+            // S11 Pattern FA-QKV-SetRows-9: 9-node Full-Attention post-RoPE Q/K BF16 round + K/V F16 cache SET_ROWS
+            if (i + 8 < cgraph->n_nodes &&
+                cgraph->nodes[i]->op == GGML_OP_CPY &&
+                cgraph->nodes[i + 1]->op == GGML_OP_CPY && cgraph->nodes[i + 1]->src[0] == cgraph->nodes[i] &&
+                cgraph->nodes[i + 5]->op == GGML_OP_VIEW &&
+                cgraph->nodes[i + 6]->op == GGML_OP_SET_ROWS && cgraph->nodes[i + 6]->src[0] == cgraph->nodes[i + 5] &&
+                cgraph->nodes[i + 7]->op == GGML_OP_VIEW &&
+                cgraph->nodes[i + 8]->op == GGML_OP_SET_ROWS && cgraph->nodes[i + 8]->src[0] == cgraph->nodes[i + 7]) {
+                ggml_tensor * k_c0  = (cgraph->nodes[i + 2]->op == GGML_OP_RESHAPE) ? cgraph->nodes[i + 3] : cgraph->nodes[i + 2];
+                ggml_tensor * k_cur = (cgraph->nodes[i + 2]->op == GGML_OP_RESHAPE) ? cgraph->nodes[i + 4] : cgraph->nodes[i + 3];
+                ggml_tensor * v_res = (cgraph->nodes[i + 2]->op == GGML_OP_RESHAPE) ? cgraph->nodes[i + 2] : cgraph->nodes[i + 4];
+                if (k_c0->op == GGML_OP_CPY && k_cur->op == GGML_OP_CPY && k_cur->src[0] == k_c0 &&
+                    v_res->op == GGML_OP_RESHAPE &&
+                    cgraph->nodes[i + 5]->src[0] == k_cur && cgraph->nodes[i + 7]->src[0] == v_res) {
+                    ggml_tensor * v_set = cgraph->nodes[i + 8];
+                    pin_s11_tensor(cgraph->nodes[i]->src[0], v_set);
+                    pin_s11_tensor(k_c0->src[0], v_set);
+                    pin_s11_tensor(v_res->src[0], v_set);
+                    pin_s11_tensor(cgraph->nodes[i + 6]->src[1], v_set);
+                    pin_s11_tensor(cgraph->nodes[i + 8]->src[1], v_set);
+                    pin_s11_tensor(cgraph->nodes[i + 1], v_set);
+                    pin_s11_tensor(k_cur, v_set);
                 }
             }
 

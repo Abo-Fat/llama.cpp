@@ -62,6 +62,13 @@ gated_delta_net_cuda(const float * q,
     float         s_shard[rows_per_lane];
     // state is stored transposed: M[col][i] = S[i][col], row col is contiguous
 
+    __shared__ float q_sh[S_v];
+    __shared__ float k_sh[S_v];
+    __shared__ float g_sh[KDA ? S_v : 1];
+    __shared__ float beta_sh;
+    const int tid         = threadIdx.y * blockDim.x + threadIdx.x;
+    const int cta_threads = blockDim.x * blockDim.y;
+
     ggml_cuda_pdl_sync();
 #pragma unroll
     for (int r = 0; r < rows_per_lane; r++) {
@@ -78,7 +85,22 @@ gated_delta_net_cuda(const float * q,
         const float * beta_t = beta + gb_offset;
         const float * g_t    = g    + gb_offset * (KDA ? S_v : 1);
 
-        const float beta_val = *beta_t;
+        for (int idx = tid; idx < S_v; idx += cta_threads) {
+            q_sh[idx] = q_t[idx];
+            k_sh[idx] = k_t[idx];
+            if constexpr (KDA) {
+                g_sh[idx] = expf(g_t[idx]);
+            }
+        }
+        if (tid == 0) {
+            beta_sh = *beta_t;
+            if constexpr (!KDA) {
+                g_sh[0] = expf(*g_t);
+            }
+        }
+        __syncthreads();
+
+        const float beta_val = beta_sh;
 
         // Cache k and q in registers
         float k_reg[rows_per_lane];
@@ -86,12 +108,12 @@ gated_delta_net_cuda(const float * q,
 #pragma unroll
         for (int r = 0; r < rows_per_lane; r++) {
             const int i = r * lanes_per_col + lane_in_col;
-            k_reg[r] = k_t[i];
-            q_reg[r] = q_t[i];
+            k_reg[r] = k_sh[i];
+            q_reg[r] = q_sh[i];
         }
 
         if constexpr (!KDA) {
-            const float g_val = expf(*g_t);
+            const float g_val = g_sh[0];
 
             // kv[col] = (S^T @ k)[col] = sum_i S[i][col] * k[i]
             float kv_shard = 0.0f;
@@ -124,7 +146,7 @@ gated_delta_net_cuda(const float * q,
 #pragma unroll
             for (int r = 0; r < rows_per_lane; r++) {
                 const int i = r * lanes_per_col + lane_in_col;
-                kv_shard += expf(g_t[i]) * s_shard[r] * k_reg[r];
+                kv_shard += g_sh[i] * s_shard[r] * k_reg[r];
             }
 
             float kv_col = warp_reduce_sum<lanes_per_col>(kv_shard);
@@ -138,7 +160,7 @@ gated_delta_net_cuda(const float * q,
 #pragma unroll
             for (int r = 0; r < rows_per_lane; r++) {
                 const int i = r * lanes_per_col + lane_in_col;
-                s_shard[r]  = expf(g_t[i]) * s_shard[r] + k_reg[r] * delta_col;
+                s_shard[r]  = g_sh[i] * s_shard[r] + k_reg[r] * delta_col;
                 attn_partial += s_shard[r] * q_reg[r];
             }
 
@@ -163,6 +185,10 @@ gated_delta_net_cuda(const float * q,
                     curr_state[col * S_v + i] = s_shard[r];
                 }
             }
+        }
+
+        if (n_tokens > 1) {
+            __syncthreads();
         }
     }
 
